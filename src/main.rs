@@ -27,6 +27,9 @@ fn parse_bytearray(data: &[u8]) -> (u64, Vec<u64>) {
 
     let mut record_sizes = vec![];
 
+    if header_bytes == 0 {
+        return (0, vec![]);
+    }
     let mut data = data;
     let mut length = header_bytes - size as u64;
     while length > 0 {
@@ -51,7 +54,7 @@ fn parse_bytearray(data: &[u8]) -> (u64, Vec<u64>) {
     (header_bytes, record_sizes)
 }
 
-fn read_btree_page(data: &[u8]) -> &[u8] {
+fn read_btree_page(data: &[u8]) -> (BTreePage, &[u8]) {
     let (payload_bytes, data, _) = read_varint(&data);
     let (_rowid, data, _) = read_varint(&data);
     let bytearray = &data[..payload_bytes as usize];
@@ -61,12 +64,51 @@ fn read_btree_page(data: &[u8]) -> &[u8] {
     let name = &columns[sizes[0] as usize..][..sizes[1] as usize];
     let name = std::str::from_utf8(name).unwrap();
 
-    if name != "sqlite_sequence" {
-        print!("{name} ");
-    }
-    // TODO: return this
+    let offset_root: u64 = sizes[0..3].iter().sum();
+    let rootpage = columns[offset_root as usize];
 
-    &data[payload_bytes as usize..]
+    let page = BTreePage { name, rootpage };
+
+    (page, &data[payload_bytes as usize..])
+}
+
+struct Header {
+    page_size: u16,
+}
+
+impl Header {
+    fn new(data: &[u8]) -> Self {
+        Self {
+            page_size: u16::from_be_bytes([data[16], data[17]]),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BTreeHeader {
+    page_type: u8,
+    freeblock: u16,
+    cells: u16,
+    offset: u16,
+    frag: u8,
+}
+
+impl BTreeHeader {
+    fn new(data: &[u8]) -> Self {
+        Self {
+            page_type: data[0],
+            freeblock: u16::from_be_bytes([data[1], data[2]]),
+            cells: u16::from_be_bytes([data[3], data[4]]),
+            offset: u16::from_be_bytes([data[5], data[6]]),
+            frag: data[7],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BTreePage<'a> {
+    name: &'a str,
+    rootpage: u8,
 }
 
 fn main() -> Result<()> {
@@ -84,32 +126,41 @@ fn main() -> Result<()> {
     let command = &args[2];
     match command.as_str() {
         ".dbinfo" => {
-            let header = &data[0..100];
+            let header = Header::new(&data);
 
-            // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
-            let page_size = u16::from_be_bytes([header[16], header[17]]);
-            println!("database page size: {}", page_size);
+            println!("database page size: {}", header.page_size);
 
-            let schema_header = &data[100..108];
-            let pages = u16::from_be_bytes([schema_header[3], schema_header[4]]);
-            println!("number of tables: {}", pages);
+            let schema_header = BTreeHeader::new(&data[100..]);
+            println!("number of tables: {}", schema_header.cells);
         }
         ".tables" => {
-            let schema_header = &data[100..108];
-            // format:
-            // type:      0]
-            // freeblock: 1, 2
-            // cells:     3, 4
-            // offset:    5, 6
-            // frag:      7
-            let offset = u16::from_be_bytes([schema_header[5], schema_header[6]]);
+            let schema_header = BTreeHeader::new(&data[100..]);
 
-            let cell = &data[offset as usize..];
-            let cell = read_btree_page(cell);
-            let cell = read_btree_page(cell);
-            let _cell = read_btree_page(cell);
+            let mut cell = &data[schema_header.offset as usize..];
+            for _ in 0..schema_header.cells {
+                let (page, c) = read_btree_page(cell);
+                cell = c;
+                if page.name != "sqlite_sequence" {}
+            }
+            println!();
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+        command => {
+            let table = command.split(" ").last().unwrap();
+
+            let header = Header::new(&data);
+            let schema_header = BTreeHeader::new(&data[100..]);
+
+            let mut cell = &data[schema_header.offset as usize..];
+            for _ in 0..schema_header.cells {
+                let (page, c) = read_btree_page(cell);
+                cell = c;
+                if page.name == table {
+                    let index = (page.rootpage - 1) as usize * header.page_size as usize;
+                    let page_header = BTreeHeader::new(&data[index..]);
+                    println!("{}", page_header.cells);
+                }
+            }
+        }
     }
 
     Ok(())
