@@ -344,13 +344,20 @@ fn main() -> Result<()> {
             println!();
         }
         command => {
-            let table_name = command
-                .split_whitespace()
-                .last()
-                .expect("malformed sql query");
+            let command = command.split_whitespace().collect::<Vec<_>>();
+
+            let table_name = command[3];
+            let column = command[1];
 
             let page = db.table(table_name)?;
-            println!("{}", page.records().count());
+            for record in page.records() {
+                let Value::Text(s) = record.get(column) else {
+                    panic!("no column {column:?} in table {table_name:?}");
+                };
+                println!("{s}");
+            }
+            // println!("{}", page.header.cells);
+            // println!("{}", page.records().count());
         }
     };
     Ok(())
