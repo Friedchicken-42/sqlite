@@ -1,4 +1,9 @@
-use anyhow::{bail, Result};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+};
+
+use anyhow::{bail, Context, Result};
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -52,7 +57,45 @@ fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
         record_sizes.push(colunm_size as usize);
     }
 
-    (record_sizes, header_bytes as usize)
+    (record_sizes, offset)
+}
+
+fn parse_sql<'a>(s: &str) -> Vec<(String, Value<'a>)> {
+    let s = s.replace("\t", "").replace("\n", "");
+    let (_, s) = s.split_once("(").unwrap();
+    let (s, _) = s.split_once(")").unwrap();
+
+    let cols = s.split(",");
+
+    let mut schema = vec![];
+
+    for col in cols {
+        let split = col.split_whitespace().collect::<Vec<_>>();
+        let name = split[0].to_string();
+        let r#type = split[1];
+
+        let value = match r#type {
+            "text" => Value::Text(""),
+            "integer" => Value::Integer(0),
+            t => panic!("missing type: {t}"),
+        };
+
+        schema.push((name, value));
+    }
+
+    schema
+}
+
+#[derive(Debug)]
+struct Header {
+    page_size: usize,
+}
+
+impl Header {
+    fn read(data: &[u8]) -> Self {
+        let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
+        Self { page_size }
+    }
 }
 
 #[derive(Debug)]
@@ -76,80 +119,196 @@ impl BTreeHeader {
     }
 }
 
-#[derive(Debug)]
-struct Cell {
-    name: String,
-    rootpage: usize,
+struct Record<'a> {
+    payload: Vec<Vec<u8>>,
+    schema: &'a [(String, Value<'a>)],
+    rowid: u64,
 }
 
-#[derive(Debug)]
-struct BTreePage {
-    header: BTreeHeader,
-    cells: Vec<Cell>,
-}
+impl<'a> Record<'a> {
+    fn read(data: &[u8], schema: &'a [(String, Value)]) -> (Self, usize) {
+        let mut offset = 0;
+        let (payload_bytes, size) = read_varint(&data[offset..]);
+        offset += size;
 
-impl BTreePage {
-    fn read(data: &[u8], offset: usize) -> Self {
-        let header_offset = if offset == 0 { 100 } else { offset };
-        let header = BTreeHeader::read(&data[header_offset..]);
+        let (rowid, size) = read_varint(&data[offset..]);
+        offset += size;
 
-        let mut offset = header.offset + offset;
-        let mut cells = Vec::with_capacity(header.cells);
+        let (sizes, size) = parse_bytearray(&data[offset..]);
+        let mut values_offset = offset + size;
 
-        for _ in 0..header.cells {
-            let (payload_bytes, size) = read_varint(&data[offset..]);
-            offset += size;
-
-            let (_rowid, size) = read_varint(&data[offset..]);
-            offset += size;
-
-            let (sizes, size) = parse_bytearray(&data[offset..]);
-
-            let columns = offset + size;
-
-            let name = &data[columns + sizes[0]..][..sizes[1]];
-            // TODO: use slice
-            let name = String::from_utf8(name.to_vec()).unwrap();
-
-            let offset_rootpage: usize = sizes[0..3].iter().sum();
-            let rootpage = data[columns + offset_rootpage] as usize;
-
-            offset += payload_bytes as usize;
-
-            cells.push(Cell { name, rootpage });
+        let mut payload = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            let value = data[values_offset..][..size].to_vec();
+            payload.push(value);
+            values_offset += size;
         }
-        Self { header, cells }
+
+        offset += payload_bytes as usize;
+
+        (
+            Record {
+                payload,
+                rowid,
+                schema,
+            },
+            offset,
+        )
+    }
+
+    fn get(&'a self, column: &str) -> Value {
+        let (index, (_, r#type)) = self
+            .schema
+            .iter()
+            .enumerate()
+            .find(|(_, (name, _))| *name == column)
+            .unwrap();
+
+        let value = &self.payload[index];
+
+        match r#type {
+            &Value::Text(_) => {
+                let text = std::str::from_utf8(&value).unwrap();
+                Value::Text(text)
+            }
+            &Value::Integer(_) => Value::Integer(value[0] as u64),
+            _ => unimplemented!(),
+        }
     }
 }
 
-struct Header {
-    page_size: usize,
+struct RecordIter<'a> {
+    records: usize,
+    current: usize,
+    offset: usize,
+    base: &'a BTreePage<'a>,
+    page: &'a BTreePage<'a>,
+    db: &'a Sqlite,
 }
 
-impl Header {
-    fn read(data: &[u8]) -> Self {
-        let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
-        Self { page_size }
+impl<'a> Iterator for RecordIter<'a> {
+    type Item = Record<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.records {
+            return None;
+        }
+
+        let (record, size) = Record::read(&self.page.data[self.offset..], &self.base.schema);
+        self.offset += size;
+
+        // TODO: overflow page
+        self.current += 1;
+        Some(record)
+    }
+}
+
+enum Value<'a> {
+    Null,
+    Integer(u64),
+    Float(u64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+struct BTreePage<'a> {
+    data: Vec<u8>,
+    header: BTreeHeader,
+    schema: Vec<(String, Value<'a>)>,
+    index: usize,
+    db: &'a Sqlite,
+}
+
+impl<'a> BTreePage<'a> {
+    fn read(data: Vec<u8>, index: usize, db: &'a Sqlite, schema: Vec<(String, Value<'a>)>) -> Self {
+        let offset = if index == 1 { 100 } else { 0 };
+        let header = BTreeHeader::read(&data[offset..]);
+
+        Self {
+            data,
+            header,
+            index,
+            schema,
+            db,
+        }
+    }
+
+    fn records(&self) -> RecordIter {
+        RecordIter {
+            records: self.header.cells,
+            current: 0,
+            offset: self.header.offset,
+            base: self,
+            page: self,
+            db: self.db,
+        }
     }
 }
 
 struct Sqlite {
-    data: Vec<u8>,
+    file: File,
     header: Header,
 }
 
 impl Sqlite {
-    fn read(file: &str) -> Result<Self> {
-        let data = std::fs::read(file)?;
-        let header = Header::read(&data);
-        Ok(Self { data, header })
+    fn read(path: &str) -> Result<Self> {
+        let file = File::open(path)?;
+
+        let mut buf = vec![0; 100];
+        (&file).read_exact(&mut buf)?;
+        let header = Header::read(&buf);
+
+        Ok(Self { file, header })
     }
 
-    fn btreepage(&self, index: usize) -> BTreePage {
+    fn page<'a>(&'a self, index: usize, schema: Vec<(String, Value<'a>)>) -> Result<BTreePage> {
         let offset = (index - 1) * self.header.page_size;
-        BTreePage::read(&self.data, offset)
+
+        (&self.file).seek(SeekFrom::Start(offset as u64))?;
+        let mut data = vec![0; self.header.page_size];
+        (&self.file).read_exact(&mut data)?;
+
+        Ok(BTreePage::read(data, index, self, schema))
+    }
+
+    fn root(&self) -> Result<BTreePage> {
+        let schema = vec![
+            ("type".into(), Value::Text("")),
+            ("name".into(), Value::Text("")),
+            ("tbl_name".into(), Value::Text("")),
+            ("rootpage".into(), Value::Integer(0)),
+            ("sql".into(), Value::Text("")),
+        ];
+        self.page(1, schema)
+    }
+
+    fn table(&self, name: &str) -> Result<BTreePage> {
+        let schema = self.root()?;
+        let record = schema
+            .records()
+            .find(|r| {
+                let Value::Text(tbl_name) = r.get("tbl_name") else {
+                    panic!("expected text")
+                };
+                name == tbl_name
+            })
+            .context(format!("no table named {name:?}"))?;
+
+        let Value::Integer(rootpage) = record.get("rootpage") else {
+            anyhow::bail!("expected integer");
+        };
+
+        let Value::Text(sql) = record.get("sql") else {
+            anyhow::bail!("expected text");
+        };
+
+        let schema = parse_sql(sql);
+
+        let page = self.page(rootpage as usize, schema)?;
+        Ok(page)
     }
 }
+
 fn main() -> Result<()> {
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
@@ -167,52 +326,32 @@ fn main() -> Result<()> {
         ".dbinfo" => {
             println!("database page size: {}", db.header.page_size);
 
-            let page = db.btreepage(1);
-            println!("number of tables: {}", page.header.cells);
+            let page = db.root()?;
+            let cells = page.header.cells;
+            println!("number of tables: {}", cells);
         }
         ".tables" => {
-            let page = db.btreepage(1);
+            let schema = db.root()?;
 
-            let tables = page.cells.iter().filter(|p| p.name != "sqlite_sequence");
-
-            for table in tables {
-                print!("{} ", table.name);
+            for record in schema.records() {
+                let Value::Text(name) = record.get("name") else {
+                    panic!("expected text")
+                };
+                if name != "sqlite_sequence" {
+                    print!("{} ", name);
+                }
             }
+            println!();
         }
         command => {
-            let commands: Vec<_> = command.split(" ").collect();
-            let table = commands[3];
+            let table_name = command
+                .split_whitespace()
+                .last()
+                .expect("malformed sql query");
 
-            let page = db.btreepage(1);
-            let Some(cell) = page.cells.iter().find(|p| p.name == table) else {
-                panic!("no table named \"{table}\"");
-            };
-
-            let page = db.btreepage(cell.rootpage);
-            println!("{}", page.header.cells);
-
-            // let name = commands[1];
-            // let table = commands[3];
-
-            // let header = Header::new(&data);
-            // let schema_header = BTreeHeader::new(&data[100..]);
-
-            // let mut cell = &data[schema_header.offset as usize..];
-            // for i in 0..schema_header.cells {
-            //     let (page, c) = read_btree_page(cell);
-            //     cell = c;
-            //     if page.name == table {
-            //         println!("{table} {i} {page:?}");
-            //         let index = (page.rootpage - 1) as usize * header.page_size as usize;
-            //         let page_header = BTreeHeader::new(&data[index..]);
-            //         println!("{page_header:?} {:#x}", page_header.offset as usize + index);
-
-            //         let mut cell = &data[page_header.offset as usize + index..];
-            //         let (page, c) = read_btree_page(cell);
-            //     }
-            // }
+            let page = db.table(table_name)?;
+            println!("{}", page.records().count());
         }
-    }
-
+    };
     Ok(())
 }
