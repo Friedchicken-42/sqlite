@@ -2,11 +2,12 @@
 pub mod command;
 
 use std::{
+    borrow::Cow,
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 pub use command::Command;
 use command::WhereST;
 
@@ -80,7 +81,7 @@ fn parse_sql<'a>(s: &str) -> Vec<(String, Value<'a>)> {
         let r#type = split[1];
 
         let value = match r#type {
-            "text" => Value::Text(""),
+            "text" => Value::Text("".into()),
             "integer" => Value::Integer(0),
             t => panic!("missing type: {t}"),
         };
@@ -169,12 +170,16 @@ impl<'a> Record<'a> {
             .find(|(_, (name, _))| *name == column)
             .unwrap();
 
+        // TODO: When an SQL table includes an INTEGER PRIMARY KEY,
+        //       that column appears in the record as a NULL value.
+        //       Use the `rowid` field.
+
         let value = &self.payload[index];
 
         match r#type {
             &Value::Text(_) => {
                 let text = std::str::from_utf8(&value).unwrap();
-                Value::Text(text)
+                Value::Text(text.into())
             }
             &Value::Integer(_) => Value::Integer(value[0] as u64),
             _ => unimplemented!(),
@@ -208,12 +213,12 @@ impl<'a> Iterator for RecordIter<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Value<'a> {
     Null,
     Integer(u64),
     Float(f64),
-    Text(&'a str),
+    Text(Cow<'a, str>),
     Blob(&'a [u8]),
 }
 
@@ -291,11 +296,11 @@ impl Sqlite {
 
     pub fn root(&self) -> Result<BTreePage> {
         let schema = vec![
-            ("type".into(), Value::Text("")),
-            ("name".into(), Value::Text("")),
-            ("tbl_name".into(), Value::Text("")),
+            ("type".into(), Value::Text("".into())),
+            ("name".into(), Value::Text("".into())),
+            ("tbl_name".into(), Value::Text("".into())),
             ("rootpage".into(), Value::Integer(0)),
-            ("sql".into(), Value::Text("")),
+            ("sql".into(), Value::Text("".into())),
         ];
         self.page(1, schema)
     }
@@ -320,14 +325,13 @@ impl Sqlite {
             anyhow::bail!("expected text");
         };
 
-        let schema = parse_sql(sql);
+        let schema = parse_sql(&sql);
 
         let page = self.page(rootpage as usize, schema)?;
         Ok(page)
     }
 
-    pub fn execute(&self, command: Command) -> Result<()> {
-        // TODO: output something
+    pub fn execute<'a>(&self, command: Command) -> Result<()> {
         match command {
             Command::Select {
                 select,
@@ -336,48 +340,36 @@ impl Sqlite {
             } => {
                 let table = self.table(from.table.as_str())?;
 
-                let data = table.records().map(|record| {
-                    select
-                        .columns
-                        .iter()
-                        .map(move |column| (column, record.get(column).to_string()))
-                        .collect::<Vec<_>>()
-                    // TODO: better handling
-                });
-
-                let data = data.filter(|record| {
+                let filtered = table.records().filter(|record| {
                     let Some(WhereST {
-                        ref column,
-                        ref condition,
-                        ref expected,
-                    }) = r#where
+                        column,
+                        condition,
+                        expected,
+                    }) = &r#where
                     else {
                         return true;
                     };
 
-                    for (col, value) in record {
-                        if *col == column {
-                            return match condition {
-                                command::Condition::Equals => *value == *expected,
-                            };
-                        }
-                    }
+                    let value = record.get(column);
 
-                    return true;
+                    match condition {
+                        command::Condition::Equals => value == *expected,
+                    }
                 });
 
-                for record in data {
-                    for (i, (_, value)) in record.iter().enumerate() {
-                        print!("{value}");
-                        if i != record.len() - 1 {
+                for record in filtered {
+                    for (i, col) in select.columns.iter().enumerate() {
+                        if i != 0 {
                             print!("|");
                         }
+                        let value = record.get(col);
+                        print!("{}", value.to_string());
                     }
                     println!();
                 }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 }

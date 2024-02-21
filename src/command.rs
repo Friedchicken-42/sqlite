@@ -1,4 +1,8 @@
+use std::borrow::Cow;
+
 use anyhow::{bail, Result};
+
+use crate::Value;
 
 trait Parse {
     fn parse(statements: &mut Vec<String>) -> Result<Self>
@@ -53,13 +57,13 @@ pub enum Condition {
 }
 
 #[derive(Debug)]
-pub struct WhereST {
+pub struct WhereST<'a> {
     pub column: String,
     pub condition: Condition,
-    pub expected: String,
+    pub expected: Value<'a>,
 }
 
-impl Parse for WhereST {
+impl<'a> Parse for WhereST<'a> {
     fn parse(statements: &mut Vec<String>) -> Result<Self> {
         let column = statements.remove(0);
         let condition = match statements.remove(0).as_str() {
@@ -67,31 +71,35 @@ impl Parse for WhereST {
             c => bail!("unmatched condition: {c:?}"),
         };
         let expected = statements.remove(0);
-        // TODO: remove this and add type checking for rows
-        let expected = if expected.starts_with("\'") {
-            expected[1..expected.len() - 1].to_string()
+
+        let expected = if expected == "null" {
+            Value::Null
+        } else if expected.starts_with("\'") {
+            Value::Text(Cow::Owned(expected[1..expected.len() - 1].to_string()))
+        } else if expected.contains(".") {
+            Value::Float(expected.parse::<f64>()?)
         } else {
-            expected
+            Value::Integer(expected.parse::<u64>()?)
         };
 
         Ok(Self {
-            column,
             condition,
+            column,
             expected,
         })
     }
 }
 
 #[derive(Debug)]
-pub enum Command {
+pub enum Command<'a> {
     Select {
         select: SelectST,
         from: FromST,
-        r#where: Option<WhereST>,
+        r#where: Option<WhereST<'a>>,
     },
 }
 
-impl Command {
+impl<'a> Command<'a> {
     pub fn parse(str: &str) -> Result<Command> {
         let mut statements = Command::lexer(str)?;
 
@@ -123,30 +131,40 @@ impl Command {
 
     fn lexer(str: &str) -> Result<Vec<String>> {
         let mut tokens = vec![String::new()];
+        let mut quote = false;
 
         for char in str.chars() {
-            match char {
-                'a'..='z' | 'A'..='Z' | '\'' => {
-                    tokens.last_mut().unwrap().push(char);
+            if quote {
+                if char == '\'' {
+                    quote = false
                 }
-                ' ' => {
-                    if !tokens.last().unwrap().is_empty() {
-                        tokens.push(String::new());
+                tokens.last_mut().unwrap().push(char);
+            } else {
+                match char {
+                    'a'..='z' | 'A'..='Z' | '_' | '\'' => {
+                        if char == '\'' {
+                            quote = true;
+                        }
+                        tokens.last_mut().unwrap().push(char);
                     }
-                }
-                c => {
-                    if let Some(last) = tokens.last_mut() {
-                        if last.is_empty() {
-                            last.push(c);
-                        } else {
-                            tokens.push(c.into());
+                    ' ' => {
+                        if !tokens.last().unwrap().is_empty() {
                             tokens.push(String::new());
+                        }
+                    }
+                    c => {
+                        if let Some(last) = tokens.last_mut() {
+                            if last.is_empty() {
+                                last.push(c);
+                            } else {
+                                tokens.push(c.into());
+                                tokens.push(String::new());
+                            }
                         }
                     }
                 }
             }
         }
-        println!("{tokens:?}");
 
         Ok(tokens)
     }
