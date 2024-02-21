@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod command;
 
 use std::{
@@ -5,8 +6,9 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 pub use command::Command;
+use command::WhereST;
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -327,15 +329,47 @@ impl Sqlite {
     pub fn execute(&self, command: Command) -> Result<()> {
         // TODO: output something
         match command {
-            Command::Select { select, from } => {
+            Command::Select {
+                select,
+                from,
+                r#where,
+            } => {
                 let table = self.table(from.table.as_str())?;
-                for record in table.records() {
-                    for (i, column) in select.columns.iter().enumerate() {
-                        let value = record.get(column).to_string(); // TODO: mabye better handling?
 
+                let data = table.records().map(|record| {
+                    select
+                        .columns
+                        .iter()
+                        .map(move |column| (column, record.get(column).to_string()))
+                        .collect::<Vec<_>>()
+                    // TODO: better handling
+                });
+
+                let data = data.filter(|record| {
+                    let Some(WhereST {
+                        ref column,
+                        ref condition,
+                        ref expected,
+                    }) = r#where
+                    else {
+                        return true;
+                    };
+
+                    for (col, value) in record {
+                        if *col == column {
+                            return match condition {
+                                command::Condition::Equals => *value == *expected,
+                            };
+                        }
+                    }
+
+                    return true;
+                });
+
+                for record in data {
+                    for (i, (_, value)) in record.iter().enumerate() {
                         print!("{value}");
-
-                        if i != select.columns.len() - 1 {
+                        if i != record.len() - 1 {
                             print!("|");
                         }
                     }
