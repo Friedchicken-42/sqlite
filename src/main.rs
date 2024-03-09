@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sqlite::{Command, Sqlite, Value};
+use sqlite::{command::Command, Sqlite, Value};
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -19,21 +19,22 @@ fn main() -> Result<()> {
             println!("database page size: {}", db.header.page_size);
 
             let page = db.root()?;
-            let cells = page.header.cells;
-            println!("number of tables: {}", cells);
+            println!("number of tables: {}", page.count());
         }
         ".tables" => {
-            let schema = db.root()?;
+            let root = db.root()?;
 
-            for record in schema.records() {
-                let Value::Text(name) = record.get("name") else {
-                    panic!("expected text")
+            for cell in root.cells() {
+                let Value::Text(name) = cell.get("tbl_name")? else {
+                    panic!("expected text");
                 };
+
                 if name != "sqlite_sequence" {
-                    print!("{} ", name);
+                    print!("{name} ");
                 }
             }
-            println!();
+
+            println!()
         }
         command => {
             let command = Command::parse(command)?;

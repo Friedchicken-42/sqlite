@@ -1,15 +1,16 @@
 #![allow(dead_code)]
+
 pub mod command;
 
+use anyhow::{anyhow, bail, Result};
+use command::Command;
 use std::{
     borrow::Cow,
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
 
-use anyhow::{Context, Result};
-pub use command::Command;
-use command::WhereST;
+use crate::command::{Condition, WhereSt};
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -66,54 +67,61 @@ fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
     (record_sizes, offset)
 }
 
-fn parse_sql<'a>(s: &str) -> Vec<(String, Value<'a>)> {
-    let s = s.replace("\t", "").replace("\n", "");
-    let (_, s) = s.split_once("(").unwrap();
-    let (s, _) = s.split_once(")").unwrap();
+fn parse_sql(s: &str) -> Schema {
+    let s = s.replace(['\t', '\n'], "");
+    let (_, s) = s.split_once('(').unwrap();
+    let (s, _) = s.split_once(')').unwrap();
 
-    let cols = s.split(",");
+    let cols = s.split(',');
 
     let mut schema = vec![];
 
     for col in cols {
         let split = col.split_whitespace().collect::<Vec<_>>();
         let name = split[0].to_string();
-        let r#type = split[1];
 
-        let value = match r#type {
-            "text" => Value::Text("".into()),
-            "integer" => Value::Integer(0),
+        let r#type = match split[1] {
+            "text" => Type::Text,
+            "integer" => Type::Integer,
             t => panic!("missing type: {t}"),
         };
 
-        schema.push((name, value));
+        schema.push((name, r#type));
     }
 
-    schema
+    Schema(schema)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Type {
+    Null,
+    Integer,
+    Float,
+    Text,
+    Blob,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Value<'a> {
+    Null,
+    Integer(u32),
+    Float(f64),
+    Text(Cow<'a, str>),
+    Blob(&'a [u8]),
 }
 
 #[derive(Debug)]
-pub struct Header {
-    pub page_size: usize,
+pub struct Schema(Vec<(String, Type)>);
+
+pub struct PageHeader {
+    page_type: usize,
+    freeblock: usize,
+    cells: usize,
+    offset: usize,
+    frag: usize,
 }
 
-impl Header {
-    fn read(data: &[u8]) -> Self {
-        let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
-        Self { page_size }
-    }
-}
-
-#[derive(Debug)]
-pub struct BTreeHeader {
-    pub page_type: usize,
-    pub freeblock: usize,
-    pub cells: usize,
-    pub offset: usize,
-    pub frag: usize,
-}
-
-impl BTreeHeader {
+impl PageHeader {
     fn read(data: &[u8]) -> Self {
         Self {
             page_type: data[0] as usize,
@@ -125,14 +133,42 @@ impl BTreeHeader {
     }
 }
 
-pub struct Record<'a> {
-    payload: Vec<Vec<u8>>,
-    schema: &'a [(String, Value<'a>)],
-    pub rowid: u64,
+pub struct Page {
+    pub header: PageHeader,
+    pointers: Vec<usize>,
+    data: Vec<u8>,
 }
 
-impl<'a> Record<'a> {
-    fn read(data: &[u8], schema: &'a [(String, Value)]) -> (Self, usize) {
+impl Page {
+    fn read(data: Vec<u8>, index: usize) -> Self {
+        let offset = if index == 1 { 100 } else { 0 };
+        let header = PageHeader::read(&data[offset..]);
+
+        let offset = offset + 8;
+        let pointers = (0..header.cells)
+            .map(|i| {
+                let off = offset + i * 2;
+                u16::from_be_bytes([data[off], data[off + 1]]) as usize
+            })
+            .collect();
+
+        Self {
+            header,
+            pointers,
+            data,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Cell<'a> {
+    data: Vec<&'a [u8]>,
+    rowid: u64,
+    schema: &'a Schema,
+}
+
+impl<'a> Cell<'a> {
+    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
         let mut offset = 0;
         let (payload_bytes, size) = read_varint(&data[offset..]);
         offset += size;
@@ -143,131 +179,133 @@ impl<'a> Record<'a> {
         let (sizes, size) = parse_bytearray(&data[offset..]);
         let mut values_offset = offset + size;
 
-        let mut payload = Vec::with_capacity(sizes.len());
+        let mut records = Vec::with_capacity(sizes.len());
         for size in sizes {
-            let value = data[values_offset..][..size].to_vec();
-            payload.push(value);
+            let value = &data[values_offset..][..size];
+            records.push(value);
             values_offset += size;
         }
 
-        offset += payload_bytes as usize;
-
-        (
-            Record {
-                payload,
-                rowid,
-                schema,
-            },
-            offset,
-        )
-    }
-
-    pub fn get(&'a self, column: &str) -> Value {
-        let (index, (_, r#type)) = self
-            .schema
-            .iter()
-            .enumerate()
-            .find(|(_, (name, _))| *name == column)
-            .unwrap();
-
-        // TODO: When an SQL table includes an INTEGER PRIMARY KEY,
-        //       that column appears in the record as a NULL value.
-        //       Use the `rowid` field.
-
-        let value = &self.payload[index];
-
-        match r#type {
-            &Value::Text(_) => {
-                let text = std::str::from_utf8(&value).unwrap();
-                Value::Text(text.into())
-            }
-            &Value::Integer(_) => Value::Integer(value[0] as u64),
-            _ => unimplemented!(),
+        Self {
+            data: records,
+            rowid,
+            schema,
         }
     }
+
+    pub fn get(&self, column: &str) -> Result<Value<'a>> {
+        let Some(index) = self.schema.0.iter().position(|(name, _)| name == column) else {
+            bail!("column: {column} not found")
+        };
+
+        let (_, r#type) = &self.schema.0[index];
+        let data = self.data[index];
+
+        if data.is_empty() && *r#type != Type::Null {
+            bail!("Empty data")
+        }
+
+        let value = match r#type {
+            Type::Null => Value::Null,
+            Type::Integer => Value::Integer(data[0] as u32),
+            Type::Float => todo!(),
+            Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
+            Type::Blob => todo!(),
+        };
+
+        Ok(value)
+    }
+
+    pub fn all(&self) -> Result<Vec<Value<'a>>> {
+        // TODO: optimize this
+        self.schema
+            .0
+            .iter()
+            .map(|(name, _)| match self.get(name) {
+                Err(_) if name == "id" => Ok(Value::Integer(self.rowid as u32)),
+                x => x,
+            })
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
-pub struct RecordIter<'a> {
-    records: usize,
-    current: usize,
-    offset: usize,
-    base: &'a BTreePage<'a>,
-    page: &'a BTreePage<'a>,
-    db: &'a Sqlite,
+pub struct CellIter<'a> {
+    btreepage: &'a BTreePage<'a>,
+    index: usize,
 }
 
-impl<'a> Iterator for RecordIter<'a> {
-    type Item = Record<'a>;
+impl<'a> Iterator for CellIter<'a> {
+    type Item = Cell<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == self.records {
+        if self.index >= self.btreepage.count() {
             return None;
         }
 
-        let (record, size) = Record::read(&self.page.data[self.offset..], &self.base.schema);
-        self.offset += size;
-
-        // TODO: overflow page
-        self.current += 1;
-        Some(record)
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Value<'a> {
-    Null,
-    Integer(u64),
-    Float(f64),
-    Text(Cow<'a, str>),
-    Blob(&'a [u8]),
-}
-
-impl<'a> ToString for Value<'a> {
-    fn to_string(&self) -> String {
-        match self {
-            Value::Null => "null".into(),
-            Value::Integer(n) => format!("{n}"),
-            Value::Float(n) => format!("{n}"),
-            Value::Text(t) => t.to_string(),
-            Value::Blob(b) => format!("{b:02x?}"),
+        // TODO: support other page types
+        let page = self.btreepage.pages.first().unwrap();
+        match page.header.page_type {
+            0x0d => (),
+            p => panic!("unsupported page: {p}"),
         }
+        let offset = page.pointers[self.index];
+
+        let cell = Cell::read(&page.data[offset..], &self.btreepage.schema);
+
+        self.index += 1;
+
+        Some(cell)
     }
 }
 
 pub struct BTreePage<'a> {
-    data: Vec<u8>,
-    pub header: BTreeHeader,
-    schema: Vec<(String, Value<'a>)>,
-    index: usize,
+    pages: Vec<Page>,
+    schema: Schema,
     db: &'a Sqlite,
 }
 
 impl<'a> BTreePage<'a> {
-    fn read(data: Vec<u8>, index: usize, db: &'a Sqlite, schema: Vec<(String, Value<'a>)>) -> Self {
-        let offset = if index == 1 { 100 } else { 0 };
-        let header = BTreeHeader::read(&data[offset..]);
+    fn read(db: &'a Sqlite, index: usize, schema: Schema) -> Result<Self> {
+        let first_page = db.page(index)?;
 
-        Self {
-            data,
-            header,
-            index,
+        Ok(Self {
+            pages: vec![first_page],
             schema,
             db,
-        }
+        })
     }
 
-    pub fn records(&self) -> RecordIter {
-        RecordIter {
-            records: self.header.cells,
-            current: 0,
-            offset: self.header.offset,
-            base: self,
-            page: self,
-            db: self.db,
+    pub fn count(&self) -> usize {
+        self.pages
+            .first()
+            .expect("Must be present at least one page")
+            .header
+            .cells
+    }
+
+    pub fn cells(&'a self) -> CellIter<'a> {
+        CellIter {
+            btreepage: self,
+            index: 0,
         }
     }
 }
 
+#[derive(Debug)]
+pub struct Header {
+    pub page_size: usize,
+}
+
+impl Header {
+    fn read(data: &[u8]) -> Result<Self> {
+        let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
+        let page_size = if page_size == 1 { 65536 } else { page_size };
+
+        Ok(Self { page_size })
+    }
+}
+
+#[derive(Debug)]
 pub struct Sqlite {
     file: File,
     pub header: Header,
@@ -279,97 +317,102 @@ impl Sqlite {
 
         let mut buf = vec![0; 100];
         (&file).read_exact(&mut buf)?;
-        let header = Header::read(&buf);
+        let header = Header::read(&buf)?;
 
         Ok(Self { file, header })
     }
 
-    fn page<'a>(&'a self, index: usize, schema: Vec<(String, Value<'a>)>) -> Result<BTreePage> {
+    pub fn page(&self, index: usize) -> Result<Page> {
         let offset = (index - 1) * self.header.page_size;
 
         (&self.file).seek(SeekFrom::Start(offset as u64))?;
         let mut data = vec![0; self.header.page_size];
         (&self.file).read_exact(&mut data)?;
 
-        Ok(BTreePage::read(data, index, self, schema))
+        Ok(Page::read(data, index))
     }
 
     pub fn root(&self) -> Result<BTreePage> {
-        let schema = vec![
-            ("type".into(), Value::Text("".into())),
-            ("name".into(), Value::Text("".into())),
-            ("tbl_name".into(), Value::Text("".into())),
-            ("rootpage".into(), Value::Integer(0)),
-            ("sql".into(), Value::Text("".into())),
-        ];
-        self.page(1, schema)
+        let schema = Schema(vec![
+            ("type".into(), Type::Text),
+            ("name".into(), Type::Text),
+            ("tbl_name".into(), Type::Text),
+            ("rootpage".into(), Type::Integer),
+            ("sql".into(), Type::Text),
+        ]);
+
+        BTreePage::read(self, 1, schema)
     }
 
     pub fn table(&self, name: &str) -> Result<BTreePage> {
-        let schema = self.root()?;
-        let record = schema
-            .records()
-            .find(|r| {
-                let Value::Text(tbl_name) = r.get("tbl_name") else {
-                    panic!("expected text")
+        let root = self.root()?;
+        let cell = root
+            .cells()
+            .find(|cell| {
+                let Value::Text(tbl_name) = cell.get("tbl_name").unwrap() else {
+                    panic!("expected \"tbl_name\" to be \"Text\"");
                 };
                 name == tbl_name
             })
-            .context(format!("no table named {name:?}"))?;
+            .ok_or(anyhow!("table \"{name}\" not found"))?;
 
-        let Value::Integer(rootpage) = record.get("rootpage") else {
+        let Value::Integer(rootpage) = cell.get("rootpage")? else {
             anyhow::bail!("expected integer");
         };
 
-        let Value::Text(sql) = record.get("sql") else {
+        let Value::Text(sql) = cell.get("sql")? else {
             anyhow::bail!("expected text");
         };
 
         let schema = parse_sql(&sql);
 
-        let page = self.page(rootpage as usize, schema)?;
-        Ok(page)
+        BTreePage::read(self, rootpage as usize, schema)
     }
 
-    pub fn execute<'a>(&self, command: Command) -> Result<()> {
+    pub fn execute(&self, command: Command) -> Result<()> {
+        // TODO: should return values here?
         match command {
             Command::Select {
                 select,
                 from,
                 r#where,
             } => {
-                let table = self.table(from.table.as_str())?;
-
-                let filtered = table.records().filter(|record| {
-                    let Some(WhereST {
-                        column,
-                        condition,
-                        expected,
-                    }) = &r#where
-                    else {
-                        return true;
-                    };
-
-                    let value = record.get(column);
-
-                    match condition {
-                        command::Condition::Equals => value == *expected,
-                    }
-                });
-
-                for record in filtered {
-                    for (i, col) in select.columns.iter().enumerate() {
-                        if i != 0 {
-                            print!("|");
+                let table = self.table(&from.table)?;
+                let cells = table
+                    .cells()
+                    .filter(|cell| {
+                        let Some(WhereSt {
+                            ref column,
+                            ref condition,
+                            ref expected,
+                        }) = r#where
+                        else {
+                            return true;
+                        };
+                        let value = cell.get(column).unwrap();
+                        match condition {
+                            Condition::Equals => value == *expected,
                         }
-                        let value = record.get(col);
-                        print!("{}", value.to_string());
-                    }
-                    println!();
-                }
+                    })
+                    .map(|cell| {
+                        select
+                            .columns
+                            .iter()
+                            .flat_map(|name| {
+                                if name == "*" {
+                                    cell.all().unwrap()
+                                } else {
+                                    vec![cell.get(name).unwrap()]
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    });
 
-                Ok(())
+                for cell in cells {
+                    println!("{cell:?}");
+                }
             }
         }
+        Ok(())
     }
 }
