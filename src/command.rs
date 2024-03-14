@@ -183,7 +183,6 @@ pub enum Command<'a> {
 impl<'a> Command<'a> {
     pub fn parse(string: &str) -> Result<Self> {
         let mut statements = Self::lexer(string)?;
-        println!("statements: {statements:?}");
 
         // TODO: better cases
         let command = match statements[..] {
@@ -201,7 +200,6 @@ impl<'a> Command<'a> {
                 }
             }
             ["create" | "CREATE", "table" | "TABLE", name, ..] => {
-                println!("create table");
                 statements.drain(0..3);
                 let schema = Schema::parse(&mut statements)?
                     .ok_or(format_err!("[create table] missing schema"))?;
@@ -227,8 +225,8 @@ impl<'a> Command<'a> {
 
         for char in string.chars() {
             match (quote, char) {
-                (false, '\'') => quote = !quote,
-                (true, '\'') => {
+                (false, '\'' | '\"') => quote = !quote,
+                (true, '\'' | '\"') => {
                     quote = !quote;
                     tokens.push(&string[starting..ending + 1]);
                     starting = ending + 1;

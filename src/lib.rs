@@ -99,7 +99,7 @@ impl<'a> Display for Value<'a> {
 }
 
 #[derive(Debug)]
-pub struct Schema(Vec<(String, Type)>);
+pub struct Schema(pub Vec<(String, Type)>);
 
 #[derive(Debug)]
 pub struct PageHeader {
@@ -108,6 +108,7 @@ pub struct PageHeader {
     cells: usize,
     offset: usize,
     frag: usize,
+    right_pointer: Option<usize>,
 }
 
 impl PageHeader {
@@ -118,6 +119,11 @@ impl PageHeader {
             cells: u16::from_be_bytes([data[3], data[4]]) as usize,
             offset: u16::from_be_bytes([data[5], data[6]]) as usize,
             frag: data[7] as usize,
+            right_pointer: if data[0] == 0x05 {
+                Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize)
+            } else {
+                None
+            },
         }
     }
 }
@@ -240,7 +246,7 @@ impl InteriorCell {
 pub struct BTreePage<'a> {
     pages: Vec<Page>,
     indexes: Vec<usize>,
-    schema: Schema,
+    pub schema: Schema,
     db: &'a Sqlite,
 }
 
@@ -274,6 +280,7 @@ impl<'a> BTreePage<'a> {
             match self.pages.last().unwrap().header.page_type {
                 0x0d => {
                     let index = self.indexes.last_mut().unwrap();
+
                     if *index >= self.pages.last().unwrap().header.cells {
                         self.indexes.pop();
                         self.pages.pop();
@@ -293,15 +300,20 @@ impl<'a> BTreePage<'a> {
                     let page = self.pages.last().unwrap();
                     let index = self.indexes.last_mut().unwrap();
 
-                    if *index >= self.pages.last().unwrap().header.cells {
+                    if *index > self.pages.last().unwrap().header.cells {
                         self.indexes.pop();
                         self.pages.pop();
                     } else {
-                        let offset = page.pointers[*index];
+                        let page = if *index == page.header.cells {
+                            page.header.right_pointer.unwrap()
+                        } else {
+                            let offset = page.pointers[*index];
+                            let cell = InteriorCell::read(&page.data[offset..]);
 
-                        let cell = InteriorCell::read(&page.data[offset..]);
+                            cell.page as usize
+                        };
 
-                        let next_page = self.db.page(cell.page as usize).unwrap();
+                        let next_page = self.db.page(page as usize).unwrap();
 
                         *index += 1;
                         self.indexes.push(0);

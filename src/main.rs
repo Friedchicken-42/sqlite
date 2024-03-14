@@ -37,9 +37,29 @@ fn main() -> Result<()> {
 
             println!()
         }
+        ".schema" => {
+            let mut iter = db.root()?;
+
+            while let Some(table) = iter.next() {
+                let Value::Text(name) = table.get("tbl_name")? else {
+                    panic!("expected text");
+                };
+
+                if name == "sqlite_sequence" {
+                    continue;
+                }
+
+                println!("schema {name:?}");
+                let table = db.table(&name)?;
+
+                for (name, r#type) in table.schema.0 {
+                    println!("{name:?}: {:?}", r#type);
+                }
+                println!();
+            }
+        }
         command => {
             let command = Command::parse(command)?;
-            println!("command: {command:?}");
             db.execute(command)?;
         }
     };
