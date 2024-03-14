@@ -2,15 +2,17 @@ use std::borrow::Cow;
 
 use anyhow::{bail, format_err, Result};
 
-use crate::Value;
+use crate::{Schema, Type, Value};
 
 trait Parse {
-    fn parse(statements: &mut Vec<String>) -> Result<Option<Self>>
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
     where
         Self: Sized;
 
-    fn check(statements: &mut Vec<String>, name: &str) -> bool {
-        statements.first().is_some_and(|stmt| stmt == name)
+    fn check(statements: &mut Vec<&str>, name: &str) -> bool {
+        statements
+            .first()
+            .is_some_and(|stmt| stmt.to_lowercase() == name)
     }
 }
 
@@ -20,7 +22,7 @@ pub struct SelectSt {
 }
 
 impl Parse for SelectSt {
-    fn parse(statements: &mut Vec<String>) -> Result<Option<Self>>
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
     where
         Self: Sized,
     {
@@ -36,8 +38,8 @@ impl Parse for SelectSt {
                 anyhow::bail!("missing statement");
             }
 
-            columns.push(statements.remove(0));
-            if !statements.first().is_some_and(|s| s == ",") {
+            columns.push(statements.remove(0).to_string());
+            if !statements.first().is_some_and(|s| *s == ",") {
                 break;
             }
             statements.remove(0);
@@ -53,7 +55,7 @@ pub struct FromSt {
 }
 
 impl Parse for FromSt {
-    fn parse(statements: &mut Vec<String>) -> Result<Option<Self>>
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
     where
         Self: Sized,
     {
@@ -66,7 +68,7 @@ impl Parse for FromSt {
             anyhow::bail!("missing statement");
         }
 
-        let table = statements.remove(0);
+        let table = statements.remove(0).to_string();
         Ok(Some(Self { table }))
     }
 }
@@ -85,7 +87,7 @@ pub struct WhereSt<'a> {
 }
 
 impl<'a> Parse for WhereSt<'a> {
-    fn parse(statements: &mut Vec<String>) -> Result<Option<Self>>
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
     where
         Self: Sized,
     {
@@ -94,8 +96,8 @@ impl<'a> Parse for WhereSt<'a> {
         }
         statements.remove(0);
 
-        let column = statements.remove(0);
-        let condition = match statements.remove(0).as_str() {
+        let column = statements.remove(0).to_string();
+        let condition = match statements.remove(0) {
             "=" => Condition::Equals,
             c => bail!("unmatched condition: {c:?}"),
         };
@@ -119,6 +121,51 @@ impl<'a> Parse for WhereSt<'a> {
     }
 }
 
+impl Parse for Schema {
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        let mut schema = vec![];
+        if !Self::check(statements, "(") {
+            bail!("missing \"(\"")
+        }
+        statements.remove(0);
+
+        loop {
+            let (name, r#type) = match statements[..] {
+                [name, r#type, ..] => {
+                    let r#type = match r#type {
+                        "integer" => Type::Integer,
+                        "text" => Type::Text,
+                        s => bail!("[schema] unparsed {s}"),
+                    };
+                    (name.to_string(), r#type)
+                }
+                [")"] => break,
+                [c] => bail!("unexpected pattern: {c:?}"),
+                [] => bail!("malformed statement"),
+            };
+
+            schema.push((name, r#type));
+            statements.drain(0..2);
+
+            while let Some(other) = statements.first() {
+                match *other {
+                    "," => {
+                        statements.remove(0);
+                        break;
+                    }
+                    ")" => break,
+                    _ => statements.remove(0),
+                };
+            }
+        }
+
+        Ok(Some(Self(schema)))
+    }
+}
+
 #[derive(Debug)]
 pub enum Command<'a> {
     Select {
@@ -126,14 +173,21 @@ pub enum Command<'a> {
         from: FromSt,
         r#where: Option<WhereSt<'a>>,
     },
+
+    CreateTable {
+        table: String,
+        schema: Schema,
+    },
 }
 
 impl<'a> Command<'a> {
     pub fn parse(string: &str) -> Result<Self> {
         let mut statements = Self::lexer(string)?;
+        println!("statements: {statements:?}");
 
-        let command = match statements[0].as_str() {
-            "select" => {
+        // TODO: better cases
+        let command = match statements[..] {
+            ["select" | "SELECT", ..] => {
                 let select = SelectSt::parse(&mut statements)?
                     .ok_or(format_err!("[select] select statemente required"))?;
                 let from = FromSt::parse(&mut statements)?
@@ -146,49 +200,60 @@ impl<'a> Command<'a> {
                     r#where,
                 }
             }
-            c => bail!("Unhandled command: {c:?}"),
+            ["create" | "CREATE", "table" | "TABLE", name, ..] => {
+                println!("create table");
+                statements.drain(0..3);
+                let schema = Schema::parse(&mut statements)?
+                    .ok_or(format_err!("[create table] missing schema"))?;
+
+                Command::CreateTable {
+                    table: name.to_string(),
+                    schema,
+                }
+            }
+            [] => bail!("Empty query"),
+            _ => bail!("Unhandle query"),
         };
 
         Ok(command)
     }
 
-    fn lexer(string: &str) -> Result<Vec<String>> {
-        let mut tokens = vec![String::new()];
+    fn lexer(string: &str) -> Result<Vec<&str>> {
+        let mut tokens = vec![];
+
+        let mut starting = 0;
+        let mut ending = 0;
         let mut quote = false;
 
         for char in string.chars() {
-            if quote {
-                if char == '\'' {
-                    quote = false
+            match (quote, char) {
+                (false, '\'') => quote = !quote,
+                (true, '\'') => {
+                    quote = !quote;
+                    tokens.push(&string[starting..ending + 1]);
+                    starting = ending + 1;
                 }
-                tokens.last_mut().unwrap().push(char);
-            } else {
-                match char {
-                    'a'..='z' | 'A'..='Z' | '_' | '\'' => {
-                        if char == '\'' {
-                            quote = true;
-                        }
-                        tokens.last_mut().unwrap().push(char);
+                (false, ' ' | '\n' | '\t') => {
+                    if starting != ending {
+                        tokens.push(&string[starting..ending]);
                     }
-                    ' ' => {
-                        if !tokens.last().unwrap().is_empty() {
-                            tokens.push(String::new());
-                        }
-                    }
-                    c => {
-                        if let Some(last) = tokens.last_mut() {
-                            if last.is_empty() {
-                                last.push(c);
-                            } else {
-                                tokens.push(c.into());
-                                tokens.push(String::new());
-                            }
-                        }
-                    }
+                    starting = ending + 1;
                 }
+                (false, ',' | '(' | ')') => {
+                    if starting != ending {
+                        tokens.push(&string[starting..ending]);
+                    }
+                    tokens.push(&string[ending..ending + 1]);
+                    starting = ending + 1;
+                }
+                _ => {}
             }
+            ending += 1;
         }
 
+        if starting != ending {
+            tokens.push(&string[starting..ending]);
+        }
         Ok(tokens)
     }
 }

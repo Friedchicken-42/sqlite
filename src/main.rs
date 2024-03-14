@@ -22,9 +22,10 @@ fn main() -> Result<()> {
             println!("number of tables: {}", page.count());
         }
         ".tables" => {
-            let root = db.root()?;
+            let mut iter = db.root()?;
 
-            for cell in root.cells() {
+            while let Some(cell) = iter.next() {
+                // for cell in root.cells() {
                 let Value::Text(name) = cell.get("tbl_name")? else {
                     panic!("expected text");
                 };
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
         }
         command => {
             let command = Command::parse(command)?;
+            println!("command: {command:?}");
             db.execute(command)?;
         }
     };

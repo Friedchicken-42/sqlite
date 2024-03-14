@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use command::Command;
 use std::{
     borrow::Cow,
+    fmt::Display,
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
@@ -67,31 +68,6 @@ fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
     (record_sizes, offset)
 }
 
-fn parse_sql(s: &str) -> Schema {
-    let s = s.replace(['\t', '\n'], "");
-    let (_, s) = s.split_once('(').unwrap();
-    let (s, _) = s.split_once(')').unwrap();
-
-    let cols = s.split(',');
-
-    let mut schema = vec![];
-
-    for col in cols {
-        let split = col.split_whitespace().collect::<Vec<_>>();
-        let name = split[0].to_string();
-
-        let r#type = match split[1] {
-            "text" => Type::Text,
-            "integer" => Type::Integer,
-            t => panic!("missing type: {t}"),
-        };
-
-        schema.push((name, r#type));
-    }
-
-    Schema(schema)
-}
-
 #[derive(Debug, PartialEq)]
 pub enum Type {
     Null,
@@ -110,9 +86,22 @@ pub enum Value<'a> {
     Blob(&'a [u8]),
 }
 
+impl<'a> Display for Value<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => write!(f, ""),
+            Value::Integer(value) => write!(f, "{value}"),
+            Value::Float(value) => write!(f, "{value}"),
+            Value::Text(str) => write!(f, "{str}"),
+            Value::Blob(bin) => write!(f, "{bin:0x?}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Schema(Vec<(String, Type)>);
 
+#[derive(Debug)]
 pub struct PageHeader {
     page_type: usize,
     freeblock: usize,
@@ -144,7 +133,12 @@ impl Page {
         let offset = if index == 1 { 100 } else { 0 };
         let header = PageHeader::read(&data[offset..]);
 
-        let offset = offset + 8;
+        let offset = if header.page_type == 0x05 {
+            offset + 12
+        } else {
+            offset + 8
+        };
+
         let pointers = (0..header.cells)
             .map(|i| {
                 let off = offset + i * 2;
@@ -161,13 +155,13 @@ impl Page {
 }
 
 #[derive(Debug)]
-pub struct Cell<'a> {
+pub struct LeafCell<'a> {
     data: Vec<&'a [u8]>,
     rowid: u64,
     schema: &'a Schema,
 }
 
-impl<'a> Cell<'a> {
+impl<'a> LeafCell<'a> {
     fn read(data: &'a [u8], schema: &'a Schema) -> Self {
         let mut offset = 0;
         let (payload_bytes, size) = read_varint(&data[offset..]);
@@ -201,8 +195,8 @@ impl<'a> Cell<'a> {
         let (_, r#type) = &self.schema.0[index];
         let data = self.data[index];
 
-        if data.is_empty() && *r#type != Type::Null {
-            bail!("Empty data")
+        if data.is_empty() {
+            return Ok(Value::Null);
         }
 
         let value = match r#type {
@@ -222,44 +216,30 @@ impl<'a> Cell<'a> {
             .0
             .iter()
             .map(|(name, _)| match self.get(name) {
-                Err(_) if name == "id" => Ok(Value::Integer(self.rowid as u32)),
+                Ok(Value::Null) if name == "id" => Ok(Value::Integer(self.rowid as u32)),
                 x => x,
             })
             .collect::<Result<Vec<_>>>()
     }
 }
 
-pub struct CellIter<'a> {
-    btreepage: &'a BTreePage<'a>,
-    index: usize,
+struct InteriorCell {
+    page: u32,
+    key: u64,
 }
 
-impl<'a> Iterator for CellIter<'a> {
-    type Item = Cell<'a>;
+impl InteriorCell {
+    fn read(data: &[u8]) -> Self {
+        let page = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let (key, _) = read_varint(&data[4..]);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.btreepage.count() {
-            return None;
-        }
-
-        // TODO: support other page types
-        let page = self.btreepage.pages.first().unwrap();
-        match page.header.page_type {
-            0x0d => (),
-            p => panic!("unsupported page: {p}"),
-        }
-        let offset = page.pointers[self.index];
-
-        let cell = Cell::read(&page.data[offset..], &self.btreepage.schema);
-
-        self.index += 1;
-
-        Some(cell)
+        Self { page, key }
     }
 }
 
 pub struct BTreePage<'a> {
     pages: Vec<Page>,
+    indexes: Vec<usize>,
     schema: Schema,
     db: &'a Sqlite,
 }
@@ -270,6 +250,7 @@ impl<'a> BTreePage<'a> {
 
         Ok(Self {
             pages: vec![first_page],
+            indexes: vec![0],
             schema,
             db,
         })
@@ -283,10 +264,52 @@ impl<'a> BTreePage<'a> {
             .cells
     }
 
-    pub fn cells(&'a self) -> CellIter<'a> {
-        CellIter {
-            btreepage: self,
-            index: 0,
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<LeafCell<'_>> {
+        loop {
+            if self.pages.is_empty() {
+                return None;
+            }
+
+            match self.pages.last().unwrap().header.page_type {
+                0x0d => {
+                    let index = self.indexes.last_mut().unwrap();
+                    if *index >= self.pages.last().unwrap().header.cells {
+                        self.indexes.pop();
+                        self.pages.pop();
+                    } else {
+                        let page = self.pages.last().unwrap();
+
+                        let offset = page.pointers[*index];
+
+                        let cell = LeafCell::read(&page.data[offset..], &self.schema);
+
+                        *index += 1;
+
+                        return Some(cell);
+                    }
+                }
+                0x05 => {
+                    let page = self.pages.last().unwrap();
+                    let index = self.indexes.last_mut().unwrap();
+
+                    if *index >= self.pages.last().unwrap().header.cells {
+                        self.indexes.pop();
+                        self.pages.pop();
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        let cell = InteriorCell::read(&page.data[offset..]);
+
+                        let next_page = self.db.page(cell.page as usize).unwrap();
+
+                        *index += 1;
+                        self.indexes.push(0);
+                        self.pages.push(next_page);
+                    }
+                }
+                _ => todo!(),
+            }
         }
     }
 }
@@ -345,28 +368,33 @@ impl Sqlite {
     }
 
     pub fn table(&self, name: &str) -> Result<BTreePage> {
-        let root = self.root()?;
-        let cell = root
-            .cells()
-            .find(|cell| {
-                let Value::Text(tbl_name) = cell.get("tbl_name").unwrap() else {
-                    panic!("expected \"tbl_name\" to be \"Text\"");
-                };
-                name == tbl_name
-            })
-            .ok_or(anyhow!("table \"{name}\" not found"))?;
+        let mut iter = self.root()?;
 
-        let Value::Integer(rootpage) = cell.get("rootpage")? else {
-            anyhow::bail!("expected integer");
-        };
+        while let Some(cell) = iter.next() {
+            let Value::Text(tbl_name) = cell.get("tbl_name").unwrap() else {
+                panic!("expected \"tbl_name\" to be \"Text\"");
+            };
 
-        let Value::Text(sql) = cell.get("sql")? else {
-            anyhow::bail!("expected text");
-        };
+            if name != tbl_name {
+                continue;
+            }
 
-        let schema = parse_sql(&sql);
+            let Value::Integer(rootpage) = cell.get("rootpage")? else {
+                anyhow::bail!("expected integer");
+            };
 
-        BTreePage::read(self, rootpage as usize, schema)
+            let Value::Text(sql) = cell.get("sql")? else {
+                anyhow::bail!("expected text");
+            };
+
+            let Command::CreateTable { schema, .. } = Command::parse(&sql)? else {
+                bail!("wrong sql command");
+            };
+
+            return BTreePage::read(self, rootpage as usize, schema);
+        }
+
+        bail!("column {name:?} not found")
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
@@ -377,41 +405,47 @@ impl Sqlite {
                 from,
                 r#where,
             } => {
-                let table = self.table(&from.table)?;
-                let cells = table
-                    .cells()
-                    .filter(|cell| {
-                        let Some(WhereSt {
-                            ref column,
-                            ref condition,
-                            ref expected,
-                        }) = r#where
-                        else {
-                            return true;
-                        };
+                let mut iter = self.table(&from.table)?;
+
+                while let Some(cell) = iter.next() {
+                    let condition = if let Some(WhereSt {
+                        ref column,
+                        ref condition,
+                        ref expected,
+                    }) = r#where
+                    {
                         let value = cell.get(column).unwrap();
                         match condition {
                             Condition::Equals => value == *expected,
                         }
-                    })
-                    .map(|cell| {
-                        select
-                            .columns
-                            .iter()
-                            .flat_map(|name| {
-                                if name == "*" {
-                                    cell.all().unwrap()
-                                } else {
-                                    vec![cell.get(name).unwrap()]
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    });
+                    } else {
+                        true
+                    };
 
-                for cell in cells {
-                    println!("{cell:?}");
+                    if !condition {
+                        continue;
+                    }
+
+                    let rows = select
+                        .columns
+                        .iter()
+                        .flat_map(|name| {
+                            if name == "*" {
+                                cell.all().unwrap()
+                            } else {
+                                // TODO: error out if name does not exists
+                                vec![cell.get(name).unwrap()]
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    for row in rows {
+                        print!("{row} ");
+                    }
+                    println!();
                 }
             }
+            _ => bail!("cannot execute this command now"),
         }
         Ok(())
     }
