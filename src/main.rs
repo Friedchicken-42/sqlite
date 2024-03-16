@@ -41,7 +41,7 @@ fn main() -> Result<()> {
             let mut iter = db.root()?;
 
             while let Some(table) = iter.next() {
-                let Value::Text(name) = table.get("tbl_name")? else {
+                let Value::Text(name) = table.get("name")? else {
                     panic!("expected text");
                 };
 

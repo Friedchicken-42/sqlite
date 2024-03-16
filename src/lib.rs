@@ -2,7 +2,7 @@
 
 pub mod command;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use command::Command;
 use std::{
     borrow::Cow,
@@ -170,7 +170,7 @@ pub struct LeafCell<'a> {
 impl<'a> LeafCell<'a> {
     fn read(data: &'a [u8], schema: &'a Schema) -> Self {
         let mut offset = 0;
-        let (payload_bytes, size) = read_varint(&data[offset..]);
+        let (_payload_bytes, size) = read_varint(&data[offset..]);
         offset += size;
 
         let (rowid, size) = read_varint(&data[offset..]);
@@ -201,7 +201,9 @@ impl<'a> LeafCell<'a> {
         let (_, r#type) = &self.schema.0[index];
         let data = self.data[index];
 
-        if data.is_empty() {
+        if data.is_empty() && column == "id" {
+            return Ok(Value::Integer(self.rowid as u32));
+        } else if data.is_empty() {
             return Ok(Value::Null);
         }
 
@@ -221,10 +223,7 @@ impl<'a> LeafCell<'a> {
         self.schema
             .0
             .iter()
-            .map(|(name, _)| match self.get(name) {
-                Ok(Value::Null) if name == "id" => Ok(Value::Integer(self.rowid as u32)),
-                x => x,
-            })
+            .map(|(name, _)| self.get(name))
             .collect::<Result<Vec<_>>>()
     }
 }
@@ -277,11 +276,12 @@ impl<'a> BTreePage<'a> {
                 return None;
             }
 
-            match self.pages.last().unwrap().header.page_type {
-                0x0d => {
-                    let index = self.indexes.last_mut().unwrap();
+            let page = self.pages.last().unwrap();
+            let index = self.indexes.last_mut().unwrap();
 
-                    if *index >= self.pages.last().unwrap().header.cells {
+            match page.header.page_type {
+                0x0d => {
+                    if *index >= page.header.cells {
                         self.indexes.pop();
                         self.pages.pop();
                     } else {
@@ -297,10 +297,7 @@ impl<'a> BTreePage<'a> {
                     }
                 }
                 0x05 => {
-                    let page = self.pages.last().unwrap();
-                    let index = self.indexes.last_mut().unwrap();
-
-                    if *index > self.pages.last().unwrap().header.cells {
+                    if *index > page.header.cells {
                         self.indexes.pop();
                         self.pages.pop();
                     } else {
@@ -313,7 +310,7 @@ impl<'a> BTreePage<'a> {
                             cell.page as usize
                         };
 
-                        let next_page = self.db.page(page as usize).unwrap();
+                        let next_page = self.db.page(page).unwrap();
 
                         *index += 1;
                         self.indexes.push(0);
@@ -383,7 +380,7 @@ impl Sqlite {
         let mut iter = self.root()?;
 
         while let Some(cell) = iter.next() {
-            let Value::Text(tbl_name) = cell.get("tbl_name").unwrap() else {
+            let Value::Text(tbl_name) = cell.get("name").unwrap() else {
                 panic!("expected \"tbl_name\" to be \"Text\"");
             };
 
@@ -399,11 +396,16 @@ impl Sqlite {
                 anyhow::bail!("expected text");
             };
 
-            let Command::CreateTable { schema, .. } = Command::parse(&sql)? else {
-                bail!("wrong sql command");
+            return match Command::parse(&sql)? {
+                Command::CreateTable { schema, .. } => {
+                    BTreePage::read(self, rootpage as usize, schema)
+                }
+                Command::CreateIndex { .. } => {
+                    let _b = BTreePage::read(self, rootpage as usize, Schema(vec![]))?;
+                    bail!("index table not yet supported")
+                }
+                _ => bail!("wrong sql command"),
             };
-
-            return BTreePage::read(self, rootpage as usize, schema);
         }
 
         bail!("column {name:?} not found")
@@ -420,21 +422,7 @@ impl Sqlite {
                 let mut iter = self.table(&from.table)?;
 
                 while let Some(cell) = iter.next() {
-                    let condition = if let Some(WhereSt {
-                        ref column,
-                        ref condition,
-                        ref expected,
-                    }) = r#where
-                    {
-                        let value = cell.get(column).unwrap();
-                        match condition {
-                            Condition::Equals => value == *expected,
-                        }
-                    } else {
-                        true
-                    };
-
-                    if !condition {
+                    if r#where.as_ref().is_some_and(|w| !w.r#match(&cell)) {
                         continue;
                     }
 
@@ -451,8 +439,11 @@ impl Sqlite {
                         })
                         .collect::<Vec<_>>();
 
-                    for row in rows {
-                        print!("{row} ");
+                    for (i, row) in rows.iter().enumerate() {
+                        if i != 0 {
+                            print!("|")
+                        }
+                        print!("{row}");
                     }
                     println!();
                 }

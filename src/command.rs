@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use anyhow::{bail, format_err, Result};
 
-use crate::{Schema, Type, Value};
+use crate::{LeafCell, Schema, Type, Value};
 
 trait Parse {
     fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
@@ -121,6 +121,15 @@ impl<'a> Parse for WhereSt<'a> {
     }
 }
 
+impl WhereSt<'_> {
+    pub fn r#match(&self, cell: &LeafCell<'_>) -> bool {
+        let value = cell.get(&self.column).unwrap();
+        match self.condition {
+            Condition::Equals => value == self.expected,
+        }
+    }
+}
+
 impl Parse for Schema {
     fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
     where
@@ -167,6 +176,34 @@ impl Parse for Schema {
 }
 
 #[derive(Debug)]
+pub struct On {
+    table: String,
+    column: String,
+}
+
+impl Parse for On {
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        if !Self::check(statements, "on") {
+            return Ok(None);
+        }
+        statements.remove(0);
+
+        let table = statements.remove(0).to_string();
+        let ["(", column, ")"] = statements[..] else {
+            bail!("[create index] wrong format");
+        };
+
+        Ok(Some(Self {
+            table: table.to_string(),
+            column: column.to_string(),
+        }))
+    }
+}
+
+#[derive(Debug)]
 pub enum Command<'a> {
     Select {
         select: SelectSt,
@@ -177,6 +214,11 @@ pub enum Command<'a> {
     CreateTable {
         table: String,
         schema: Schema,
+    },
+
+    CreateIndex {
+        index: String,
+        on: On,
     },
 }
 
@@ -207,6 +249,17 @@ impl<'a> Command<'a> {
                 Command::CreateTable {
                     table: name.to_string(),
                     schema,
+                }
+            }
+            ["create" | "CREATE", "index" | "INDEX", index, ..] => {
+                statements.drain(0..3);
+
+                let on = On::parse(&mut statements)?
+                    .ok_or(format_err!("[create index] on statement requires"))?;
+
+                Command::CreateIndex {
+                    index: index.to_string(),
+                    on,
                 }
             }
             [] => bail!("Empty query"),
