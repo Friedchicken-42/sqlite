@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use anyhow::{bail, format_err, Result};
 
-use crate::{LeafCell, Schema, Type, Value};
+use crate::{Cell, Schema, Type, Value};
 
 trait Parse {
     fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
@@ -35,7 +35,7 @@ impl Parse for SelectSt {
 
         loop {
             if statements.is_empty() {
-                anyhow::bail!("missing statement");
+                bail!("missing statement");
             }
 
             columns.push(statements.remove(0).to_string());
@@ -65,7 +65,7 @@ impl Parse for FromSt {
         statements.remove(0);
 
         if statements.is_empty() {
-            anyhow::bail!("missing statement");
+            bail!("missing statement");
         }
 
         let table = statements.remove(0).to_string();
@@ -122,7 +122,7 @@ impl<'a> Parse for WhereSt<'a> {
 }
 
 impl WhereSt<'_> {
-    pub fn r#match(&self, cell: &LeafCell<'_>) -> bool {
+    pub fn r#match(&self, cell: &Cell<'_>) -> bool {
         let value = cell.get(&self.column).unwrap();
         match self.condition {
             Condition::Equals => value == self.expected,
@@ -145,7 +145,7 @@ impl Parse for Schema {
             let (name, r#type) = match statements[..] {
                 [name, r#type, ..] => {
                     let r#type = match r#type {
-                        "integer" => Type::Integer,
+                        "integer" | "int" => Type::Integer,
                         "text" => Type::Text,
                         s => bail!("[schema] unparsed {s}"),
                     };
@@ -177,8 +177,8 @@ impl Parse for Schema {
 
 #[derive(Debug)]
 pub struct On {
-    table: String,
-    column: String,
+    pub table: String,
+    pub columns: Vec<String>,
 }
 
 impl Parse for On {
@@ -192,13 +192,25 @@ impl Parse for On {
         statements.remove(0);
 
         let table = statements.remove(0).to_string();
-        let ["(", column, ")"] = statements[..] else {
-            bail!("[create index] wrong format");
-        };
+
+        statements.remove(0);
+
+        let mut columns = vec![];
+
+        loop {
+            match statements.first() {
+                Some(&")") => break,
+                Some(&",") => {}
+                Some(column) => columns.push(column.to_string()),
+                None => break,
+            };
+
+            statements.remove(0);
+        }
 
         Ok(Some(Self {
             table: table.to_string(),
-            column: column.to_string(),
+            columns,
         }))
     }
 }

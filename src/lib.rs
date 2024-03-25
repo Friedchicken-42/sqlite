@@ -11,7 +11,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
-use crate::command::{Condition, WhereSt};
+use crate::command::On;
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -68,7 +68,7 @@ fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
     (record_sizes, offset)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Type {
     Null,
     Integer,
@@ -119,7 +119,7 @@ impl PageHeader {
             cells: u16::from_be_bytes([data[3], data[4]]) as usize,
             offset: u16::from_be_bytes([data[5], data[6]]) as usize,
             frag: data[7] as usize,
-            right_pointer: if data[0] == 0x05 {
+            right_pointer: if data[0] == 0x05 || data[0] == 0x02 {
                 Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize)
             } else {
                 None
@@ -128,10 +128,11 @@ impl PageHeader {
     }
 }
 
+#[derive(Debug)]
 pub struct Page {
     pub header: PageHeader,
-    pointers: Vec<usize>,
-    data: Vec<u8>,
+    pub pointers: Vec<usize>,
+    pub data: Vec<u8>,
 }
 
 impl Page {
@@ -139,7 +140,7 @@ impl Page {
         let offset = if index == 1 { 100 } else { 0 };
         let header = PageHeader::read(&data[offset..]);
 
-        let offset = if header.page_type == 0x05 {
+        let offset = if header.right_pointer.is_some() {
             offset + 12
         } else {
             offset + 8
@@ -157,6 +158,61 @@ impl Page {
             pointers,
             data,
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum Cell<'a> {
+    Leaf(LeafCell<'a>),
+    Interior(InteriorCell),
+    LeafIndex(LeafIndexCell<'a>),
+    InteriorIndex(InteriorIndexCell<'a>),
+}
+
+impl<'a> Cell<'a> {
+    pub fn get(&self, column: &str) -> Result<Value<'a>> {
+        let (data, schema, rowid) = match self {
+            Cell::Leaf(leaf) => (&leaf.data, &leaf.schema, leaf.rowid),
+            Cell::LeafIndex(leaf) => (&leaf.data, &leaf.schema, 0),
+            _ => bail!("cannot `get` from an interior cell"),
+        };
+
+        let Some(index) = schema.0.iter().position(|(name, _)| name == column) else {
+            bail!("column: {column} not found")
+        };
+
+        let (_, r#type) = &schema.0[index];
+        let data = data[index];
+
+        if data.is_empty() && column == "id" {
+            return Ok(Value::Integer(rowid as u32));
+        } else if data.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        let value = match r#type {
+            Type::Null => Value::Null,
+            Type::Integer => Value::Integer(data[0] as u32),
+            Type::Float => todo!(),
+            Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
+            Type::Blob => Value::Blob(data),
+        };
+
+        Ok(value)
+    }
+
+    pub fn all(&self) -> Result<Vec<Value<'a>>> {
+        let schema = match self {
+            Cell::Leaf(leaf) => &leaf.schema,
+            Cell::LeafIndex(leaf) => &leaf.schema,
+            _ => bail!("cannot `get` from an interior cell"),
+        };
+        // TODO: optimize this
+        schema
+            .0
+            .iter()
+            .map(|(name, _)| self.get(name))
+            .collect::<Result<Vec<_>>>()
     }
 }
 
@@ -192,43 +248,10 @@ impl<'a> LeafCell<'a> {
             schema,
         }
     }
-
-    pub fn get(&self, column: &str) -> Result<Value<'a>> {
-        let Some(index) = self.schema.0.iter().position(|(name, _)| name == column) else {
-            bail!("column: {column} not found")
-        };
-
-        let (_, r#type) = &self.schema.0[index];
-        let data = self.data[index];
-
-        if data.is_empty() && column == "id" {
-            return Ok(Value::Integer(self.rowid as u32));
-        } else if data.is_empty() {
-            return Ok(Value::Null);
-        }
-
-        let value = match r#type {
-            Type::Null => Value::Null,
-            Type::Integer => Value::Integer(data[0] as u32),
-            Type::Float => todo!(),
-            Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
-            Type::Blob => todo!(),
-        };
-
-        Ok(value)
-    }
-
-    pub fn all(&self) -> Result<Vec<Value<'a>>> {
-        // TODO: optimize this
-        self.schema
-            .0
-            .iter()
-            .map(|(name, _)| self.get(name))
-            .collect::<Result<Vec<_>>>()
-    }
 }
 
-struct InteriorCell {
+#[derive(Debug)]
+pub struct InteriorCell {
     page: u32,
     key: u64,
 }
@@ -242,9 +265,72 @@ impl InteriorCell {
     }
 }
 
+#[derive(Debug)]
+pub struct LeafIndexCell<'a> {
+    data: Vec<&'a [u8]>,
+    schema: &'a Schema,
+}
+
+impl<'a> LeafIndexCell<'a> {
+    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
+        let mut offset = 0;
+        let (payload_bytes, size) = read_varint(&data[offset..]);
+        offset += size;
+
+        let (sizes, size) = parse_bytearray(&data[offset..]);
+        let mut values_offset = offset + size;
+
+        let mut records = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            let value = &data[values_offset..][..size];
+            records.push(value);
+            values_offset += size;
+        }
+
+        Self {
+            data: records,
+            schema,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InteriorIndexCell<'a> {
+    page: u32,
+    data: Vec<&'a [u8]>,
+    schema: &'a Schema,
+}
+
+impl<'a> InteriorIndexCell<'a> {
+    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
+        let page = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+
+        let mut offset = 4;
+        let (payload_bytes, size) = read_varint(&data[offset..]);
+        offset += size;
+
+        let (sizes, size) = parse_bytearray(&data[offset..]);
+        let mut values_offset = offset + size;
+
+        let mut records = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            let value = &data[values_offset..][..size];
+            records.push(value);
+            values_offset += size;
+        }
+        // TODO: overflow page: u32
+
+        Self {
+            page,
+            data: records,
+            schema,
+        }
+    }
+}
+
 pub struct BTreePage<'a> {
-    pages: Vec<Page>,
-    indexes: Vec<usize>,
+    pub pages: Vec<Page>,
+    pub indexes: Vec<usize>,
     pub schema: Schema,
     db: &'a Sqlite,
 }
@@ -270,17 +356,16 @@ impl<'a> BTreePage<'a> {
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<LeafCell<'_>> {
+    pub fn next(&mut self) -> Option<Cell<'_>> {
         loop {
             if self.pages.is_empty() {
                 return None;
             }
-
             let page = self.pages.last().unwrap();
             let index = self.indexes.last_mut().unwrap();
 
             match page.header.page_type {
-                0x0d => {
+                page_type @ (0x0a | 0x0d) => {
                     if *index >= page.header.cells {
                         self.indexes.pop();
                         self.pages.pop();
@@ -289,14 +374,24 @@ impl<'a> BTreePage<'a> {
 
                         let offset = page.pointers[*index];
 
-                        let cell = LeafCell::read(&page.data[offset..], &self.schema);
-
                         *index += 1;
+
+                        let cell = match page_type {
+                            0x0a => {
+                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
+                                Cell::LeafIndex(cell)
+                            }
+                            0x0d => {
+                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
+                                Cell::Leaf(cell)
+                            }
+                            _ => unreachable!(),
+                        };
 
                         return Some(cell);
                     }
                 }
-                0x05 => {
+                page_type @ (0x02 | 0x05) => {
                     if *index > page.header.cells {
                         self.indexes.pop();
                         self.pages.pop();
@@ -305,9 +400,19 @@ impl<'a> BTreePage<'a> {
                             page.header.right_pointer.unwrap()
                         } else {
                             let offset = page.pointers[*index];
-                            let cell = InteriorCell::read(&page.data[offset..]);
 
-                            cell.page as usize
+                            match page_type {
+                                0x02 => {
+                                    let cell =
+                                        InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                                    cell.page as usize
+                                }
+                                0x05 => {
+                                    let cell = InteriorCell::read(&page.data[offset..]);
+                                    cell.page as usize
+                                }
+                                _ => unreachable!(),
+                            }
                         };
 
                         let next_page = self.db.page(page).unwrap();
@@ -317,7 +422,7 @@ impl<'a> BTreePage<'a> {
                         self.pages.push(next_page);
                     }
                 }
-                _ => todo!(),
+                p => panic!("unhandled page type: {p:?}"),
             }
         }
     }
@@ -389,20 +494,39 @@ impl Sqlite {
             }
 
             let Value::Integer(rootpage) = cell.get("rootpage")? else {
-                anyhow::bail!("expected integer");
+                bail!("expected integer");
             };
 
             let Value::Text(sql) = cell.get("sql")? else {
-                anyhow::bail!("expected text");
+                bail!("expected sql string");
             };
 
             return match Command::parse(&sql)? {
                 Command::CreateTable { schema, .. } => {
                     BTreePage::read(self, rootpage as usize, schema)
                 }
-                Command::CreateIndex { .. } => {
-                    let _b = BTreePage::read(self, rootpage as usize, Schema(vec![]))?;
-                    bail!("index table not yet supported")
+                Command::CreateIndex {
+                    on: On { table, columns },
+                    ..
+                } => {
+                    // Each entry in the index b-tree corresponds to a single row in the associated SQL table.
+                    // The key to an index b-tree is a record composed of the columns that are being indexed followed by the key of the corresponding table row.
+                    let mut schema = vec![];
+                    let table = self.table(&table)?;
+
+                    for column in columns {
+                        for (name, r#type) in &table.schema.0 {
+                            if column == *name {
+                                schema.push((column.clone(), *r#type));
+                            }
+                        }
+                    }
+
+                    // why the FUCK is this not a varint (even if it should be)?
+                    // blob.iter().fold(0, |acc, x| (acc << 8) + x)
+                    schema.push(("index".into(), Type::Blob));
+                    let schema = Schema(schema);
+                    BTreePage::read(self, rootpage as usize, schema)
                 }
                 _ => bail!("wrong sql command"),
             };

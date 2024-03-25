@@ -25,7 +25,6 @@ fn main() -> Result<()> {
             let mut iter = db.root()?;
 
             while let Some(cell) = iter.next() {
-                // for cell in root.cells() {
                 let Value::Text(name) = cell.get("tbl_name")? else {
                     panic!("expected text");
                 };
@@ -45,7 +44,7 @@ fn main() -> Result<()> {
                     panic!("expected text");
                 };
 
-                if name == "sqlite_sequence" {
+                if name == "sqlite_sequence" || name.starts_with("sqlite_autoindex") {
                     continue;
                 }
 
@@ -60,6 +59,7 @@ fn main() -> Result<()> {
         }
         command => {
             let command = Command::parse(command)?;
+            println!("command: {command:?}");
             db.execute(command)?;
         }
     };
