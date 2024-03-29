@@ -226,7 +226,7 @@ pub struct LeafCell<'a> {
 impl<'a> LeafCell<'a> {
     fn read(data: &'a [u8], schema: &'a Schema) -> Self {
         let mut offset = 0;
-        let (_payload_bytes, size) = read_varint(&data[offset..]);
+        let (payload_bytes, size) = read_varint(&data[offset..]);
         offset += size;
 
         let (rowid, size) = read_varint(&data[offset..]);
@@ -330,7 +330,6 @@ impl<'a> InteriorIndexCell<'a> {
 
 pub struct BTreePage<'a> {
     pub pages: Vec<Page>,
-    pub indexes: Vec<usize>,
     pub schema: Schema,
     db: &'a Sqlite,
 }
@@ -341,7 +340,6 @@ impl<'a> BTreePage<'a> {
 
         Ok(Self {
             pages: vec![first_page],
-            indexes: vec![0],
             schema,
             db,
         })
@@ -355,22 +353,36 @@ impl<'a> BTreePage<'a> {
             .cells
     }
 
+    pub fn rows(self) -> Rows<'a> {
+        Rows {
+            btreepage: self,
+            indexes: vec![0],
+        }
+    }
+}
+
+pub struct Rows<'a> {
+    btreepage: BTreePage<'a>,
+    indexes: Vec<usize>,
+}
+
+impl<'a> Rows<'a> {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Cell<'_>> {
         loop {
-            if self.pages.is_empty() {
+            if self.btreepage.pages.is_empty() {
                 return None;
             }
-            let page = self.pages.last().unwrap();
+            let page = self.btreepage.pages.last().unwrap();
             let index = self.indexes.last_mut().unwrap();
 
             match page.header.page_type {
                 page_type @ (0x0a | 0x0d) => {
                     if *index >= page.header.cells {
                         self.indexes.pop();
-                        self.pages.pop();
+                        self.btreepage.pages.pop();
                     } else {
-                        let page = self.pages.last().unwrap();
+                        let page = self.btreepage.pages.last().unwrap();
 
                         let offset = page.pointers[*index];
 
@@ -378,11 +390,15 @@ impl<'a> BTreePage<'a> {
 
                         let cell = match page_type {
                             0x0a => {
-                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
+                                let cell = LeafIndexCell::read(
+                                    &page.data[offset..],
+                                    &self.btreepage.schema,
+                                );
                                 Cell::LeafIndex(cell)
                             }
                             0x0d => {
-                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
+                                let cell =
+                                    LeafCell::read(&page.data[offset..], &self.btreepage.schema);
                                 Cell::Leaf(cell)
                             }
                             _ => unreachable!(),
@@ -394,7 +410,7 @@ impl<'a> BTreePage<'a> {
                 page_type @ (0x02 | 0x05) => {
                     if *index > page.header.cells {
                         self.indexes.pop();
-                        self.pages.pop();
+                        self.btreepage.pages.pop();
                     } else {
                         let page = if *index == page.header.cells {
                             page.header.right_pointer.unwrap()
@@ -403,8 +419,10 @@ impl<'a> BTreePage<'a> {
 
                             match page_type {
                                 0x02 => {
-                                    let cell =
-                                        InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                                    let cell = InteriorIndexCell::read(
+                                        &page.data[offset..],
+                                        &self.btreepage.schema,
+                                    );
                                     cell.page as usize
                                 }
                                 0x05 => {
@@ -415,11 +433,11 @@ impl<'a> BTreePage<'a> {
                             }
                         };
 
-                        let next_page = self.db.page(page).unwrap();
+                        let next_page = self.btreepage.db.page(page).unwrap();
 
                         *index += 1;
                         self.indexes.push(0);
-                        self.pages.push(next_page);
+                        self.btreepage.pages.push(next_page);
                     }
                 }
                 p => panic!("unhandled page type: {p:?}"),
@@ -482,7 +500,8 @@ impl Sqlite {
     }
 
     pub fn table(&self, name: &str) -> Result<BTreePage> {
-        let mut iter = self.root()?;
+        let table = self.root()?;
+        let mut iter = table.rows();
 
         while let Some(cell) = iter.next() {
             let Value::Text(tbl_name) = cell.get("name").unwrap() else {
@@ -543,7 +562,9 @@ impl Sqlite {
                 from,
                 r#where,
             } => {
-                let mut iter = self.table(&from.table)?;
+                let table = self.table(&from.table)?;
+                println!("page: {:?}", table.pages[0]);
+                let mut iter = table.rows();
 
                 while let Some(cell) = iter.next() {
                     if r#where.as_ref().is_some_and(|w| !w.r#match(&cell)) {

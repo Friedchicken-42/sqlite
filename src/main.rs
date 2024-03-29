@@ -22,7 +22,8 @@ fn main() -> Result<()> {
             println!("number of tables: {}", page.count());
         }
         ".tables" => {
-            let mut iter = db.root()?;
+            let table = db.root()?;
+            let mut iter = table.rows();
 
             while let Some(cell) = iter.next() {
                 let Value::Text(name) = cell.get("tbl_name")? else {
@@ -37,7 +38,8 @@ fn main() -> Result<()> {
             println!()
         }
         ".schema" => {
-            let mut iter = db.root()?;
+            let table = db.root()?;
+            let mut iter = table.rows();
 
             while let Some(table) = iter.next() {
                 let Value::Text(name) = table.get("name")? else {
