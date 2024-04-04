@@ -174,6 +174,7 @@ impl<'a> Cell<'a> {
         let (data, schema, rowid) = match self {
             Cell::Leaf(leaf) => (&leaf.data, &leaf.schema, leaf.rowid),
             Cell::LeafIndex(leaf) => (&leaf.data, &leaf.schema, 0),
+            Cell::InteriorIndex(index) => (&index.data, &index.schema, 0),
             _ => bail!("cannot `get` from an interior cell"),
         };
 
@@ -242,6 +243,8 @@ impl<'a> LeafCell<'a> {
             values_offset += size;
         }
 
+        assert!(values_offset - offset == payload_bytes as usize);
+
         Self {
             data: records,
             rowid,
@@ -287,6 +290,8 @@ impl<'a> LeafIndexCell<'a> {
             values_offset += size;
         }
 
+        assert!(values_offset - offset == payload_bytes as usize);
+
         Self {
             data: records,
             schema,
@@ -318,6 +323,8 @@ impl<'a> InteriorIndexCell<'a> {
             records.push(value);
             values_offset += size;
         }
+
+        assert!(values_offset - offset == payload_bytes as usize);
         // TODO: overflow page: u32
 
         Self {
@@ -328,6 +335,7 @@ impl<'a> InteriorIndexCell<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct BTreePage<'a> {
     pub pages: Vec<Page>,
     pub schema: Schema,
@@ -361,12 +369,65 @@ impl<'a> BTreePage<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Rows<'a> {
     btreepage: BTreePage<'a>,
     indexes: Vec<usize>,
 }
 
 impl<'a> Rows<'a> {
+    pub fn filter(self, filters: &'a [&str], values: &'a [&Value]) -> Result<FilteredRows<'a>> {
+        let db = self.btreepage.db;
+        let root = db.root()?;
+        let mut iter = root.rows();
+
+        while let Some(index) = iter.next() {
+            let Value::Text(tbl_name) = index.get("name")? else {
+                panic!("expected \"tbl_name\" to be \"Text\"");
+            };
+
+            if tbl_name == "sqlite_sequence" {
+                continue;
+            }
+
+            let Value::Text(sql) = index.get("sql")? else {
+                bail!("expected sql string");
+            };
+
+            if let Command::CreateIndex {
+                on: On { table, columns },
+                ..
+            } = Command::parse(&sql)?
+            {
+                // TODO: add table name check
+                let mut count = 0;
+                for col in filters {
+                    for column in &columns {
+                        if *col == column {
+                            count += 1;
+                        }
+                    }
+                }
+
+                if count != filters.len() {
+                    continue;
+                }
+
+                let btreeindex = db.table(&tbl_name)?;
+
+                return Ok(FilteredRows {
+                    btreepage: self.btreepage,
+                    indexes: self.indexes,
+                    btreeindex: btreeindex.rows(),
+                    filters,
+                    values,
+                });
+            };
+        }
+
+        bail!("no index found");
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Cell<'_>> {
         loop {
@@ -444,6 +505,165 @@ impl<'a> Rows<'a> {
             }
         }
     }
+
+    pub fn search(&mut self, filters: &'a [&str], values: &[&Value]) -> Option<usize> {
+        loop {
+            if self.btreepage.pages.is_empty() {
+                return None;
+            }
+            let page = self.btreepage.pages.last().unwrap();
+            let index = self.indexes.last_mut().unwrap();
+
+            match page.header.page_type {
+                0x0a => {
+                    if *index >= page.header.cells {
+                        self.indexes.pop();
+                        self.btreepage.pages.pop();
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        let cell =
+                            LeafIndexCell::read(&page.data[offset..], &self.btreepage.schema);
+                        let cell = Cell::LeafIndex(cell);
+
+                        let value = cell.get(filters[0]).unwrap(); // TODO: multiple filters
+
+                        let cmp = match (value, values[0]) {
+                            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                            _ => todo!(),
+                        };
+
+                        if cmp.is_gt() {
+                            return None;
+                        } else if cmp.is_eq() {
+                            let Value::Blob(blob) = cell.get("index").unwrap() else {
+                                panic!("expected index");
+                            };
+
+                            let rowid = blob.iter().fold(0, |acc, x| (acc << 8) + (*x as usize));
+
+                            return Some(rowid);
+                        }
+                    }
+                }
+                0x02 => {
+                    #[allow(clippy::comparison_chain)]
+                    if *index > page.header.cells {
+                        self.indexes.pop();
+                        self.btreepage.pages.pop();
+                    } else if *index == page.header.cells {
+                        let page = page.header.right_pointer.unwrap();
+                        let next_page = self.btreepage.db.page(page).unwrap();
+                        *index += 1;
+                        self.btreepage.pages.push(next_page);
+                        self.indexes.push(0);
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        let cell =
+                            InteriorIndexCell::read(&page.data[offset..], &self.btreepage.schema);
+
+                        let page = cell.page;
+
+                        let cell = Cell::InteriorIndex(cell);
+
+                        let value = cell.get(filters[0]).unwrap(); // TODO: multiple filters
+
+                        let cmp = match (value, values[0]) {
+                            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                            _ => todo!(),
+                        };
+
+                        if cmp.is_ge() {
+                            let next_page = self.btreepage.db.page(page as usize).unwrap();
+                            self.btreepage.pages.push(next_page);
+                            self.indexes.push(0);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+pub struct FilteredRows<'a> {
+    btreepage: BTreePage<'a>,
+    indexes: Vec<usize>,
+    btreeindex: Rows<'a>,
+    filters: &'a [&'a str],
+    values: &'a [&'a Value<'a>],
+}
+
+impl<'a> FilteredRows<'a> {
+    fn next_by_rowid(&mut self, rowid: usize) -> Option<Cell<'_>> {
+        loop {
+            if self.btreepage.pages.is_empty() {
+                return None;
+            }
+
+            let page = self.btreepage.pages.last().unwrap();
+            let index = self.indexes.last_mut().unwrap();
+
+            match page.header.page_type {
+                0x0d => {
+                    if *index >= page.header.cells {
+                        self.indexes.pop();
+                        self.btreepage.pages.pop();
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        let cell = LeafCell::read(&page.data[offset..], &self.btreepage.schema);
+
+                        if cell.rowid == rowid as u64 {
+                            let cell = Cell::Leaf(cell);
+                            return Some(cell);
+                        }
+                    }
+                }
+                0x05 =>
+                {
+                    #[allow(clippy::comparison_chain)]
+                    if *index > page.header.cells {
+                        self.indexes.pop();
+                        self.btreepage.pages.pop();
+                    } else if *index == page.header.cells {
+                        let page = page.header.right_pointer.unwrap();
+                        let next_page = self.btreepage.db.page(page).unwrap();
+                        *index += 1;
+                        self.btreepage.pages.push(next_page);
+                        self.indexes.push(0);
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        let cell = InteriorCell::read(&page.data[offset..]);
+
+                        if rowid <= cell.key as usize {
+                            let next_page = self.btreepage.db.page(cell.page as usize).unwrap();
+                            self.btreepage.pages.push(next_page);
+                            self.indexes.push(0);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Cell<'_>> {
+        let rowid = self.btreeindex.search(self.filters, self.values)?;
+
+        self.next_by_rowid(rowid)
+    }
 }
 
 #[derive(Debug)]
@@ -504,7 +724,7 @@ impl Sqlite {
         let mut iter = table.rows();
 
         while let Some(cell) = iter.next() {
-            let Value::Text(tbl_name) = cell.get("name").unwrap() else {
+            let Value::Text(tbl_name) = cell.get("name")? else {
                 panic!("expected \"tbl_name\" to be \"Text\"");
             };
 
@@ -563,7 +783,6 @@ impl Sqlite {
                 r#where,
             } => {
                 let table = self.table(&from.table)?;
-                println!("page: {:?}", table.pages[0]);
                 let mut iter = table.rows();
 
                 while let Some(cell) = iter.next() {

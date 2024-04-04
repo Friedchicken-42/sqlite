@@ -147,7 +147,7 @@ impl Parse for Schema {
                     let r#type = match r#type {
                         "integer" | "int" => Type::Integer,
                         "text" => Type::Text,
-                        s => bail!("[schema] unparsed {s}"),
+                        s => bail!("[schema] unparsed type: {s}"),
                     };
                     (name.to_string(), r#type)
                 }

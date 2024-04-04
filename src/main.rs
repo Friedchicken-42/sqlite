@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
-use sqlite::{command::Command, Sqlite, Value};
+use sqlite::{
+    command::{Command, On},
+    Sqlite, Value,
+};
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -51,10 +54,33 @@ fn main() -> Result<()> {
                 }
 
                 println!("schema {name:?}");
-                let table = db.table(&name)?;
 
-                for (name, r#type) in table.schema.0 {
-                    println!("{name:?}: {:?}", r#type);
+                let Value::Text(sql) = table.get("sql")? else {
+                    panic!("expected sql string");
+                };
+
+                match Command::parse(&sql)? {
+                    Command::CreateTable { schema, .. } => {
+                        for (name, r#type) in schema.0.iter() {
+                            println!("{name:?}: {:?}", r#type);
+                        }
+                    }
+                    Command::CreateIndex {
+                        on: On { table, columns },
+                        ..
+                    } => {
+                        let mut cols = String::new();
+
+                        for (i, col) in columns.iter().enumerate() {
+                            if i != 0 {
+                                cols.push_str(", ");
+                            }
+                            cols += col;
+                        }
+
+                        println!("{table}({cols})");
+                    }
+                    _ => bail!("unepxected statements"),
                 }
                 println!();
             }
