@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use command::Command;
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     fmt::Display,
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -245,6 +246,10 @@ impl<'a> LeafCell<'a> {
 
         assert!(values_offset - offset == payload_bytes as usize);
 
+        let u = 4096;
+        let x = u - 35;
+        assert!(size <= x);
+
         Self {
             data: records,
             rowid,
@@ -292,6 +297,11 @@ impl<'a> LeafIndexCell<'a> {
 
         assert!(values_offset - offset == payload_bytes as usize);
 
+        // U = db.header.page_size - db.header.reserved
+        let u = 4096;
+        let x = ((u - 12) * 64 / 255) - 23;
+        assert!(size <= x);
+
         Self {
             data: records,
             schema,
@@ -325,6 +335,11 @@ impl<'a> InteriorIndexCell<'a> {
         }
 
         assert!(values_offset - offset == payload_bytes as usize);
+
+        // U = db.header.page_size - db.header.reserved
+        let u = 4096;
+        let x = ((u - 12) * 64 / 255) - 23;
+        assert!(size <= x);
         // TODO: overflow page: u32
 
         Self {
@@ -337,8 +352,9 @@ impl<'a> InteriorIndexCell<'a> {
 
 #[derive(Debug)]
 pub struct BTreePage<'a> {
-    pub pages: Vec<Page>,
-    pub schema: Schema,
+    pages: Vec<Page>,
+    indexes: Vec<usize>,
+    schema: Schema,
     db: &'a Sqlite,
 }
 
@@ -348,6 +364,7 @@ impl<'a> BTreePage<'a> {
 
         Ok(Self {
             pages: vec![first_page],
+            indexes: vec![0],
             schema,
             db,
         })
@@ -364,19 +381,185 @@ impl<'a> BTreePage<'a> {
     pub fn rows(self) -> Rows<'a> {
         Rows {
             btreepage: self,
-            indexes: vec![0],
+            btreeindex: None,
+            filters: vec![],
         }
+    }
+
+    fn loop_until<F>(&mut self, filter: Option<F>) -> Option<Cell<'_>>
+    where
+        F: Fn(&Cell) -> Ordering,
+    {
+        loop {
+            if self.pages.is_empty() {
+                return None;
+            }
+
+            let page = self.pages.last().unwrap();
+            let index = self.indexes.last_mut().unwrap();
+
+            match page.header.page_type {
+                page_type @ (0x0a | 0x0d) => {
+                    if *index >= page.header.cells {
+                        self.pages.pop();
+                        self.indexes.pop();
+                    } else {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        match (page_type, &filter) {
+                            (0x0a, None) => {
+                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
+                                return Some(Cell::LeafIndex(cell));
+                            }
+                            (0x0d, None) => {
+                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
+                                return Some(Cell::Leaf(cell));
+                            }
+                            (0x0a, Some(f)) => {
+                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
+                                let cell = Cell::LeafIndex(cell);
+
+                                match f(&cell) {
+                                    Ordering::Less => {}
+                                    Ordering::Equal => return Some(cell),
+                                    Ordering::Greater => return None,
+                                }
+                            }
+                            (0x0d, Some(f)) => {
+                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
+                                let cell = Cell::Leaf(cell);
+
+                                if f(&cell).is_eq() {
+                                    return Some(cell);
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+                page_type @ (0x02 | 0x05) => match (*index).cmp(&page.header.cells) {
+                    Ordering::Greater => {
+                        self.indexes.pop();
+                        self.pages.pop();
+                    }
+                    Ordering::Equal => {
+                        *index += 1;
+
+                        let page = page.header.right_pointer.unwrap();
+                        let next_page = self.db.page(page).unwrap();
+
+                        self.pages.push(next_page);
+                        self.indexes.push(0);
+                    }
+                    Ordering::Less => {
+                        let offset = page.pointers[*index];
+
+                        *index += 1;
+
+                        let next_page = match (page_type, &filter) {
+                            (0x02, None) => {
+                                let cell =
+                                    InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                                Some(cell.page as usize)
+                            }
+                            (0x05, None) => {
+                                let cell = InteriorCell::read(&page.data[offset..]);
+                                Some(cell.page as usize)
+                            }
+                            (0x02, Some(f)) => {
+                                let cell =
+                                    InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                                let page = cell.page as usize;
+
+                                let cell = Cell::InteriorIndex(cell);
+
+                                if f(&cell).is_ge() {
+                                    Some(page)
+                                } else {
+                                    None
+                                }
+                            }
+                            (0x05, Some(f)) => {
+                                let cell = InteriorCell::read(&page.data[offset..]);
+                                let page = cell.page as usize;
+
+                                let cell = Cell::Interior(cell);
+
+                                if f(&cell).is_ge() {
+                                    Some(page)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        if let Some(page) = next_page {
+                            let next_page = self.db.page(page).unwrap();
+                            self.pages.push(next_page);
+                            self.indexes.push(0);
+                        }
+                    }
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn search(&mut self, filters: &[(Cow<'a, str>, Value<'a>)]) -> Option<usize> {
+        let filter = if filters.is_empty() {
+            None
+        } else {
+            Some(move |cell: &Cell| {
+                let (key, value) = &filters[0];
+                let res = cell.get(key).unwrap(); // TODO: multiple filters
+
+                match (res, value) {
+                    (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                    _ => todo!(),
+                }
+            })
+        };
+
+        let cell = self.loop_until(filter)?;
+
+        let Value::Blob(blob) = cell.get("index").unwrap() else {
+            panic!("wrong value");
+        };
+
+        let rowid = blob.iter().fold(0, |acc, x| (acc << 8) + (*x as usize));
+
+        Some(rowid)
+    }
+
+    fn next(&mut self, rowid: Option<usize>) -> Option<Cell<'_>> {
+        let filter = rowid.map(|rowid| {
+            move |cell: &Cell| {
+                let row = match cell {
+                    Cell::Leaf(l) => l.rowid,
+                    Cell::Interior(i) => i.key,
+                    _ => unreachable!(),
+                } as usize;
+
+                row.cmp(&rowid)
+            }
+        });
+
+        self.loop_until(filter)
     }
 }
 
 #[derive(Debug)]
 pub struct Rows<'a> {
     btreepage: BTreePage<'a>,
-    indexes: Vec<usize>,
+    btreeindex: Option<BTreePage<'a>>,
+    filters: Vec<(Cow<'a, str>, Value<'a>)>,
 }
 
 impl<'a> Rows<'a> {
-    pub fn filter(self, filters: &'a [&str], values: &'a [&Value]) -> Result<FilteredRows<'a>> {
+    fn find_index(&self, filters: &[(Cow<'a, str>, Value<'a>)]) -> Result<Option<BTreePage<'a>>> {
         let db = self.btreepage.db;
         let root = db.root()?;
         let mut iter = root.rows();
@@ -400,12 +583,12 @@ impl<'a> Rows<'a> {
             } = Command::parse(&sql)?
             {
                 // TODO: add table name check
+
                 let mut count = 0;
-                for col in filters {
+                for (col, _) in filters {
                     for column in &columns {
-                        if *col == column {
-                            count += 1;
-                        }
+                        count += 1;
+                        if col == column {}
                     }
                 }
 
@@ -414,269 +597,50 @@ impl<'a> Rows<'a> {
                 }
 
                 let btreeindex = db.table(&tbl_name)?;
-
-                return Ok(FilteredRows {
-                    btreepage: self.btreepage,
-                    indexes: self.indexes,
-                    btreeindex: btreeindex.rows(),
-                    filters,
-                    values,
-                });
+                return Ok(Some(btreeindex));
             };
         }
 
-        bail!("no index found");
+        Ok(None)
+    }
+
+    pub fn filter(self, filters: Vec<(Cow<'a, str>, Value<'a>)>) -> Result<Self> {
+        let btreeindex = self.find_index(&filters)?;
+
+        Ok(Self {
+            btreeindex,
+            filters,
+            ..self
+        })
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Cell<'_>> {
-        loop {
-            if self.btreepage.pages.is_empty() {
-                return None;
-            }
-            let page = self.btreepage.pages.last().unwrap();
-            let index = self.indexes.last_mut().unwrap();
-
-            match page.header.page_type {
-                page_type @ (0x0a | 0x0d) => {
-                    if *index >= page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else {
-                        let page = self.btreepage.pages.last().unwrap();
-
-                        let offset = page.pointers[*index];
-
-                        *index += 1;
-
-                        let cell = match page_type {
-                            0x0a => {
-                                let cell = LeafIndexCell::read(
-                                    &page.data[offset..],
-                                    &self.btreepage.schema,
-                                );
-                                Cell::LeafIndex(cell)
-                            }
-                            0x0d => {
-                                let cell =
-                                    LeafCell::read(&page.data[offset..], &self.btreepage.schema);
-                                Cell::Leaf(cell)
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        return Some(cell);
-                    }
-                }
-                page_type @ (0x02 | 0x05) => {
-                    if *index > page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else {
-                        let page = if *index == page.header.cells {
-                            page.header.right_pointer.unwrap()
-                        } else {
-                            let offset = page.pointers[*index];
-
-                            match page_type {
-                                0x02 => {
-                                    let cell = InteriorIndexCell::read(
-                                        &page.data[offset..],
-                                        &self.btreepage.schema,
-                                    );
-                                    cell.page as usize
-                                }
-                                0x05 => {
-                                    let cell = InteriorCell::read(&page.data[offset..]);
-                                    cell.page as usize
-                                }
-                                _ => unreachable!(),
-                            }
-                        };
-
-                        let next_page = self.btreepage.db.page(page).unwrap();
-
-                        *index += 1;
-                        self.indexes.push(0);
-                        self.btreepage.pages.push(next_page);
-                    }
-                }
-                p => panic!("unhandled page type: {p:?}"),
-            }
+        if let Some(ref mut btree_page) = self.btreeindex {
+            let rowid = btree_page.search(&self.filters)?;
+            self.btreepage.next(Some(rowid))
+        } else {
+            self.btreepage.next(None)
         }
-    }
-
-    pub fn search(&mut self, filters: &'a [&str], values: &[&Value]) -> Option<usize> {
-        loop {
-            if self.btreepage.pages.is_empty() {
-                return None;
-            }
-            let page = self.btreepage.pages.last().unwrap();
-            let index = self.indexes.last_mut().unwrap();
-
-            match page.header.page_type {
-                0x0a => {
-                    if *index >= page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else {
-                        let offset = page.pointers[*index];
-
-                        *index += 1;
-
-                        let cell =
-                            LeafIndexCell::read(&page.data[offset..], &self.btreepage.schema);
-                        let cell = Cell::LeafIndex(cell);
-
-                        let value = cell.get(filters[0]).unwrap(); // TODO: multiple filters
-
-                        let cmp = match (value, values[0]) {
-                            (Value::Text(a), Value::Text(b)) => a.cmp(b),
-                            _ => todo!(),
-                        };
-
-                        if cmp.is_gt() {
-                            return None;
-                        } else if cmp.is_eq() {
-                            let Value::Blob(blob) = cell.get("index").unwrap() else {
-                                panic!("expected index");
-                            };
-
-                            let rowid = blob.iter().fold(0, |acc, x| (acc << 8) + (*x as usize));
-
-                            return Some(rowid);
-                        }
-                    }
-                }
-                0x02 => {
-                    #[allow(clippy::comparison_chain)]
-                    if *index > page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else if *index == page.header.cells {
-                        let page = page.header.right_pointer.unwrap();
-                        let next_page = self.btreepage.db.page(page).unwrap();
-                        *index += 1;
-                        self.btreepage.pages.push(next_page);
-                        self.indexes.push(0);
-                    } else {
-                        let offset = page.pointers[*index];
-
-                        *index += 1;
-
-                        let cell =
-                            InteriorIndexCell::read(&page.data[offset..], &self.btreepage.schema);
-
-                        let page = cell.page;
-
-                        let cell = Cell::InteriorIndex(cell);
-
-                        let value = cell.get(filters[0]).unwrap(); // TODO: multiple filters
-
-                        let cmp = match (value, values[0]) {
-                            (Value::Text(a), Value::Text(b)) => a.cmp(b),
-                            _ => todo!(),
-                        };
-
-                        if cmp.is_ge() {
-                            let next_page = self.btreepage.db.page(page as usize).unwrap();
-                            self.btreepage.pages.push(next_page);
-                            self.indexes.push(0);
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-pub struct FilteredRows<'a> {
-    btreepage: BTreePage<'a>,
-    indexes: Vec<usize>,
-    btreeindex: Rows<'a>,
-    filters: &'a [&'a str],
-    values: &'a [&'a Value<'a>],
-}
-
-impl<'a> FilteredRows<'a> {
-    fn next_by_rowid(&mut self, rowid: usize) -> Option<Cell<'_>> {
-        loop {
-            if self.btreepage.pages.is_empty() {
-                return None;
-            }
-
-            let page = self.btreepage.pages.last().unwrap();
-            let index = self.indexes.last_mut().unwrap();
-
-            match page.header.page_type {
-                0x0d => {
-                    if *index >= page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else {
-                        let offset = page.pointers[*index];
-
-                        *index += 1;
-
-                        let cell = LeafCell::read(&page.data[offset..], &self.btreepage.schema);
-
-                        if cell.rowid == rowid as u64 {
-                            let cell = Cell::Leaf(cell);
-                            return Some(cell);
-                        }
-                    }
-                }
-                0x05 =>
-                {
-                    #[allow(clippy::comparison_chain)]
-                    if *index > page.header.cells {
-                        self.indexes.pop();
-                        self.btreepage.pages.pop();
-                    } else if *index == page.header.cells {
-                        let page = page.header.right_pointer.unwrap();
-                        let next_page = self.btreepage.db.page(page).unwrap();
-                        *index += 1;
-                        self.btreepage.pages.push(next_page);
-                        self.indexes.push(0);
-                    } else {
-                        let offset = page.pointers[*index];
-
-                        *index += 1;
-
-                        let cell = InteriorCell::read(&page.data[offset..]);
-
-                        if rowid <= cell.key as usize {
-                            let next_page = self.btreepage.db.page(cell.page as usize).unwrap();
-                            self.btreepage.pages.push(next_page);
-                            self.indexes.push(0);
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            };
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Cell<'_>> {
-        let rowid = self.btreeindex.search(self.filters, self.values)?;
-
-        self.next_by_rowid(rowid)
     }
 }
 
 #[derive(Debug)]
 pub struct Header {
+    pub reserved: u8,
     pub page_size: usize,
 }
 
 impl Header {
     fn read(data: &[u8]) -> Result<Self> {
+        let reserved = u8::from_be_bytes([data[20]]);
         let page_size = u16::from_be_bytes([data[16], data[17]]) as usize;
         let page_size = if page_size == 1 { 65536 } else { page_size };
 
-        Ok(Self { page_size })
+        Ok(Self {
+            reserved,
+            page_size,
+        })
     }
 }
 
@@ -722,7 +686,6 @@ impl Sqlite {
     pub fn table(&self, name: &str) -> Result<BTreePage> {
         let table = self.root()?;
         let mut iter = table.rows();
-
         while let Some(cell) = iter.next() {
             let Value::Text(tbl_name) = cell.get("name")? else {
                 panic!("expected \"tbl_name\" to be \"Text\"");

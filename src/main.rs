@@ -40,6 +40,24 @@ fn main() -> Result<()> {
 
             println!()
         }
+        ".idx" => {
+            let table = db.table("companies")?;
+
+            let iter = table.rows();
+            let mut iter = iter.filter(vec![("country".into(), Value::Text("zambia".into()))])?;
+
+            while let Some(cell) = iter.next() {
+                let Value::Integer(id) = cell.get("id")? else {
+                    unreachable!()
+                };
+
+                let Value::Text(name) = cell.get("name")? else {
+                    unreachable!()
+                };
+
+                println!("{id}|{name}");
+            }
+        }
         ".schema" => {
             let table = db.root()?;
             let mut iter = table.rows();
