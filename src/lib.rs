@@ -207,6 +207,7 @@ impl<'a> Cell<'a> {
         let schema = match self {
             Cell::Leaf(leaf) => &leaf.schema,
             Cell::LeafIndex(leaf) => &leaf.schema,
+            Cell::InteriorIndex(index) => &index.schema,
             _ => bail!("cannot `get` from an interior cell"),
         };
         // TODO: optimize this
@@ -439,12 +440,11 @@ impl<'a> BTreePage<'a> {
                         };
                     }
                 }
-                page_type @ (0x02 | 0x05) => match (*index).cmp(&page.header.cells) {
-                    Ordering::Greater => {
+                page_type @ (0x02 | 0x05) => {
+                    if *index > page.header.cells * 2 {
                         self.indexes.pop();
                         self.pages.pop();
-                    }
-                    Ordering::Equal => {
+                    } else if *index == page.header.cells * 2 {
                         *index += 1;
 
                         let page = page.header.right_pointer.unwrap();
@@ -452,9 +452,23 @@ impl<'a> BTreePage<'a> {
 
                         self.pages.push(next_page);
                         self.indexes.push(0);
-                    }
-                    Ordering::Less => {
-                        let offset = page.pointers[*index];
+                    } else if *index % 2 == 1 && page_type == 0x02 {
+                        let offset = page.pointers[(*index - 1) / 2];
+
+                        *index += 1;
+
+                        let cell = InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                        let cell = Cell::InteriorIndex(cell);
+
+                        if let Some(f) = &filter {
+                            if f(&cell).is_ge() {
+                                return Some(cell);
+                            }
+                        } else {
+                            return Some(cell);
+                        }
+                    } else if *index % 2 == 0 {
+                        let offset = page.pointers[*index / 2];
 
                         *index += 1;
 
@@ -502,7 +516,7 @@ impl<'a> BTreePage<'a> {
                             self.indexes.push(0);
                         }
                     }
-                },
+                }
                 _ => unreachable!(),
             }
         }
