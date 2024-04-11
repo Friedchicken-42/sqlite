@@ -467,6 +467,8 @@ impl<'a> BTreePage<'a> {
                         } else {
                             return Some(cell);
                         }
+                    } else if *index % 2 == 1 {
+                        *index += 1;
                     } else if *index % 2 == 0 {
                         let offset = page.pointers[*index / 2];
 
