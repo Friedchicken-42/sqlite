@@ -73,7 +73,7 @@ impl Parse for FromSt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Condition {
     Equals,
 }
@@ -126,6 +126,14 @@ impl WhereSt<'_> {
         let value = cell.get(&self.column).unwrap();
         match self.condition {
             Condition::Equals => value == self.expected,
+        }
+    }
+
+    pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
+        if self.condition == Condition::Equals {
+            vec![(self.column.clone().into(), self.expected.clone())]
+        } else {
+            vec![]
         }
     }
 }

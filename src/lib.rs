@@ -36,7 +36,22 @@ fn read_varint(data: &[u8]) -> (u64, usize) {
     (number, i + 1)
 }
 
-fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
+fn serial_size(serial: u64) -> u64 {
+    match serial {
+        0 | 8 | 9 | 12 | 13 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 | 7 => 8,
+        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+        _ => unreachable!(),
+    }
+}
+
+fn parse_bytearray(data: &[u8]) -> (Vec<u64>, usize) {
     let (header_bytes, size) = read_varint(data);
 
     if header_bytes == 0 {
@@ -44,29 +59,41 @@ fn parse_bytearray(data: &[u8]) -> (Vec<usize>, usize) {
     }
 
     let mut offset = size;
-    let mut record_sizes = vec![];
+    let mut serials = vec![];
 
     let mut length = header_bytes - size as u64;
+
     while length > 0 {
-        let (value, size) = read_varint(&data[offset..]);
+        let (serial, size) = read_varint(&data[offset..]);
         offset += size;
         length -= size as u64;
-        let colunm_size = match value {
-            0 | 8 | 9 | 12 | 13 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 3,
-            4 => 4,
-            5 => 6,
-            6 | 7 => 8,
-            n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
-            n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
-            _ => unreachable!(),
-        };
-        record_sizes.push(colunm_size as usize);
+
+        serials.push(serial);
     }
 
-    (record_sizes, offset)
+    (serials, offset)
+}
+
+fn bytearray_values(data: &[u8]) -> (Vec<&[u8]>, usize) {
+    let (serials, size) = parse_bytearray(data);
+    let mut offset = size;
+
+    let mut records = Vec::with_capacity(serials.len());
+
+    for serial in serials {
+        let size = serial_size(serial) as usize;
+
+        let value = match serial {
+            8 => &[0],
+            9 => &[1],
+            _ => &data[offset..][..size],
+        };
+
+        records.push(value);
+        offset += size;
+    }
+
+    (records, offset)
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -78,7 +105,7 @@ pub enum Type {
     Blob,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value<'a> {
     Null,
     Integer(u32),
@@ -235,17 +262,9 @@ impl<'a> LeafCell<'a> {
         let (rowid, size) = read_varint(&data[offset..]);
         offset += size;
 
-        let (sizes, size) = parse_bytearray(&data[offset..]);
-        let mut values_offset = offset + size;
+        let (records, values_offset) = bytearray_values(&data[offset..]);
 
-        let mut records = Vec::with_capacity(sizes.len());
-        for size in sizes {
-            let value = &data[values_offset..][..size];
-            records.push(value);
-            values_offset += size;
-        }
-
-        assert!(values_offset - offset == payload_bytes as usize);
+        assert!(values_offset == payload_bytes as usize);
 
         let u = 4096;
         let x = u - 35;
@@ -286,17 +305,9 @@ impl<'a> LeafIndexCell<'a> {
         let (payload_bytes, size) = read_varint(&data[offset..]);
         offset += size;
 
-        let (sizes, size) = parse_bytearray(&data[offset..]);
-        let mut values_offset = offset + size;
+        let (records, values_offset) = bytearray_values(&data[offset..]);
 
-        let mut records = Vec::with_capacity(sizes.len());
-        for size in sizes {
-            let value = &data[values_offset..][..size];
-            records.push(value);
-            values_offset += size;
-        }
-
-        assert!(values_offset - offset == payload_bytes as usize);
+        assert!(values_offset == payload_bytes as usize);
 
         // U = db.header.page_size - db.header.reserved
         let u = 4096;
@@ -325,17 +336,9 @@ impl<'a> InteriorIndexCell<'a> {
         let (payload_bytes, size) = read_varint(&data[offset..]);
         offset += size;
 
-        let (sizes, size) = parse_bytearray(&data[offset..]);
-        let mut values_offset = offset + size;
+        let (records, values_offset) = bytearray_values(&data[offset..]);
 
-        let mut records = Vec::with_capacity(sizes.len());
-        for size in sizes {
-            let value = &data[values_offset..][..size];
-            records.push(value);
-            values_offset += size;
-        }
-
-        assert!(values_offset - offset == payload_bytes as usize);
+        assert!(values_offset == payload_bytes as usize);
 
         // U = db.header.page_size - db.header.reserved
         let u = 4096;
@@ -680,6 +683,8 @@ impl Sqlite {
     pub fn page(&self, index: usize) -> Result<Page> {
         let offset = (index - 1) * self.header.page_size;
 
+        println!(" [[ PAGE ]] ");
+
         (&self.file).seek(SeekFrom::Start(offset as u64))?;
         let mut data = vec![0; self.header.page_size];
         (&self.file).read_exact(&mut data)?;
@@ -763,6 +768,11 @@ impl Sqlite {
             } => {
                 let table = self.table(&from.table)?;
                 let mut iter = table.rows();
+
+                if let Some(r#where) = &r#where {
+                    let filters = r#where.filters();
+                    iter = iter.filter(filters)?;
+                }
 
                 while let Some(cell) = iter.next() {
                     if r#where.as_ref().is_some_and(|w| !w.r#match(&cell)) {
