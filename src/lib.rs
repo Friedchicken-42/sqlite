@@ -683,8 +683,6 @@ impl Sqlite {
     pub fn page(&self, index: usize) -> Result<Page> {
         let offset = (index - 1) * self.header.page_size;
 
-        println!(" [[ PAGE ]] ");
-
         (&self.file).seek(SeekFrom::Start(offset as u64))?;
         let mut data = vec![0; self.header.page_size];
         (&self.file).read_exact(&mut data)?;
