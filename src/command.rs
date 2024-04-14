@@ -74,16 +74,73 @@ impl Parse for FromSt {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Condition {
+pub enum Conditional {
     Equals,
 }
 
 #[derive(Debug)]
-pub struct WhereSt<'a> {
-    // TODO: add multiple conditions
-    pub column: String,
-    pub condition: Condition,
-    pub expected: Value<'a>,
+pub struct Condition<'a> {
+    column: String,
+    conditional: Conditional,
+    expected: Value<'a>,
+}
+
+impl Condition<'_> {
+    fn parse(statements: &mut Vec<&str>) -> Result<Self> {
+        if statements.len() < 3 {
+            bail!("not enought elements for a condition");
+        }
+
+        let column = statements[0].to_string();
+
+        let conditional = match statements[1] {
+            "=" => Conditional::Equals,
+            c => bail!("unmatched condition: {c:?}"),
+        };
+
+        let expected = statements[2];
+
+        let expected = if expected == "null" {
+            Value::Null
+        } else if expected.starts_with('\'') {
+            Value::Text(Cow::Owned(expected[1..expected.len() - 1].to_string()))
+        } else if expected.contains('.') {
+            Value::Float(expected.parse::<f64>()?)
+        } else {
+            Value::Integer(expected.parse::<u32>()?)
+        };
+
+        statements.drain(0..3);
+
+        Ok(Condition {
+            column,
+            conditional,
+            expected,
+        })
+    }
+
+    pub fn r#match(&self, cell: &Cell<'_>) -> bool {
+        let value = cell.get(&self.column).unwrap();
+
+        match self.conditional {
+            Conditional::Equals => value == self.expected,
+        }
+    }
+
+    pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
+        if self.conditional == Conditional::Equals {
+            vec![(self.column.clone().into(), self.expected.clone())]
+        } else {
+            vec![]
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WhereSt<'a> {
+    Condition(Condition<'a>),
+    And(Box<Condition<'a>>, Box<Condition<'a>>),
+    Or(Box<Condition<'a>>, Box<Condition<'a>>),
 }
 
 impl<'a> Parse for WhereSt<'a> {
@@ -96,44 +153,27 @@ impl<'a> Parse for WhereSt<'a> {
         }
         statements.remove(0);
 
-        let column = statements.remove(0).to_string();
-        let condition = match statements.remove(0) {
-            "=" => Condition::Equals,
-            c => bail!("unmatched condition: {c:?}"),
-        };
-        let expected = statements.remove(0);
+        let condition = Condition::parse(statements)?;
 
-        let expected = if expected == "null" {
-            Value::Null
-        } else if expected.starts_with('\'') {
-            Value::Text(Cow::Owned(expected[1..expected.len() - 1].to_string()))
-        } else if expected.contains('.') {
-            Value::Float(expected.parse::<f64>()?)
-        } else {
-            Value::Integer(expected.parse::<u32>()?)
-        };
-
-        Ok(Some(Self {
-            condition,
-            column,
-            expected,
-        }))
+        Ok(Some(Self::Condition(condition)))
     }
 }
 
 impl WhereSt<'_> {
     pub fn r#match(&self, cell: &Cell<'_>) -> bool {
-        let value = cell.get(&self.column).unwrap();
-        match self.condition {
-            Condition::Equals => value == self.expected,
+        match self {
+            WhereSt::Condition(cond) => cond.r#match(cell),
+            WhereSt::And(a, b) => a.r#match(cell) && b.r#match(cell),
+            WhereSt::Or(a, b) => a.r#match(cell) || b.r#match(cell),
         }
     }
 
+    // Returns a list of check needed
     pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
-        if self.condition == Condition::Equals {
-            vec![(self.column.clone().into(), self.expected.clone())]
-        } else {
-            vec![]
+        match self {
+            WhereSt::Condition(cond) => cond.filters(),
+            WhereSt::And(a, b) => [a.filters(), b.filters()].concat(),
+            WhereSt::Or(_, _) => vec![],
         }
     }
 }
@@ -224,11 +264,37 @@ impl Parse for On {
 }
 
 #[derive(Debug)]
+pub struct LimitSt {
+    pub limit: usize,
+}
+
+impl Parse for LimitSt {
+    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        if !Self::check(statements, "limit") {
+            return Ok(None);
+        }
+        statements.remove(0);
+
+        if statements.is_empty() {
+            bail!("missing value");
+        }
+
+        let limit = statements.remove(0).parse::<usize>()?;
+
+        Ok(Some(LimitSt { limit }))
+    }
+}
+
+#[derive(Debug)]
 pub enum Command<'a> {
     Select {
         select: SelectSt,
         from: FromSt,
         r#where: Option<WhereSt<'a>>,
+        limit: Option<LimitSt>,
     },
 
     CreateTable {
@@ -254,11 +320,13 @@ impl<'a> Command<'a> {
                 let from = FromSt::parse(&mut statements)?
                     .ok_or(format_err!("[select] from statemente required"))?;
                 let r#where = WhereSt::parse(&mut statements)?;
+                let limit = LimitSt::parse(&mut statements)?;
 
                 Command::Select {
                     select,
                     from,
                     r#where,
+                    limit,
                 }
             }
             ["create" | "CREATE", "table" | "TABLE", name, ..] => {

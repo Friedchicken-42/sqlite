@@ -215,7 +215,8 @@ impl<'a> Cell<'a> {
 
         if data.is_empty() && column == "id" {
             return Ok(Value::Integer(rowid as u32));
-        } else if data.is_empty() {
+        }
+        if data.is_empty() {
             return Ok(Value::Null);
         }
 
@@ -763,7 +764,9 @@ impl Sqlite {
                 select,
                 from,
                 r#where,
+                limit,
             } => {
+                let mut count = 0;
                 let table = self.table(&from.table)?;
                 let mut iter = table.rows();
 
@@ -773,6 +776,10 @@ impl Sqlite {
                 }
 
                 while let Some(cell) = iter.next() {
+                    if limit.as_ref().is_some_and(|l| count >= l.limit) {
+                        break;
+                    }
+
                     if r#where.as_ref().is_some_and(|w| !w.r#match(&cell)) {
                         continue;
                     }
@@ -780,14 +787,16 @@ impl Sqlite {
                     let rows = select
                         .columns
                         .iter()
-                        .flat_map(|name| {
+                        .map(|name| {
                             if name == "*" {
-                                cell.all().unwrap()
+                                cell.all()
                             } else {
-                                // TODO: error out if name does not exists
-                                vec![cell.get(name).unwrap()]
+                                vec![cell.get(name)].into_iter().collect()
                             }
                         })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .flatten()
                         .collect::<Vec<_>>();
 
                     for (i, row) in rows.iter().enumerate() {
@@ -797,6 +806,8 @@ impl Sqlite {
                         print!("{row}");
                     }
                     println!();
+
+                    count += 1;
                 }
             }
             _ => bail!("cannot execute this command now"),
