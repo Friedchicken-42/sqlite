@@ -533,13 +533,31 @@ impl<'a> BTreePage<'a> {
             None
         } else {
             Some(move |cell: &Cell| {
-                let (key, value) = &filters[0];
-                let res = cell.get(key).unwrap(); // TODO: multiple filters
+                for (key, value) in filters {
+                    let res = cell.get(key).unwrap();
 
-                match (res, value) {
-                    (Value::Text(a), Value::Text(b)) => a.cmp(b),
-                    _ => todo!(),
+                    let cmp = match (res, value) {
+                        (Value::Null, Value::Null) => Ordering::Equal,
+                        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+                        (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+                        (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                        (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
+                        (Value::Null, _) => Ordering::Less,
+                        (_, Value::Null) => Ordering::Greater,
+                        (Value::Integer(a), Value::Float(b)) => (a as f64).total_cmp(b),
+                        (Value::Float(a), Value::Integer(b)) => a.total_cmp(&(*b as f64)),
+                        (Value::Integer(_) | Value::Float(_), _) => Ordering::Less,
+                        (_, Value::Integer(_) | Value::Float(_)) => Ordering::Greater,
+                        (Value::Text(_), _) => Ordering::Less,
+                        (_, Value::Text(_)) => Ordering::Greater,
+                    };
+
+                    if cmp.is_ne() {
+                        return cmp;
+                    }
                 }
+
+                Ordering::Equal
             })
         };
 
@@ -607,8 +625,10 @@ impl<'a> Rows<'a> {
                 let mut count = 0;
                 for (col, _) in filters {
                     for column in &columns {
-                        count += 1;
-                        if col == column {}
+                        // TODO: find nearest
+                        if col == column {
+                            count += 1;
+                        }
                     }
                 }
 
@@ -780,9 +800,11 @@ impl Sqlite {
                         break;
                     }
 
-                    if r#where.as_ref().is_some_and(|w| !w.r#match(&cell)) {
-                        continue;
-                    }
+                    if let Some(w) = &r#where {
+                        if !w.r#match(&cell)? {
+                            continue;
+                        }
+                    };
 
                     let rows = select
                         .columns

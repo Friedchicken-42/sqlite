@@ -1,4 +1,7 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    fmt::{Debug, Display},
+};
 
 use anyhow::{bail, format_err, Result};
 
@@ -78,6 +81,14 @@ pub enum Conditional {
     Equals,
 }
 
+impl Display for Conditional {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Conditional::Equals => write!(f, "="),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Condition<'a> {
     column: String,
@@ -119,11 +130,13 @@ impl Condition<'_> {
         })
     }
 
-    pub fn r#match(&self, cell: &Cell<'_>) -> bool {
-        let value = cell.get(&self.column).unwrap();
+    pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
+        let Ok(value) = cell.get(&self.column) else {
+            bail!("column {:?} not found", self.column)
+        };
 
         match self.conditional {
-            Conditional::Equals => value == self.expected,
+            Conditional::Equals => Ok(value == self.expected),
         }
     }
 
@@ -136,11 +149,21 @@ impl Condition<'_> {
     }
 }
 
+impl Display for Condition<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} {} {}",
+            self.column, self.conditional, self.expected
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum WhereSt<'a> {
     Condition(Condition<'a>),
-    And(Box<Condition<'a>>, Box<Condition<'a>>),
-    Or(Box<Condition<'a>>, Box<Condition<'a>>),
+    And(Box<WhereSt<'a>>, Box<WhereSt<'a>>),
+    Or(Box<WhereSt<'a>>, Box<WhereSt<'a>>),
 }
 
 impl<'a> Parse for WhereSt<'a> {
@@ -153,18 +176,39 @@ impl<'a> Parse for WhereSt<'a> {
         }
         statements.remove(0);
 
-        let condition = Condition::parse(statements)?;
+        let mut condition = Self::Condition(Condition::parse(statements)?);
 
-        Ok(Some(Self::Condition(condition)))
+        loop {
+            match statements.first() {
+                Some(&"and") => {
+                    statements.remove(0);
+                    let other = Self::Condition(Condition::parse(statements)?);
+
+                    if let Self::Or(l, r) = condition {
+                        condition = Self::Or(l, Box::new(Self::And(r, Box::new(other))));
+                    } else {
+                        condition = Self::And(Box::new(condition), Box::new(other));
+                    }
+                }
+                Some(&"or") => {
+                    statements.remove(0);
+                    let other = Self::Condition(Condition::parse(statements)?);
+                    condition = Self::Or(Box::new(condition), Box::new(other));
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Some(condition))
     }
 }
 
 impl WhereSt<'_> {
-    pub fn r#match(&self, cell: &Cell<'_>) -> bool {
+    pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
         match self {
             WhereSt::Condition(cond) => cond.r#match(cell),
-            WhereSt::And(a, b) => a.r#match(cell) && b.r#match(cell),
-            WhereSt::Or(a, b) => a.r#match(cell) || b.r#match(cell),
+            WhereSt::And(a, b) => Ok(a.r#match(cell)? && b.r#match(cell)?),
+            WhereSt::Or(a, b) => Ok(a.r#match(cell)? || b.r#match(cell)?),
         }
     }
 
@@ -174,6 +218,16 @@ impl WhereSt<'_> {
             WhereSt::Condition(cond) => cond.filters(),
             WhereSt::And(a, b) => [a.filters(), b.filters()].concat(),
             WhereSt::Or(_, _) => vec![],
+        }
+    }
+}
+
+impl Display for WhereSt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Condition(c) => write!(f, "{c}"),
+            Self::And(a, b) => write!(f, "And ( {a}, {b} ) "),
+            Self::Or(a, b) => write!(f, "Or ( {a}, {b} ) "),
         }
     }
 }
