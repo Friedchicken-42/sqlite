@@ -207,7 +207,7 @@ impl<'a> Cell<'a> {
         };
 
         let Some(index) = schema.0.iter().position(|(name, _)| name == column) else {
-            bail!("column: {column} not found")
+            bail!("column: {column:?} not found")
         };
 
         let (_, r#type) = &schema.0[index];
@@ -792,7 +792,9 @@ impl Sqlite {
 
                 if let Some(r#where) = &r#where {
                     let filters = r#where.filters();
-                    iter = iter.filter(filters)?;
+                    if !filters.is_empty() {
+                        iter = iter.filter(filters)?;
+                    }
                 }
 
                 while let Some(cell) = iter.next() {
