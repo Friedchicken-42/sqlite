@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
 pub mod command;
+pub mod page;
 
 use anyhow::{bail, Result};
 use command::Command;
+use page::{Cell, Page};
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -13,88 +15,6 @@ use std::{
 };
 
 use crate::command::On;
-
-fn read_varint(data: &[u8]) -> (u64, usize) {
-    let mut i = 0;
-    let mut number = 0u64;
-    loop {
-        let byte = data[i];
-
-        if byte & 0b10000000 == 0 || i == 9 {
-            break;
-        }
-
-        number = number << 7 | (byte & 0b01111111) as u64;
-
-        i += 1;
-    }
-
-    if i != 9 {
-        number = number << 7 | data[i] as u64;
-    }
-
-    (number, i + 1)
-}
-
-fn serial_size(serial: u64) -> u64 {
-    match serial {
-        0 | 8 | 9 | 12 | 13 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 6,
-        6 | 7 => 8,
-        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
-        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
-        _ => unreachable!(),
-    }
-}
-
-fn parse_bytearray(data: &[u8]) -> (Vec<u64>, usize) {
-    let (header_bytes, size) = read_varint(data);
-
-    if header_bytes == 0 {
-        return (vec![], 0);
-    }
-
-    let mut offset = size;
-    let mut serials = vec![];
-
-    let mut length = header_bytes - size as u64;
-
-    while length > 0 {
-        let (serial, size) = read_varint(&data[offset..]);
-        offset += size;
-        length -= size as u64;
-
-        serials.push(serial);
-    }
-
-    (serials, offset)
-}
-
-fn bytearray_values(data: &[u8]) -> (Vec<&[u8]>, usize) {
-    let (serials, size) = parse_bytearray(data);
-    let mut offset = size;
-
-    let mut records = Vec::with_capacity(serials.len());
-
-    for serial in serials {
-        let size = serial_size(serial) as usize;
-
-        let value = match serial {
-            8 => &[0],
-            9 => &[1],
-            _ => &data[offset..][..size],
-        };
-
-        records.push(value);
-        offset += size;
-    }
-
-    (records, offset)
-}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Type {
@@ -114,6 +34,26 @@ pub enum Value<'a> {
     Blob(&'a [u8]),
 }
 
+impl<'a> Value<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (Value::Integer(a), Value::Float(b)) => (*a as f64).total_cmp(b),
+            (Value::Float(a), Value::Integer(b)) => a.total_cmp(&(*b as f64)),
+            (Value::Integer(_) | Value::Float(_), _) => Ordering::Less,
+            (_, Value::Integer(_) | Value::Float(_)) => Ordering::Greater,
+            (Value::Text(_), _) => Ordering::Less,
+            (_, Value::Text(_)) => Ordering::Greater,
+        }
+    }
+}
+
 impl<'a> Display for Value<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -128,232 +68,6 @@ impl<'a> Display for Value<'a> {
 
 #[derive(Debug)]
 pub struct Schema(pub Vec<(String, Type)>);
-
-#[derive(Debug)]
-pub struct PageHeader {
-    page_type: usize,
-    freeblock: usize,
-    cells: usize,
-    offset: usize,
-    frag: usize,
-    right_pointer: Option<usize>,
-}
-
-impl PageHeader {
-    fn read(data: &[u8]) -> Self {
-        Self {
-            page_type: data[0] as usize,
-            freeblock: u16::from_be_bytes([data[1], data[2]]) as usize,
-            cells: u16::from_be_bytes([data[3], data[4]]) as usize,
-            offset: u16::from_be_bytes([data[5], data[6]]) as usize,
-            frag: data[7] as usize,
-            right_pointer: if data[0] == 0x05 || data[0] == 0x02 {
-                Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize)
-            } else {
-                None
-            },
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Page {
-    pub header: PageHeader,
-    pub pointers: Vec<usize>,
-    pub data: Vec<u8>,
-}
-
-impl Page {
-    fn read(data: Vec<u8>, index: usize) -> Self {
-        let offset = if index == 1 { 100 } else { 0 };
-        let header = PageHeader::read(&data[offset..]);
-
-        let offset = if header.right_pointer.is_some() {
-            offset + 12
-        } else {
-            offset + 8
-        };
-
-        let pointers = (0..header.cells)
-            .map(|i| {
-                let off = offset + i * 2;
-                u16::from_be_bytes([data[off], data[off + 1]]) as usize
-            })
-            .collect();
-
-        Self {
-            header,
-            pointers,
-            data,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Cell<'a> {
-    Leaf(LeafCell<'a>),
-    Interior(InteriorCell),
-    LeafIndex(LeafIndexCell<'a>),
-    InteriorIndex(InteriorIndexCell<'a>),
-}
-
-impl<'a> Cell<'a> {
-    pub fn get(&self, column: &str) -> Result<Value<'a>> {
-        let (data, schema, rowid) = match self {
-            Cell::Leaf(leaf) => (&leaf.data, &leaf.schema, leaf.rowid),
-            Cell::LeafIndex(leaf) => (&leaf.data, &leaf.schema, 0),
-            Cell::InteriorIndex(index) => (&index.data, &index.schema, 0),
-            _ => bail!("cannot `get` from an interior cell"),
-        };
-
-        let Some(index) = schema.0.iter().position(|(name, _)| name == column) else {
-            bail!("column: {column:?} not found")
-        };
-
-        let (_, r#type) = &schema.0[index];
-        let data = data[index];
-
-        if data.is_empty() && column == "id" {
-            return Ok(Value::Integer(rowid as u32));
-        }
-        if data.is_empty() {
-            return Ok(Value::Null);
-        }
-
-        let value = match r#type {
-            Type::Null => Value::Null,
-            Type::Integer => Value::Integer(data[0] as u32),
-            Type::Float => todo!(),
-            Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
-            Type::Blob => Value::Blob(data),
-        };
-
-        Ok(value)
-    }
-
-    pub fn all(&self) -> Result<Vec<Value<'a>>> {
-        let schema = match self {
-            Cell::Leaf(leaf) => &leaf.schema,
-            Cell::LeafIndex(leaf) => &leaf.schema,
-            Cell::InteriorIndex(index) => &index.schema,
-            _ => bail!("cannot `get` from an interior cell"),
-        };
-        // TODO: optimize this
-        schema
-            .0
-            .iter()
-            .map(|(name, _)| self.get(name))
-            .collect::<Result<Vec<_>>>()
-    }
-}
-
-#[derive(Debug)]
-pub struct LeafCell<'a> {
-    data: Vec<&'a [u8]>,
-    rowid: u64,
-    schema: &'a Schema,
-}
-
-impl<'a> LeafCell<'a> {
-    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
-        let mut offset = 0;
-        let (payload_bytes, size) = read_varint(&data[offset..]);
-        offset += size;
-
-        let (rowid, size) = read_varint(&data[offset..]);
-        offset += size;
-
-        let (records, values_offset) = bytearray_values(&data[offset..]);
-
-        assert!(values_offset == payload_bytes as usize);
-
-        let u = 4096;
-        let x = u - 35;
-        assert!(size <= x);
-
-        Self {
-            data: records,
-            rowid,
-            schema,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct InteriorCell {
-    page: u32,
-    key: u64,
-}
-
-impl InteriorCell {
-    fn read(data: &[u8]) -> Self {
-        let page = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let (key, _) = read_varint(&data[4..]);
-
-        Self { page, key }
-    }
-}
-
-#[derive(Debug)]
-pub struct LeafIndexCell<'a> {
-    data: Vec<&'a [u8]>,
-    schema: &'a Schema,
-}
-
-impl<'a> LeafIndexCell<'a> {
-    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
-        let mut offset = 0;
-        let (payload_bytes, size) = read_varint(&data[offset..]);
-        offset += size;
-
-        let (records, values_offset) = bytearray_values(&data[offset..]);
-
-        assert!(values_offset == payload_bytes as usize);
-
-        // U = db.header.page_size - db.header.reserved
-        let u = 4096;
-        let x = ((u - 12) * 64 / 255) - 23;
-        assert!(size <= x);
-
-        Self {
-            data: records,
-            schema,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct InteriorIndexCell<'a> {
-    page: u32,
-    data: Vec<&'a [u8]>,
-    schema: &'a Schema,
-}
-
-impl<'a> InteriorIndexCell<'a> {
-    fn read(data: &'a [u8], schema: &'a Schema) -> Self {
-        let page = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-
-        let mut offset = 4;
-        let (payload_bytes, size) = read_varint(&data[offset..]);
-        offset += size;
-
-        let (records, values_offset) = bytearray_values(&data[offset..]);
-
-        assert!(values_offset == payload_bytes as usize);
-
-        // U = db.header.page_size - db.header.reserved
-        let u = 4096;
-        let x = ((u - 12) * 64 / 255) - 23;
-        assert!(size <= x);
-        // TODO: overflow page: u32
-
-        Self {
-            page,
-            data: records,
-            schema,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct BTreePage<'a> {
@@ -379,8 +93,7 @@ impl<'a> BTreePage<'a> {
         self.pages
             .first()
             .expect("Must be present at least one page")
-            .header
-            .cells
+            .cells()
     }
 
     pub fn rows(self) -> Rows<'a> {
@@ -403,28 +116,37 @@ impl<'a> BTreePage<'a> {
             let page = self.pages.last().unwrap();
             let index = self.indexes.last_mut().unwrap();
 
-            match page.header.page_type {
-                page_type @ (0x0a | 0x0d) => {
-                    if *index >= page.header.cells {
+            match page {
+                page @ (Page::TableLeaf(_) | Page::IndexLeaf(_)) => {
+                    if *index >= page.cells() {
                         self.pages.pop();
                         self.indexes.pop();
                     } else {
-                        let offset = page.pointers[*index];
+                        let pointers = page.pointers();
+                        let offset = pointers[*index];
 
                         *index += 1;
 
-                        match (page_type, &filter) {
-                            (0x0a, None) => {
-                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
-                                return Some(Cell::LeafIndex(cell));
+                        match (page, &filter) {
+                            (Page::TableLeaf(t), None) => {
+                                let cell = t.cell(offset, &self.schema);
+                                return Some(Cell::TableLeaf(cell));
                             }
-                            (0x0d, None) => {
-                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
-                                return Some(Cell::Leaf(cell));
+                            (Page::IndexLeaf(i), None) => {
+                                let cell = i.cell(offset, &self.schema);
+                                return Some(Cell::IndexLeaf(cell));
                             }
-                            (0x0a, Some(f)) => {
-                                let cell = LeafIndexCell::read(&page.data[offset..], &self.schema);
-                                let cell = Cell::LeafIndex(cell);
+                            (Page::TableLeaf(t), Some(f)) => {
+                                let cell = t.cell(offset, &self.schema);
+                                let cell = Cell::TableLeaf(cell);
+
+                                if f(&cell).is_eq() {
+                                    return Some(cell);
+                                }
+                            }
+                            (Page::IndexLeaf(i), Some(f)) => {
+                                let cell = i.cell(offset, &self.schema);
+                                let cell = Cell::IndexLeaf(cell);
 
                                 match f(&cell) {
                                     Ordering::Less => {}
@@ -432,68 +154,69 @@ impl<'a> BTreePage<'a> {
                                     Ordering::Greater => return None,
                                 }
                             }
-                            (0x0d, Some(f)) => {
-                                let cell = LeafCell::read(&page.data[offset..], &self.schema);
-                                let cell = Cell::Leaf(cell);
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                page @ (Page::TableInterior(_) | Page::IndexInterior(_)) => {
+                    if *index > page.cells() * 2 {
+                        self.indexes.pop();
+                        self.pages.pop();
+                    } else if *index == page.cells() * 2 {
+                        *index += 1;
 
-                                if f(&cell).is_eq() {
+                        let right_pointer = match page {
+                            Page::TableInterior(t) => t.right_pointer,
+                            Page::IndexInterior(i) => i.right_pointer,
+                            _ => unreachable!(),
+                        };
+
+                        let next_page = self.db.page(right_pointer).unwrap();
+
+                        self.pages.push(next_page);
+                        self.indexes.push(0);
+                    } else if *index % 2 == 1 {
+                        match page {
+                            Page::TableInterior(_) => *index += 1,
+                            Page::IndexInterior(i) => {
+                                let pointers = page.pointers();
+                                let offset = pointers[(*index - 1) / 2];
+
+                                *index += 1;
+
+                                let cell = i.cell(offset, &self.schema);
+                                let cell = Cell::IndexInterior(cell);
+
+                                if let Some(f) = &filter {
+                                    if f(&cell).is_ge() {
+                                        return Some(cell);
+                                    }
+                                } else {
                                     return Some(cell);
                                 }
                             }
                             _ => unreachable!(),
-                        };
-                    }
-                }
-                page_type @ (0x02 | 0x05) => {
-                    if *index > page.header.cells * 2 {
-                        self.indexes.pop();
-                        self.pages.pop();
-                    } else if *index == page.header.cells * 2 {
-                        *index += 1;
-
-                        let page = page.header.right_pointer.unwrap();
-                        let next_page = self.db.page(page).unwrap();
-
-                        self.pages.push(next_page);
-                        self.indexes.push(0);
-                    } else if *index % 2 == 1 && page_type == 0x02 {
-                        let offset = page.pointers[(*index - 1) / 2];
-
-                        *index += 1;
-
-                        let cell = InteriorIndexCell::read(&page.data[offset..], &self.schema);
-                        let cell = Cell::InteriorIndex(cell);
-
-                        if let Some(f) = &filter {
-                            if f(&cell).is_ge() {
-                                return Some(cell);
-                            }
-                        } else {
-                            return Some(cell);
                         }
-                    } else if *index % 2 == 1 {
-                        *index += 1;
-                    } else if *index % 2 == 0 {
-                        let offset = page.pointers[*index / 2];
+                    } else {
+                        let pointers = page.pointers();
+                        let offset = pointers[*index / 2];
 
                         *index += 1;
 
-                        let next_page = match (page_type, &filter) {
-                            (0x02, None) => {
-                                let cell =
-                                    InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                        let next_page = match (page, &filter) {
+                            (Page::TableInterior(t), None) => {
+                                let cell = t.cell(offset);
                                 Some(cell.page as usize)
                             }
-                            (0x05, None) => {
-                                let cell = InteriorCell::read(&page.data[offset..]);
+                            (Page::IndexInterior(i), None) => {
+                                let cell = i.cell(offset, &self.schema);
                                 Some(cell.page as usize)
                             }
-                            (0x02, Some(f)) => {
-                                let cell =
-                                    InteriorIndexCell::read(&page.data[offset..], &self.schema);
+                            (Page::TableInterior(t), Some(f)) => {
+                                let cell = t.cell(offset);
                                 let page = cell.page as usize;
 
-                                let cell = Cell::InteriorIndex(cell);
+                                let cell = Cell::TableInterior(cell);
 
                                 if f(&cell).is_ge() {
                                     Some(page)
@@ -501,11 +224,11 @@ impl<'a> BTreePage<'a> {
                                     None
                                 }
                             }
-                            (0x05, Some(f)) => {
-                                let cell = InteriorCell::read(&page.data[offset..]);
+                            (Page::IndexInterior(i), Some(f)) => {
+                                let cell = i.cell(offset, &self.schema);
                                 let page = cell.page as usize;
 
-                                let cell = Cell::Interior(cell);
+                                let cell = Cell::IndexInterior(cell);
 
                                 if f(&cell).is_ge() {
                                     Some(page)
@@ -523,7 +246,6 @@ impl<'a> BTreePage<'a> {
                         }
                     }
                 }
-                _ => unreachable!(),
             }
         }
     }
@@ -536,21 +258,7 @@ impl<'a> BTreePage<'a> {
                 for (key, value) in filters {
                     let res = cell.get(key).unwrap();
 
-                    let cmp = match (res, value) {
-                        (Value::Null, Value::Null) => Ordering::Equal,
-                        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-                        (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
-                        (Value::Text(a), Value::Text(b)) => a.cmp(b),
-                        (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
-                        (Value::Null, _) => Ordering::Less,
-                        (_, Value::Null) => Ordering::Greater,
-                        (Value::Integer(a), Value::Float(b)) => (a as f64).total_cmp(b),
-                        (Value::Float(a), Value::Integer(b)) => a.total_cmp(&(*b as f64)),
-                        (Value::Integer(_) | Value::Float(_), _) => Ordering::Less,
-                        (_, Value::Integer(_) | Value::Float(_)) => Ordering::Greater,
-                        (Value::Text(_), _) => Ordering::Less,
-                        (_, Value::Text(_)) => Ordering::Greater,
-                    };
+                    let cmp = res.cmp(value);
 
                     if cmp.is_ne() {
                         return cmp;
@@ -576,8 +284,8 @@ impl<'a> BTreePage<'a> {
         let filter = rowid.map(|rowid| {
             move |cell: &Cell| {
                 let row = match cell {
-                    Cell::Leaf(l) => l.rowid,
-                    Cell::Interior(i) => i.key,
+                    Cell::TableLeaf(l) => l.rowid,
+                    Cell::TableInterior(i) => i.key,
                     _ => unreachable!(),
                 } as usize;
 
@@ -708,7 +416,7 @@ impl Sqlite {
         let mut data = vec![0; self.header.page_size];
         (&self.file).read_exact(&mut data)?;
 
-        Ok(Page::read(data, index))
+        Page::read(data, index)
     }
 
     pub fn root(&self) -> Result<BTreePage> {
