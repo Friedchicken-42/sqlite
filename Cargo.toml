@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.59"    # error handling
+pest = "2.7.10"
+pest_derive = "2.7.10"
 # itertools = "0.10.3" # useful iterator extensions
 # nom = "7.0.0"        # for parsing
 # peg = "0.7.0"        # for parsing

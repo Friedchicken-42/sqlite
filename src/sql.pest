@@ -1,0 +1,54 @@
+WHITESPACE = _{ " " | "\n" | "\t" }
+
+identifier = @{ ( ASCII_ALPHANUMERIC | "_" )+ }
+
+number = @{ ASCII_DIGIT+ }
+
+string = { 
+    "'" ~ (ASCII_ALPHANUMERIC | " " | "_" )* ~ "'" |
+    "\"" ~ (ASCII_ALPHANUMERIC | " " | "_" )* ~ "\"" 
+}
+
+function = { identifier ~ "(" ~ identifier ~ ")" }
+
+dotted_field = { identifier ~ ("." ~ identifier)+ }
+
+wildcard = { "*" }
+
+simple_field = { wildcard | function | dotted_field | identifier }
+
+aliased_field = { simple_field ~ "as" ~ identifier }
+
+field = _{ aliased_field | simple_field }
+
+fields = _{ field ~ ("," ~ field)* }
+
+select_clause = { "select" ~ fields }
+
+from_clause = { "from" ~ identifier }
+
+conditional = { "=" }
+
+condition = { identifier ~ conditional ~ ( identifier | string ) }
+
+binary_operator = { "and" | "or" }
+
+binary_expression = { condition ~ (binary_operator ~ condition)* }
+
+where_clause = { "where" ~ binary_expression }
+
+limit_clause = { "limit" ~ number }
+
+select_query = { select_clause ~  from_clause ~ where_clause? ~ limit_clause? }
+
+table_column = { ( string | identifier ) ~ identifier ~ ASCII_ALPHANUMERIC* }
+
+table_columns = _{ table_column ~ ("," ~ table_column)* }
+
+create_table = { "create table" ~ identifier ~ "(" ~ table_columns ~ ")" }
+
+index_columns = { identifier ~ ("," ~ identifier)* }
+
+create_index = { "create index" ~ identifier ~ "on" ~ identifier ~ "(" ~ index_columns ~ ")" }
+
+query = { SOI ~ ( select_query | create_table | create_index ) ~ EOI }

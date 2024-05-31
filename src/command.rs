@@ -1,92 +1,104 @@
-use std::{
-    borrow::Cow,
-    fmt::{Debug, Display},
-};
+use std::borrow::Cow;
 
-use anyhow::{bail, format_err, Result};
+use anyhow::{bail, Result};
+use pest::{iterators::Pair, Parser};
+use pest_derive::Parser;
 
-use crate::{Cell, Schema, Type, Value};
+use crate::{page::Cell, Schema, Type, Value};
 
-trait Parse {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized;
+#[derive(Parser)]
+#[grammar = "sql.pest"]
+struct SQLParser;
 
-    fn check(statements: &mut Vec<&str>, name: &str) -> bool {
-        statements
-            .first()
-            .is_some_and(|stmt| stmt.to_lowercase() == name)
+#[derive(Debug)]
+pub enum SimpleColumn {
+    Wildcard,
+    String(String),
+    Dotted(Vec<String>),
+}
+
+impl SimpleColumn {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        match pair.as_rule() {
+            Rule::identifier => {
+                let string = pair.as_span().as_str().to_string();
+                Ok(Self::String(string))
+            }
+            Rule::wildcard => Ok(Self::Wildcard),
+            Rule::dotted_field => {
+                let inner = pair.into_inner();
+                let strings = inner.map(|p| p.as_span().as_str().to_string()).collect();
+
+                Ok(Self::Dotted(strings))
+            }
+            _ => bail!("Malformed query"),
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct SelectSt {
-    pub columns: Vec<String>,
+pub enum Column {
+    Alias(SimpleColumn, String),
+    Simple(SimpleColumn),
 }
 
-impl Parse for SelectSt {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if !Self::check(statements, "select") {
-            return Ok(None);
-        }
-        statements.remove(0);
-
-        let mut columns = vec![];
-
-        loop {
-            if statements.is_empty() {
-                bail!("missing statement");
+impl Column {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        match pair.as_rule() {
+            Rule::simple_field => {
+                let mut inner = pair.into_inner();
+                let simple = inner.next().unwrap();
+                let simple = SimpleColumn::new(simple)?;
+                Ok(Self::Simple(simple))
             }
+            Rule::aliased_field => {
+                let mut inner = pair.into_inner();
+                let simple = inner.next().unwrap();
+                let simple = simple.into_inner().next().unwrap();
+                let alias = inner.next().unwrap();
 
-            columns.push(statements.remove(0).to_string());
-            if !statements.first().is_some_and(|s| *s == ",") {
-                break;
+                let simple = SimpleColumn::new(simple)?;
+                let alias = alias.as_span().as_str().to_string();
+
+                Ok(Self::Alias(simple, alias))
             }
-            statements.remove(0);
+            _ => bail!("Malformed query"),
         }
-
-        Ok(Some(Self { columns }))
     }
 }
 
 #[derive(Debug)]
-pub struct FromSt {
+pub struct SelectClause {
+    pub columns: Vec<Column>,
+}
+
+impl SelectClause {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let columns = pair
+            .into_inner()
+            .map(Column::new)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { columns })
+    }
+}
+
+#[derive(Debug)]
+pub struct FromClause {
     pub table: String,
 }
 
-impl Parse for FromSt {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if !Self::check(statements, "from") {
-            return Ok(None);
-        }
-        statements.remove(0);
-
-        if statements.is_empty() {
-            bail!("missing statement");
-        }
-
-        let table = statements.remove(0).to_string();
-        Ok(Some(Self { table }))
+impl FromClause {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let inner = pair.into_inner().next().unwrap();
+        let table = inner.as_span().as_str().to_string();
+        Ok(Self { table })
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Conditional {
     Equals,
-}
-
-impl Display for Conditional {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Conditional::Equals => write!(f, "="),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -96,20 +108,16 @@ pub struct Condition<'a> {
     expected: Value<'a>,
 }
 
-impl Condition<'_> {
-    fn parse(statements: &mut Vec<&str>) -> Result<Self> {
-        if statements.len() < 3 {
-            bail!("not enought elements for a condition");
-        }
-
-        let column = statements[0].to_string();
-
-        let conditional = match statements[1] {
+impl<'a> Condition<'a> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let mut inner = pair.into_inner();
+        let column = inner.next().unwrap().as_span().as_str().to_string();
+        let conditional = match inner.next().unwrap().as_span().as_str() {
             "=" => Conditional::Equals,
-            c => bail!("unmatched condition: {c:?}"),
+            _ => bail!("Malformed query"),
         };
 
-        let expected = statements[2];
+        let expected = inner.next().unwrap().as_span().as_str().to_string();
 
         let expected = if expected == "null" {
             Value::Null
@@ -121,9 +129,7 @@ impl Condition<'_> {
             Value::Integer(expected.parse::<u32>()?)
         };
 
-        statements.drain(0..3);
-
-        Ok(Condition {
+        Ok(Self {
             column,
             conditional,
             expected,
@@ -149,206 +155,95 @@ impl Condition<'_> {
     }
 }
 
-impl Display for Condition<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:?} {} {}",
-            self.column, self.conditional, self.expected
-        )
-    }
-}
-
 #[derive(Debug)]
-pub enum WhereSt<'a> {
+pub enum WhereClause<'a> {
     Condition(Condition<'a>),
-    And(Box<WhereSt<'a>>, Box<WhereSt<'a>>),
-    Or(Box<WhereSt<'a>>, Box<WhereSt<'a>>),
+    And(Box<WhereClause<'a>>, Box<WhereClause<'a>>),
+    Or(Box<WhereClause<'a>>, Box<WhereClause<'a>>),
 }
 
-impl<'a> Parse for WhereSt<'a> {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if !Self::check(statements, "where") {
-            return Ok(None);
-        }
-        statements.remove(0);
+impl<'a> WhereClause<'a> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let binary = pair.into_inner().next().unwrap();
 
-        let mut condition = Self::Condition(Condition::parse(statements)?);
+        let mut condition = None;
+        let mut operation = None;
 
-        loop {
-            match statements.first() {
-                Some(&"and") => {
-                    statements.remove(0);
-                    let other = Self::Condition(Condition::parse(statements)?);
+        for pair in binary.into_inner() {
+            match pair.as_rule() {
+                Rule::condition => {
+                    let other = Self::Condition(Condition::new(pair)?);
 
-                    if let Self::Or(l, r) = condition {
-                        condition = Self::Or(l, Box::new(Self::And(r, Box::new(other))));
-                    } else {
-                        condition = Self::And(Box::new(condition), Box::new(other));
-                    }
+                    let new = match (condition, operation) {
+                        (None, _) => other,
+                        (Some(cond), Some("or")) => {
+                            operation = None;
+                            Self::Or(Box::new(cond), Box::new(other))
+                        }
+                        (Some(cond), Some("and")) => {
+                            operation = None;
+
+                            if let Self::Or(l, r) = cond {
+                                Self::Or(l, Box::new(Self::And(r, Box::new(other))))
+                            } else {
+                                Self::And(Box::new(cond), Box::new(other))
+                            }
+                        }
+                        _ => bail!("Malformed query"),
+                    };
+
+                    condition = Some(new);
                 }
-                Some(&"or") => {
-                    statements.remove(0);
-                    let other = Self::Condition(Condition::parse(statements)?);
-                    condition = Self::Or(Box::new(condition), Box::new(other));
+                Rule::binary_operator => {
+                    operation = Some(pair.as_span().as_str());
                 }
-                _ => break,
+                _ => bail!("Malformed query"),
             }
         }
 
-        Ok(Some(condition))
+        Ok(condition.unwrap())
     }
-}
 
-impl WhereSt<'_> {
     pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
         match self {
-            WhereSt::Condition(cond) => cond.r#match(cell),
-            WhereSt::And(a, b) => Ok(a.r#match(cell)? && b.r#match(cell)?),
-            WhereSt::Or(a, b) => Ok(a.r#match(cell)? || b.r#match(cell)?),
+            WhereClause::Condition(cond) => cond.r#match(cell),
+            WhereClause::And(a, b) => Ok(a.r#match(cell)? && b.r#match(cell)?),
+            WhereClause::Or(a, b) => Ok(a.r#match(cell)? || b.r#match(cell)?),
         }
     }
 
     // Returns a list of check needed
     pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
         match self {
-            WhereSt::Condition(cond) => cond.filters(),
-            WhereSt::And(a, b) => [a.filters(), b.filters()].concat(),
-            WhereSt::Or(_, _) => vec![],
+            WhereClause::Condition(cond) => cond.filters(),
+            WhereClause::And(a, b) => [a.filters(), b.filters()].concat(),
+            WhereClause::Or(_, _) => vec![],
         }
-    }
-}
-
-impl Display for WhereSt<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Condition(c) => write!(f, "{c}"),
-            Self::And(a, b) => write!(f, "And ( {a}, {b} ) "),
-            Self::Or(a, b) => write!(f, "Or ( {a}, {b} ) "),
-        }
-    }
-}
-
-impl Parse for Schema {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        let mut schema = vec![];
-        if !Self::check(statements, "(") {
-            bail!("missing \"(\"")
-        }
-        statements.remove(0);
-
-        loop {
-            let (name, r#type) = match statements[..] {
-                [name, r#type, ..] => {
-                    let r#type = match r#type {
-                        "integer" | "int" => Type::Integer,
-                        "text" => Type::Text,
-                        s => bail!("[schema] unparsed type: {s}"),
-                    };
-                    (name.to_string(), r#type)
-                }
-                [")"] => break,
-                [c] => bail!("unexpected pattern: {c:?}"),
-                [] => bail!("malformed statement"),
-            };
-
-            schema.push((name, r#type));
-            statements.drain(0..2);
-
-            while let Some(other) = statements.first() {
-                match *other {
-                    "," => {
-                        statements.remove(0);
-                        break;
-                    }
-                    ")" => break,
-                    _ => statements.remove(0),
-                };
-            }
-        }
-
-        Ok(Some(Self(schema)))
     }
 }
 
 #[derive(Debug)]
-pub struct On {
-    pub table: String,
-    pub columns: Vec<String>,
-}
-
-impl Parse for On {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if !Self::check(statements, "on") {
-            return Ok(None);
-        }
-        statements.remove(0);
-
-        let table = statements.remove(0).to_string();
-
-        statements.remove(0);
-
-        let mut columns = vec![];
-
-        loop {
-            match statements.first() {
-                Some(&")") => break,
-                Some(&",") => {}
-                Some(column) => columns.push(column.to_string()),
-                None => break,
-            };
-
-            statements.remove(0);
-        }
-
-        Ok(Some(Self {
-            table: table.to_string(),
-            columns,
-        }))
-    }
-}
-
-#[derive(Debug)]
-pub struct LimitSt {
+pub struct LimitClause {
     pub limit: usize,
 }
 
-impl Parse for LimitSt {
-    fn parse(statements: &mut Vec<&str>) -> Result<Option<Self>>
-    where
-        Self: Sized,
-    {
-        if !Self::check(statements, "limit") {
-            return Ok(None);
-        }
-        statements.remove(0);
+impl LimitClause {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let number = pair.into_inner().next().unwrap();
+        let number = number.as_span().as_str();
+        let limit = str::parse::<usize>(number)?;
 
-        if statements.is_empty() {
-            bail!("missing value");
-        }
-
-        let limit = statements.remove(0).parse::<usize>()?;
-
-        Ok(Some(LimitSt { limit }))
+        Ok(LimitClause { limit })
     }
 }
 
 #[derive(Debug)]
 pub enum Command<'a> {
     Select {
-        select: SelectSt,
-        from: FromSt,
-        r#where: Option<WhereSt<'a>>,
-        limit: Option<LimitSt>,
+        select: SelectClause,
+        from: FromClause,
+        r#where: Option<WhereClause<'a>>,
+        limit: Option<LimitClause>,
     },
 
     CreateTable {
@@ -358,95 +253,104 @@ pub enum Command<'a> {
 
     CreateIndex {
         index: String,
-        on: On,
+        table: String,
+        columns: Vec<String>,
     },
 }
 
 impl<'a> Command<'a> {
-    pub fn parse(string: &str) -> Result<Self> {
-        let mut statements = Self::lexer(string)?;
+    pub fn parse(query: &str) -> Result<Self> {
+        println!("query: {query:?}");
+        let parsed = SQLParser::parse(Rule::query, query)?.next().unwrap();
+        let pair = parsed.into_inner().next().unwrap();
 
-        // TODO: better cases
-        let command = match statements[..] {
-            ["select" | "SELECT", ..] => {
-                let select = SelectSt::parse(&mut statements)?
-                    .ok_or(format_err!("[select] select statemente required"))?;
-                let from = FromSt::parse(&mut statements)?
-                    .ok_or(format_err!("[select] from statemente required"))?;
-                let r#where = WhereSt::parse(&mut statements)?;
-                let limit = LimitSt::parse(&mut statements)?;
+        match pair.as_rule() {
+            Rule::select_query => {
+                let mut select = None;
+                let mut from = None;
+                let mut r#where = None;
+                let mut limit = None;
 
-                Command::Select {
+                for p in pair.into_inner() {
+                    match p.as_rule() {
+                        Rule::EOI => {}
+                        Rule::select_clause => select = Some(SelectClause::new(p)?),
+                        Rule::from_clause => from = Some(FromClause::new(p)?),
+                        Rule::where_clause => r#where = Some(WhereClause::new(p)?),
+                        Rule::limit_clause => limit = Some(LimitClause::new(p)?),
+                        _ => bail!("Malformed query"),
+                    }
+                }
+
+                let (Some(select), Some(from)) = (select, from) else {
+                    bail!("Malformed query")
+                };
+
+                Ok(Self::Select {
                     select,
                     from,
                     r#where,
                     limit,
-                }
+                })
             }
-            ["create" | "CREATE", "table" | "TABLE", name, ..] => {
-                statements.drain(0..3);
-                let schema = Schema::parse(&mut statements)?
-                    .ok_or(format_err!("[create table] missing schema"))?;
+            Rule::create_table => {
+                let mut table = None;
+                let mut schema = vec![];
 
-                Command::CreateTable {
-                    table: name.to_string(),
-                    schema,
-                }
-            }
-            ["create" | "CREATE", "index" | "INDEX", index, ..] => {
-                statements.drain(0..3);
+                for p in pair.into_inner() {
+                    match p.as_rule() {
+                        Rule::EOI => {}
+                        Rule::identifier => table = Some(p.as_span().as_str().to_string()),
+                        Rule::table_column => {
+                            let mut inner = p.into_inner();
+                            let name = inner.next().unwrap();
+                            let name = name.as_span().as_str().to_string();
 
-                let on = On::parse(&mut statements)?
-                    .ok_or(format_err!("[create index] on statement requires"))?;
+                            let r#type = inner.next().unwrap();
+                            let r#type = r#type.as_span().as_str().to_string();
+                            let r#type = match r#type.to_lowercase().as_str() {
+                                "int" | "integer" => Type::Integer,
+                                "text" => Type::Text,
+                                t => bail!("Missing type: {t:?}"),
+                            };
 
-                Command::CreateIndex {
-                    index: index.to_string(),
-                    on,
-                }
-            }
-            [] => bail!("Empty query"),
-            _ => bail!("Unhandle query"),
-        };
-
-        Ok(command)
-    }
-
-    fn lexer(string: &str) -> Result<Vec<&str>> {
-        let mut tokens = vec![];
-
-        let mut starting = 0;
-        let mut ending = 0;
-        let mut quote = false;
-
-        for char in string.chars() {
-            match (quote, char) {
-                (false, '\'' | '\"') => quote = !quote,
-                (true, '\'' | '\"') => {
-                    quote = !quote;
-                    tokens.push(&string[starting..ending + 1]);
-                    starting = ending + 1;
-                }
-                (false, ' ' | '\n' | '\t') => {
-                    if starting != ending {
-                        tokens.push(&string[starting..ending]);
+                            schema.push((name, r#type));
+                        }
+                        _ => bail!("Malformed query"),
                     }
-                    starting = ending + 1;
                 }
-                (false, ',' | '(' | ')') => {
-                    if starting != ending {
-                        tokens.push(&string[starting..ending]);
-                    }
-                    tokens.push(&string[ending..ending + 1]);
-                    starting = ending + 1;
-                }
-                _ => {}
-            }
-            ending += 1;
-        }
 
-        if starting != ending {
-            tokens.push(&string[starting..ending]);
+                let Some(table) = table else {
+                    bail!("Malformed query")
+                };
+
+                let schema = Schema(schema);
+
+                Ok(Self::CreateTable { table, schema })
+            }
+
+            Rule::create_index => {
+                let mut inner = pair.into_inner();
+                let index = inner.next().unwrap();
+                let index = index.as_span().as_str().to_string();
+
+                let table = inner.next().unwrap();
+                let table = table.as_span().as_str().to_string();
+
+                let columns = inner.next().unwrap();
+                let columns = columns
+                    .into_inner()
+                    .map(|p| p.as_span().as_str().to_string())
+                    .collect::<Vec<_>>();
+
+                Ok(Self::CreateIndex {
+                    index,
+                    table,
+                    columns,
+                })
+            }
+
+            _ => bail!("Wrong query"),
         }
-        Ok(tokens)
     }
 }

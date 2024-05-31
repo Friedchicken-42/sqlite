@@ -4,7 +4,7 @@ pub mod command;
 pub mod page;
 
 use anyhow::{bail, Result};
-use command::Command;
+use command::{Column, Command, SimpleColumn};
 use page::{Cell, Page};
 use std::{
     borrow::Cow,
@@ -13,8 +13,6 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
-
-use crate::command::On;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Type {
@@ -323,10 +321,8 @@ impl<'a> Rows<'a> {
                 bail!("expected sql string");
             };
 
-            if let Command::CreateIndex {
-                on: On { table, columns },
-                ..
-            } = Command::parse(&sql)?
+            if let Command::CreateIndex { table, columns, .. } =
+                Command::parse(&sql.to_lowercase())?
             {
                 // TODO: add table name check
 
@@ -451,14 +447,13 @@ impl Sqlite {
                 bail!("expected sql string");
             };
 
-            return match Command::parse(&sql)? {
+            println!("{sql:?}");
+
+            return match Command::parse(&sql.to_lowercase())? {
                 Command::CreateTable { schema, .. } => {
                     BTreePage::read(self, rootpage as usize, schema)
                 }
-                Command::CreateIndex {
-                    on: On { table, columns },
-                    ..
-                } => {
+                Command::CreateIndex { table, columns, .. } => {
                     // Each entry in the index b-tree corresponds to a single row in the associated SQL table.
                     // The key to an index b-tree is a record composed of the columns that are being indexed followed by the key of the corresponding table row.
                     let mut schema = vec![];
@@ -519,12 +514,15 @@ impl Sqlite {
                     let rows = select
                         .columns
                         .iter()
-                        .map(|name| {
-                            if name == "*" {
-                                cell.all()
-                            } else {
-                                vec![cell.get(name)].into_iter().collect()
-                            }
+                        .map(|column| match column {
+                            Column::Simple(s) => match s {
+                                SimpleColumn::Wildcard => cell.all(),
+                                SimpleColumn::String(name) => {
+                                    vec![cell.get(name)].into_iter().collect()
+                                }
+                                _ => todo!(),
+                            },
+                            _ => todo!(),
                         })
                         .collect::<Result<Vec<_>>>()?
                         .into_iter()
@@ -542,8 +540,14 @@ impl Sqlite {
                     count += 1;
                 }
             }
-            _ => bail!("cannot execute this command now"),
+            Command::CreateTable { table, schema } => todo!(),
+            Command::CreateIndex {
+                index,
+                table,
+                columns,
+            } => todo!(),
         }
+
         Ok(())
     }
 }
