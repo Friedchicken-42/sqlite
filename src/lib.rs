@@ -4,7 +4,7 @@ pub mod command;
 pub mod page;
 
 use anyhow::{bail, Result};
-use command::{Column, Command, SimpleColumn};
+use command::{Column, Command, CreateIndex, CreateTable, FromTable, SimpleColumn};
 use page::{Cell, Page};
 use std::{
     borrow::Cow,
@@ -321,7 +321,7 @@ impl<'a> Rows<'a> {
                 bail!("expected sql string");
             };
 
-            if let Command::CreateIndex { table, columns, .. } =
+            if let Command::CreateIndex(CreateIndex { table, columns, .. }) =
                 Command::parse(&sql.to_lowercase())?
             {
                 // TODO: add table name check
@@ -447,13 +447,11 @@ impl Sqlite {
                 bail!("expected sql string");
             };
 
-            println!("{sql:?}");
-
             return match Command::parse(&sql.to_lowercase())? {
-                Command::CreateTable { schema, .. } => {
+                Command::CreateTable(CreateTable { schema, .. }) => {
                     BTreePage::read(self, rootpage as usize, schema)
                 }
-                Command::CreateIndex { table, columns, .. } => {
+                Command::CreateIndex(CreateIndex { table, columns, .. }) => {
                     // Each entry in the index b-tree corresponds to a single row in the associated SQL table.
                     // The key to an index b-tree is a record composed of the columns that are being indexed followed by the key of the corresponding table row.
                     let mut schema = vec![];
@@ -477,11 +475,13 @@ impl Sqlite {
             };
         }
 
-        bail!("column {name:?} not found")
+        bail!("table {name:?} not found")
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
         // TODO: should return values here?
+        command.execute(self)
+        /*
         match command {
             Command::Select {
                 select,
@@ -490,7 +490,17 @@ impl Sqlite {
                 limit,
             } => {
                 let mut count = 0;
-                let table = self.table(&from.table)?;
+
+                println!("{:?}", from.tables);
+
+                let tablename = "asdf";
+                // let tablename = match from.tables.first() {
+                //     None => bail!("Empty query"),
+                //     Some(FromTable::Simple(name)) => name,
+                //     Some(FromTable::Alias(name, _)) => name,
+                // };
+                let table = self.table(tablename)?;
+
                 let mut iter = table.rows();
 
                 if let Some(r#where) = &r#where {
@@ -549,5 +559,6 @@ impl Sqlite {
         }
 
         Ok(())
+        */
     }
 }

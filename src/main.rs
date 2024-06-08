@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
-use sqlite::{command::Command, Sqlite, Value};
+use sqlite::{
+    command::{Command, CreateIndex, CreateTable},
+    Sqlite, Value,
+};
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -57,12 +60,12 @@ fn main() -> Result<()> {
                 };
 
                 match Command::parse(&sql.to_lowercase())? {
-                    Command::CreateTable { schema, .. } => {
+                    Command::CreateTable(CreateTable { schema, .. }) => {
                         for (name, r#type) in schema.0.iter() {
                             println!("{name:?}: {:?}", r#type);
                         }
                     }
-                    Command::CreateIndex { table, columns, .. } => {
+                    Command::CreateIndex(CreateIndex { table, columns, .. }) => {
                         let mut cols = String::new();
 
                         for (i, col) in columns.iter().enumerate() {
@@ -81,7 +84,6 @@ fn main() -> Result<()> {
         }
         command => {
             let command = Command::parse(command)?;
-            println!("{command:#?}");
             db.execute(command)?;
         }
     };

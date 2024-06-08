@@ -25,11 +25,20 @@ fields = _{ field ~ ("," ~ field)* }
 
 select_clause = { "select" ~ fields }
 
-from_clause = { "from" ~ identifier }
+// aliased_table = { ( identifier ~ "as" ~ identifier ) | ( identifier ~ identifier ) }
+aliased_table = { identifier ~ "as" ~ identifier }
+
+table = _{ aliased_table | identifier } 
+
+join = _{ "join" ~ table ~ ( "on" ~ condition )? }
+
+tables = _{ table ~ ( join | ( "," ~  table) )* }
+
+from_clause = { "from" ~ tables }
 
 conditional = { "=" }
 
-condition = { identifier ~ conditional ~ ( identifier | string ) }
+condition = { ( dotted_field | identifier ) ~ conditional ~ ( dotted_field | string | identifier ) }
 
 binary_operator = { "and" | "or" }
 

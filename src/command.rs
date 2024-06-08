@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{page::Cell, Schema, Type, Value};
+use crate::{page::Cell, Rows, Schema, Sqlite, Type, Value};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -31,7 +31,7 @@ impl SimpleColumn {
 
                 Ok(Self::Dotted(strings))
             }
-            _ => bail!("Malformed query"),
+            _ => bail!("[Simple Column] Malformed query"),
         }
     }
 }
@@ -62,7 +62,7 @@ impl Column {
 
                 Ok(Self::Alias(simple, alias))
             }
-            _ => bail!("Malformed query"),
+            _ => bail!("[Column] Malformed query"),
         }
     }
 }
@@ -84,15 +84,65 @@ impl SelectClause {
 }
 
 #[derive(Debug)]
-pub struct FromClause {
-    pub table: String,
+pub enum FromTable {
+    Simple(String),
+    Alias(String, String),
 }
 
-impl FromClause {
+impl FromTable {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
-        let inner = pair.into_inner().next().unwrap();
-        let table = inner.as_span().as_str().to_string();
-        Ok(Self { table })
+        match pair.as_rule() {
+            Rule::identifier => {
+                let string = pair.as_span().as_str().to_string();
+                Ok(Self::Simple(string))
+            }
+            Rule::aliased_table => {
+                let mut inner = pair.into_inner();
+                let simple = inner.next().unwrap();
+                let simple = simple.as_span().as_str().to_string();
+
+                let alias = inner.next().unwrap();
+                let alias = alias.as_span().as_str().to_string();
+
+                Ok(Self::Alias(simple, alias))
+            }
+            _ => bail!("[From Table] Malformed query"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FromClause<'a> {
+    pub tables: Vec<FromTable>,
+    pub conditions: Vec<Condition<'a>>,
+}
+
+impl<'a> FromClause<'a> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let inner = pair.into_inner();
+
+        let mut tables = vec![];
+        let mut conditions = vec![];
+
+        for pair in inner {
+            match pair.as_rule() {
+                Rule::identifier | Rule::aliased_table => {
+                    let table = FromTable::new(pair)?;
+                    tables.push(table);
+                }
+                Rule::condition => {
+                    dbg!(&pair);
+                    let condition = Condition::new(pair)?;
+                    conditions.push(condition);
+                }
+                _ => bail!("[From Clause] Malformed query"),
+            }
+        }
+
+        dbg!(&tables);
+        dbg!(&conditions);
+
+        Ok(Self { tables, conditions })
     }
 }
 
@@ -102,32 +152,55 @@ pub enum Conditional {
 }
 
 #[derive(Debug)]
+pub enum Expected<'a> {
+    Value(Value<'a>),
+    Column(Column),
+}
+
+impl<'a> Expected<'a> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let expected = pair.as_span().as_str().to_string();
+
+        let expected = if expected == "null" {
+            Self::Value(Value::Null)
+        } else if expected.starts_with('\'') {
+            let string = expected[1..expected.len() - 1].to_string();
+            let string = Cow::Owned(string);
+            Self::Value(Value::Text(string))
+        } else if let Ok(number) = expected.parse::<u32>() {
+            Self::Value(Value::Integer(number))
+        } else if let Ok(number) = expected.parse::<f64>() {
+            Self::Value(Value::Float(number))
+        } else {
+            let column = SimpleColumn::new(pair)?;
+            Self::Column(Column::Simple(column))
+        };
+
+        Ok(expected)
+    }
+}
+
+#[derive(Debug)]
 pub struct Condition<'a> {
-    column: String,
+    column: Column,
     conditional: Conditional,
-    expected: Value<'a>,
+    expected: Expected<'a>,
 }
 
 impl<'a> Condition<'a> {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         let mut inner = pair.into_inner();
-        let column = inner.next().unwrap().as_span().as_str().to_string();
+        let column = inner.next().unwrap();
+        let column = SimpleColumn::new(column)?;
+        let column = Column::Simple(column);
+
         let conditional = match inner.next().unwrap().as_span().as_str() {
             "=" => Conditional::Equals,
-            _ => bail!("Malformed query"),
+            _ => bail!("[Condition] Malformed query"),
         };
 
-        let expected = inner.next().unwrap().as_span().as_str().to_string();
-
-        let expected = if expected == "null" {
-            Value::Null
-        } else if expected.starts_with('\'') {
-            Value::Text(Cow::Owned(expected[1..expected.len() - 1].to_string()))
-        } else if expected.contains('.') {
-            Value::Float(expected.parse::<f64>()?)
-        } else {
-            Value::Integer(expected.parse::<u32>()?)
-        };
+        let expected = inner.next().unwrap();
+        let expected = Expected::new(expected)?;
 
         Ok(Self {
             column,
@@ -137,21 +210,23 @@ impl<'a> Condition<'a> {
     }
 
     pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
-        let Ok(value) = cell.get(&self.column) else {
-            bail!("column {:?} not found", self.column)
-        };
+        // let Ok(value) = cell.get(&self.column) else {
+        //     bail!("column {:?} not found", self.column)
+        // };
 
-        match self.conditional {
-            Conditional::Equals => Ok(value == self.expected),
-        }
+        // match self.conditional {
+        //     Conditional::Equals => Ok(value == self.expected),
+        // }
+        todo!()
     }
 
     pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
-        if self.conditional == Conditional::Equals {
-            vec![(self.column.clone().into(), self.expected.clone())]
-        } else {
-            vec![]
-        }
+        // if self.conditional == Conditional::Equals {
+        //     vec![(self.column.clone().into(), self.expected.clone())]
+        // } else {
+        //     vec![]
+        // }
+        todo!()
     }
 }
 
@@ -189,7 +264,7 @@ impl<'a> WhereClause<'a> {
                                 Self::And(Box::new(cond), Box::new(other))
                             }
                         }
-                        _ => bail!("Malformed query"),
+                        _ => bail!("[Where Condition] Malformed query"),
                     };
 
                     condition = Some(new);
@@ -197,7 +272,7 @@ impl<'a> WhereClause<'a> {
                 Rule::binary_operator => {
                     operation = Some(pair.as_span().as_str());
                 }
-                _ => bail!("Malformed query"),
+                _ => bail!("[Where Clause] Malformed query"),
             }
         }
 
@@ -238,119 +313,261 @@ impl LimitClause {
 }
 
 #[derive(Debug)]
+pub struct Select<'a> {
+    pub select: SelectClause,
+    pub from: FromClause<'a>,
+    pub r#where: Option<WhereClause<'a>>,
+    pub limit: Option<LimitClause>,
+}
+
+impl<'a> Select<'a> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let mut select = None;
+        let mut from = None;
+        let mut r#where = None;
+        let mut limit = None;
+
+        for p in pair.into_inner() {
+            match p.as_rule() {
+                Rule::EOI => {}
+                Rule::select_clause => select = Some(SelectClause::new(p)?),
+                Rule::from_clause => from = Some(FromClause::new(p)?),
+                Rule::where_clause => r#where = Some(WhereClause::new(p)?),
+                Rule::limit_clause => limit = Some(LimitClause::new(p)?),
+                _ => bail!("[Select Command] Malformed query"),
+            }
+        }
+
+        let (Some(select), Some(from)) = (select, from) else {
+            bail!("[Select Command] Malformed query")
+        };
+
+        Ok(Select {
+            select,
+            from,
+            r#where,
+            limit,
+        })
+    }
+
+    pub fn execute(self, db: &Sqlite) -> Result<()> {
+        fn cartesian<F>(
+            tables: &[FromTable],
+            values: &[(&FromTable, &Cell)],
+            callback: &F,
+            db: &Sqlite,
+        ) -> Result<()>
+        where
+            F: Fn(&[(&FromTable, &Cell)]) -> Result<()>,
+        {
+            if tables.is_empty() {
+                return callback(&values);
+                // for (table, row) in values {
+                //     let (name, alias) = match table {
+                //         FromTable::Simple(n) => (n, n),
+                //         FromTable::Alias(n, a) => (n, a),
+                //     };
+
+                //     let column = "name";
+
+                //     let item = row.get(column).unwrap();
+                //     print!("{name} {alias}.{column} = {item:?}  ");
+                // }
+                // println!();
+                // return Ok(());
+            }
+
+            let fromtable = &tables[0];
+            let name = match fromtable {
+                FromTable::Simple(n) => n,
+                FromTable::Alias(n, _) => n,
+            };
+
+            let table = db.table(name)?;
+            let mut rows = table.rows();
+
+            while let Some(cell) = rows.next() {
+                let mut values = values.to_vec();
+                values.push((fromtable, &cell));
+                cartesian(&tables[1..], &values, callback, db)?;
+                values.pop();
+            }
+
+            Ok(())
+        }
+
+        let Select {
+            select,
+            from: FromClause { tables, conditions },
+            r#where,
+            limit,
+        } = self;
+
+        let condition = conditions
+            .into_iter()
+            .fold(None, |acc, cond| match (acc, cond) {
+                (None, c) => Some(WhereClause::Condition(c)),
+                (Some(a), b) => {
+                    let a = Box::new(a);
+                    let c = Box::new(WhereClause::Condition(b));
+                    Some(WhereClause::And(a, c))
+                }
+            });
+
+        let r#where = match (r#where, condition) {
+            (None, None) => None,
+            (Some(r), Some(c)) => Some(WhereClause::And(Box::new(r), Box::new(c))),
+            (Some(x), _) | (_, Some(x)) => Some(x),
+        };
+
+        dbg!(&r#where);
+        dbg!(&tables);
+
+        let callback = |values: &[(&FromTable, &Cell)]| -> Result<()> {
+            for (table, cell) in values {
+                for column in &select.columns {
+                    // TODO: add *
+                    let column = match column {
+                        Column::Alias(_, _) => todo!(),
+                        Column::Simple(s) => s,
+                    };
+
+                    let name = match column {
+                        SimpleColumn::Wildcard => todo!(),
+                        SimpleColumn::String(s) => s,
+                        SimpleColumn::Dotted(_) => todo!(),
+                    };
+                    let value = cell.get(name)?;
+
+                    print!("{value} ");
+                }
+            }
+            println!();
+            Ok(())
+        };
+
+        cartesian(&tables, &[], &callback, db)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct CreateTable {
+    pub table: String,
+    pub schema: Schema,
+}
+
+impl CreateTable {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let mut table = None;
+        let mut schema = vec![];
+
+        for p in pair.into_inner() {
+            match p.as_rule() {
+                Rule::EOI => {}
+                Rule::identifier => table = Some(p.as_span().as_str().to_string()),
+                Rule::table_column => {
+                    let mut inner = p.into_inner();
+                    let name = inner.next().unwrap();
+                    let name = name.as_span().as_str().to_string();
+
+                    let r#type = inner.next().unwrap();
+                    let r#type = r#type.as_span().as_str().to_string();
+                    let r#type = match r#type.to_lowercase().as_str() {
+                        "int" | "integer" => Type::Integer,
+                        "text" => Type::Text,
+                        t => bail!("Missing type: {t:?}"),
+                    };
+
+                    schema.push((name, r#type));
+                }
+                _ => bail!("[Create Table Command] Malformed query"),
+            }
+        }
+
+        let Some(table) = table else {
+            bail!("[Create Table Command] Malformed query")
+        };
+
+        let schema = Schema(schema);
+
+        Ok(CreateTable { table, schema })
+    }
+
+    pub fn execute(self, db: &Sqlite) -> Result<()> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub struct CreateIndex {
+    pub index: String,
+    pub table: String,
+    pub columns: Vec<String>,
+}
+
+impl CreateIndex {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        let mut inner = pair.into_inner();
+        let index = inner.next().unwrap();
+        let index = index.as_span().as_str().to_string();
+
+        let table = inner.next().unwrap();
+        let table = table.as_span().as_str().to_string();
+
+        let columns = inner.next().unwrap();
+        let columns = columns
+            .into_inner()
+            .map(|p| p.as_span().as_str().to_string())
+            .collect::<Vec<_>>();
+
+        Ok(CreateIndex {
+            index,
+            table,
+            columns,
+        })
+    }
+
+    pub fn execute(self, db: &Sqlite) -> Result<()> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
 pub enum Command<'a> {
-    Select {
-        select: SelectClause,
-        from: FromClause,
-        r#where: Option<WhereClause<'a>>,
-        limit: Option<LimitClause>,
-    },
-
-    CreateTable {
-        table: String,
-        schema: Schema,
-    },
-
-    CreateIndex {
-        index: String,
-        table: String,
-        columns: Vec<String>,
-    },
+    Select(Select<'a>),
+    CreateTable(CreateTable),
+    CreateIndex(CreateIndex),
 }
 
 impl<'a> Command<'a> {
     pub fn parse(query: &str) -> Result<Self> {
-        println!("query: {query:?}");
         let parsed = SQLParser::parse(Rule::query, query)?.next().unwrap();
         let pair = parsed.into_inner().next().unwrap();
 
         match pair.as_rule() {
             Rule::select_query => {
-                let mut select = None;
-                let mut from = None;
-                let mut r#where = None;
-                let mut limit = None;
-
-                for p in pair.into_inner() {
-                    match p.as_rule() {
-                        Rule::EOI => {}
-                        Rule::select_clause => select = Some(SelectClause::new(p)?),
-                        Rule::from_clause => from = Some(FromClause::new(p)?),
-                        Rule::where_clause => r#where = Some(WhereClause::new(p)?),
-                        Rule::limit_clause => limit = Some(LimitClause::new(p)?),
-                        _ => bail!("Malformed query"),
-                    }
-                }
-
-                let (Some(select), Some(from)) = (select, from) else {
-                    bail!("Malformed query")
-                };
-
-                Ok(Self::Select {
-                    select,
-                    from,
-                    r#where,
-                    limit,
-                })
+                let select = Select::new(pair)?;
+                Ok(Self::Select(select))
             }
             Rule::create_table => {
-                let mut table = None;
-                let mut schema = vec![];
-
-                for p in pair.into_inner() {
-                    match p.as_rule() {
-                        Rule::EOI => {}
-                        Rule::identifier => table = Some(p.as_span().as_str().to_string()),
-                        Rule::table_column => {
-                            let mut inner = p.into_inner();
-                            let name = inner.next().unwrap();
-                            let name = name.as_span().as_str().to_string();
-
-                            let r#type = inner.next().unwrap();
-                            let r#type = r#type.as_span().as_str().to_string();
-                            let r#type = match r#type.to_lowercase().as_str() {
-                                "int" | "integer" => Type::Integer,
-                                "text" => Type::Text,
-                                t => bail!("Missing type: {t:?}"),
-                            };
-
-                            schema.push((name, r#type));
-                        }
-                        _ => bail!("Malformed query"),
-                    }
-                }
-
-                let Some(table) = table else {
-                    bail!("Malformed query")
-                };
-
-                let schema = Schema(schema);
-
-                Ok(Self::CreateTable { table, schema })
+                let createtable = CreateTable::new(pair)?;
+                Ok(Self::CreateTable(createtable))
             }
-
             Rule::create_index => {
-                let mut inner = pair.into_inner();
-                let index = inner.next().unwrap();
-                let index = index.as_span().as_str().to_string();
-
-                let table = inner.next().unwrap();
-                let table = table.as_span().as_str().to_string();
-
-                let columns = inner.next().unwrap();
-                let columns = columns
-                    .into_inner()
-                    .map(|p| p.as_span().as_str().to_string())
-                    .collect::<Vec<_>>();
-
-                Ok(Self::CreateIndex {
-                    index,
-                    table,
-                    columns,
-                })
+                let createindex = CreateIndex::new(pair)?;
+                Ok(Self::CreateIndex(createindex))
             }
-
             _ => bail!("Wrong query"),
+        }
+    }
+
+    pub fn execute(self, db: &Sqlite) -> Result<()> {
+        match self {
+            Command::Select(select) => select.execute(db),
+            Command::CreateTable(createtable) => createtable.execute(db),
+            Command::CreateIndex(createindex) => createindex.execute(db),
         }
     }
 }
