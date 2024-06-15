@@ -9,7 +9,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
-use tracing::{event, info, instrument, span, trace, Level};
+use tracing::{event, span, Level};
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -103,7 +103,7 @@ pub enum Type {
     Blob,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, PartialOrd)]
 pub enum Value<'a> {
     Null,
     Integer(u32),
@@ -112,7 +112,9 @@ pub enum Value<'a> {
     Blob(&'a [u8]),
 }
 
-impl<'a> Value<'a> {
+impl<'a> Eq for Value<'a> {}
+
+impl<'a> Ord for Value<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
@@ -145,7 +147,7 @@ impl<'a> Display for Value<'a> {
 }
 
 #[derive(Debug)]
-struct Schema(Vec<(String, Type)>);
+pub struct Schema(Vec<(String, Type)>);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum PageType {
@@ -221,21 +223,11 @@ impl Page {
         let data = &self.data[offset..];
 
         let mut offset = match self.r#type {
-            PageType::TableLeaf => 0,
-            PageType::IndexLeaf => 0,
-            PageType::TableInterior => 4,
-            PageType::IndexInterior => 4,
-            // PageType::IndexInterior => {
-            //     return Cell {
-            //         r#type: self.r#type,
-            //         data,
-            //         records: vec![],
-            //         schema,
-            //     }
-            // }
+            PageType::TableLeaf | PageType::IndexLeaf => 0,
+            PageType::TableInterior | PageType::IndexInterior => 4,
         };
 
-        let (payload_bytes, size) = read_varint(&data[offset..]);
+        let (_, size) = read_varint(&data[offset..]);
         offset += size;
 
         if self.r#type == PageType::TableLeaf {
@@ -270,11 +262,11 @@ impl Page {
     }
 }
 
-trait Rows: Debug {
+pub trait Rows: Debug {
     fn next(&mut self) -> Option<impl Row>;
 }
 
-trait Row<'a>: Debug {
+pub trait Row<'a>: Debug {
     fn get(&self, column: &str) -> Result<Value<'a>>;
 }
 
@@ -433,8 +425,6 @@ impl<'a> BTreePage<'a> {
 
 impl<'a> Rows for BTreePage<'a> {
     fn next(&mut self) -> Option<impl Row> {
-        // let filter: Option<impl Fn(&Cell) -> Ordering> = None;
-
         // Type system hack, TODO: find a better way
         let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
         self.loop_until(filter)
@@ -470,7 +460,6 @@ impl<'a> BTreeIndex<'a> {
         };
 
         let cell = self.btreepage.loop_until(filter)?;
-        // println!("CELL: {:?} {:?}", cell.get("country"), cell.get("index"));
 
         let Value::Blob(blob) = cell.get("index").unwrap() else {
             panic!("wrong value");
@@ -491,7 +480,6 @@ pub struct IndexedRows<'a> {
 impl<'a> Rows for IndexedRows<'a> {
     fn next(&mut self) -> Option<impl Row> {
         let rowid = self.btreeindex.next()?;
-        // println!("ROWID FOUND: {rowid}");
         self.btreepage.next_by_rowid(rowid)
     }
 }
@@ -599,7 +587,11 @@ impl Sqlite {
         Ok(Self { file, header })
     }
 
-    fn root(&self) -> Result<BTreePage> {
+    pub fn page_size(&self) -> usize {
+        self.header.page_size
+    }
+
+    pub fn root(&self) -> Result<BTreePage> {
         let schema = Schema(vec![
             ("type".into(), Type::Text),
             ("name".into(), Type::Text),
@@ -632,7 +624,7 @@ impl Sqlite {
         Ok(page)
     }
 
-    fn table(&self, name: &str) -> Result<BTreePage> {
+    fn find(&self, name: &str) -> Result<(u32, Command)> {
         let span = span!(Level::INFO, "Page Search", name = name);
         let _enter = span.enter();
 
@@ -655,37 +647,52 @@ impl Sqlite {
                 bail!("Expected text")
             };
 
-            return match Command::parse(&sql.to_lowercase())? {
-                Command::CreateTable(CreateTable { schema, .. }) => {
-                    BTreePage::read(self, rootpage as usize, schema)
-                }
-                Command::CreateIndex(CreateIndex {
-                    index,
-                    table,
-                    columns,
-                }) => {
-                    let mut schema = vec![];
-                    let table = self.table(&table)?;
+            let command = Command::parse(&sql.to_lowercase())?;
 
-                    for column in columns {
-                        for (name, r#type) in &table.schema.0 {
-                            if column == *name {
-                                schema.push((column.clone(), *r#type));
-                            }
-                        }
-                    }
-
-                    // why the FUCK is this not a varint (even if it should be)?
-                    // blob.iter().fold(0, |acc, x| (acc << 8) + x)
-                    schema.push(("index".into(), Type::Blob));
-                    let schema = Schema(schema);
-                    BTreePage::read(self, rootpage as usize, schema)
-                }
-                _ => bail!("wrong sql command"),
-            };
+            return Ok((rootpage, command));
         }
 
         bail!("table {name:?} not found");
+    }
+
+    pub fn table(&self, name: &str) -> Result<BTreePage> {
+        let (rootpage, command) = self.find(name)?;
+
+        if let Command::CreateTable(CreateTable { table, schema }) = command {
+            BTreePage::read(self, rootpage as usize, schema)
+        } else {
+            bail!("{name:?} is not a table")
+        }
+    }
+
+    pub fn index(&self, name: &str) -> Result<BTreePage> {
+        let (rootpage, command) = self.find(name)?;
+
+        if let Command::CreateIndex(CreateIndex {
+            index,
+            table,
+            columns,
+        }) = command
+        {
+            let mut schema = vec![];
+            let table = self.table(&table)?;
+
+            for column in columns {
+                for (name, r#type) in &table.schema.0 {
+                    if column == *name {
+                        schema.push((column.clone(), *r#type));
+                    }
+                }
+            }
+
+            // why the FUCK is this not a varint (even if it should be)?
+            // blob.iter().fold(0, |acc, x| (acc << 8) + x)
+            schema.push(("index".into(), Type::Blob));
+            let schema = Schema(schema);
+            BTreePage::read(self, rootpage as usize, schema)
+        } else {
+            bail!("{name:?} is not a table")
+        }
     }
 
     pub fn show_schema(&self) -> Result<()> {
@@ -726,7 +733,10 @@ impl Sqlite {
                 }
                 _ => bail!("unexpected statement"),
             }
+
+            println!()
         }
+
         Ok(())
     }
 
@@ -789,7 +799,7 @@ mod tests {
     fn simple_index() -> Result<()> {
         let db = Sqlite::read("other.db")?;
         let table = db.table("apples")?;
-        let index = db.table("apples_idx")?;
+        let index = db.index("apples_idx")?;
 
         let mut indexed = IndexedRows {
             btreepage: table,
@@ -815,7 +825,7 @@ mod tests {
     fn complex_index() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
         let table = db.table("companies")?;
-        let index = db.table("idx_companies_country")?;
+        let index = db.index("idx_companies_country")?;
 
         let mut indexed = IndexedRows {
             btreepage: table,
