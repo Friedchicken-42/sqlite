@@ -25,7 +25,9 @@ fields = _{ field ~ ("," ~ field)* }
 
 select_clause = { "select" ~ fields }
 
-// aliased_table = { ( identifier ~ "as" ~ identifier ) | ( identifier ~ identifier ) }
+// table_as = { identifier ~ "as" ~ identifier }
+// table_concat = ${ identifier ~ identifier }
+// aliased_table = @{ table_as | table_concat }
 aliased_table = { identifier ~ "as" ~ identifier }
 
 table = _{ aliased_table | identifier } 

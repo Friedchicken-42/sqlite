@@ -1,18 +1,98 @@
-#![allow(dead_code)]
-
-pub mod command;
-pub mod page;
+mod command;
 
 use anyhow::{bail, Result};
-use command::{Column, Command, CreateIndex, CreateTable, FromTable, SimpleColumn};
-use page::{Cell, Page};
+use command::{Command, CreateIndex, CreateTable};
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    fmt::Display,
+    fmt::{Debug, Display},
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
+use tracing::{event, info, instrument, span, trace, Level};
+
+fn read_varint(data: &[u8]) -> (u64, usize) {
+    let mut i = 0;
+    let mut number = 0u64;
+
+    loop {
+        let byte = data[i];
+
+        if byte & 0b10000000 == 0 || i == 9 {
+            break;
+        }
+
+        number = number << 7 | (byte & 0b01111111) as u64;
+
+        i += 1;
+    }
+
+    if i != 9 {
+        number = number << 7 | data[i] as u64;
+    }
+
+    (number, i + 1)
+}
+
+fn serial_size(serial: u64) -> u64 {
+    match serial {
+        0 | 8 | 9 | 12 | 13 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 | 7 => 8,
+        n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
+        n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+        _ => unreachable!(),
+    }
+}
+
+fn parse_bytearray(data: &[u8]) -> (Vec<u64>, usize) {
+    let (header_bytes, size) = read_varint(data);
+
+    if header_bytes == 0 {
+        return (vec![], 0);
+    }
+
+    let mut offset = size;
+    let mut serials = vec![];
+
+    let mut length = header_bytes - size as u64;
+
+    while length > 0 {
+        let (serial, size) = read_varint(&data[offset..]);
+        offset += size;
+        length -= size as u64;
+
+        serials.push(serial);
+    }
+
+    (serials, offset)
+}
+
+fn bytearray_values(data: &[u8]) -> (Vec<&[u8]>, usize) {
+    let (serials, size) = parse_bytearray(data);
+    let mut offset = size;
+
+    let mut records = Vec::with_capacity(serials.len());
+
+    for serial in serials {
+        let size = serial_size(serial) as usize;
+
+        let value = match serial {
+            8 => &[0],
+            9 => &[1],
+            _ => &data[offset..][..size],
+        };
+
+        records.push(value);
+        offset += size;
+    }
+
+    (records, offset)
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Type {
@@ -65,7 +145,138 @@ impl<'a> Display for Value<'a> {
 }
 
 #[derive(Debug)]
-pub struct Schema(pub Vec<(String, Type)>);
+struct Schema(Vec<(String, Type)>);
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum PageType {
+    TableLeaf,
+    IndexLeaf,
+    TableInterior,
+    IndexInterior,
+}
+
+#[derive(Debug)]
+pub struct PageHeader {
+    freeblock: usize,
+    cells: usize,
+    offset: usize,
+    frag: usize,
+}
+
+impl PageHeader {
+    fn read(data: &[u8]) -> Self {
+        Self {
+            freeblock: u16::from_be_bytes([data[1], data[2]]) as usize,
+            cells: u16::from_be_bytes([data[3], data[4]]) as usize,
+            offset: u16::from_be_bytes([data[5], data[6]]) as usize,
+            frag: data[7] as usize,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Page {
+    r#type: PageType,
+    header: PageHeader,
+    pointers: Vec<usize>,
+    data: Vec<u8>,
+}
+
+impl Page {
+    fn read(data: Vec<u8>, index: usize) -> Result<Self> {
+        let offset = if index == 1 { 100 } else { 0 };
+
+        let header = PageHeader::read(&data[offset..]);
+
+        let r#type = match data[offset] {
+            0x0d => PageType::TableLeaf,
+            0x0a => PageType::IndexLeaf,
+            0x05 => PageType::TableInterior,
+            0x02 => PageType::IndexInterior,
+            p => bail!("wrong page_type: {p:?}"),
+        };
+
+        let offset = if r#type == PageType::TableInterior || r#type == PageType::IndexInterior {
+            offset + 12
+        } else {
+            offset + 8
+        };
+
+        let pointers = (0..header.cells)
+            .map(|i| {
+                let off = offset + i * 2;
+                u16::from_be_bytes([data[off], data[off + 1]]) as usize
+            })
+            .collect();
+
+        Ok(Self {
+            r#type,
+            header,
+            pointers,
+            data,
+        })
+    }
+
+    fn cell<'a>(&'a self, offset: usize, schema: &'a Schema) -> Cell<'a> {
+        let data = &self.data[offset..];
+
+        let mut offset = match self.r#type {
+            PageType::TableLeaf => 0,
+            PageType::IndexLeaf => 0,
+            PageType::TableInterior => 4,
+            PageType::IndexInterior => 4,
+            // PageType::IndexInterior => {
+            //     return Cell {
+            //         r#type: self.r#type,
+            //         data,
+            //         records: vec![],
+            //         schema,
+            //     }
+            // }
+        };
+
+        let (payload_bytes, size) = read_varint(&data[offset..]);
+        offset += size;
+
+        if self.r#type == PageType::TableLeaf {
+            let (_, size) = read_varint(&data[offset..]);
+            offset += size;
+        }
+
+        let (records, _) = if self.r#type != PageType::TableInterior {
+            bytearray_values(&data[offset..])
+        } else {
+            (vec![], 0)
+        };
+
+        Cell {
+            r#type: self.r#type,
+            data,
+            records,
+            schema,
+        }
+    }
+
+    fn right_pointer(&self) -> Result<usize> {
+        match self.r#type {
+            PageType::TableInterior | PageType::IndexInterior => {
+                let pointer =
+                    u32::from_be_bytes([self.data[8], self.data[9], self.data[10], self.data[11]])
+                        as usize;
+                Ok(pointer)
+            }
+            _ => bail!("right pointer is present only in interior page"),
+        }
+    }
+}
+
+trait Rows: Debug {
+    fn next(&mut self) -> Option<impl Row>;
+}
+
+trait Row<'a>: Debug {
+    fn get(&self, column: &str) -> Result<Value<'a>>;
+}
 
 #[derive(Debug)]
 pub struct BTreePage<'a> {
@@ -91,15 +302,8 @@ impl<'a> BTreePage<'a> {
         self.pages
             .first()
             .expect("Must be present at least one page")
-            .cells()
-    }
-
-    pub fn rows(self) -> Rows<'a> {
-        Rows {
-            btreepage: self,
-            btreeindex: None,
-            filters: vec![],
-        }
+            .header
+            .cells
     }
 
     fn loop_until<F>(&mut self, filter: Option<F>) -> Option<Cell<'_>>
@@ -114,38 +318,29 @@ impl<'a> BTreePage<'a> {
             let page = self.pages.last().unwrap();
             let index = self.indexes.last_mut().unwrap();
 
-            match page {
-                page @ (Page::TableLeaf(_) | Page::IndexLeaf(_)) => {
-                    if *index >= page.cells() {
+            match &page.r#type {
+                page_type @ (PageType::TableLeaf | PageType::IndexLeaf) => {
+                    if *index >= page.header.cells {
                         self.pages.pop();
                         self.indexes.pop();
                     } else {
-                        let pointers = page.pointers();
+                        let pointers = &page.pointers;
                         let offset = pointers[*index];
 
                         *index += 1;
 
-                        match (page, &filter) {
-                            (Page::TableLeaf(t), None) => {
-                                let cell = t.cell(offset, &self.schema);
-                                return Some(Cell::TableLeaf(cell));
+                        match (page_type, &filter) {
+                            (_, None) => {
+                                return Some(page.cell(offset, &self.schema));
                             }
-                            (Page::IndexLeaf(i), None) => {
-                                let cell = i.cell(offset, &self.schema);
-                                return Some(Cell::IndexLeaf(cell));
-                            }
-                            (Page::TableLeaf(t), Some(f)) => {
-                                let cell = t.cell(offset, &self.schema);
-                                let cell = Cell::TableLeaf(cell);
-
+                            (PageType::TableLeaf, Some(f)) => {
+                                let cell = page.cell(offset, &self.schema);
                                 if f(&cell).is_eq() {
                                     return Some(cell);
                                 }
                             }
-                            (Page::IndexLeaf(i), Some(f)) => {
-                                let cell = i.cell(offset, &self.schema);
-                                let cell = Cell::IndexLeaf(cell);
-
+                            (PageType::IndexLeaf, Some(f)) => {
+                                let cell = page.cell(offset, &self.schema);
                                 match f(&cell) {
                                     Ordering::Less => {}
                                     Ordering::Equal => return Some(cell),
@@ -156,34 +351,30 @@ impl<'a> BTreePage<'a> {
                         }
                     }
                 }
-                page @ (Page::TableInterior(_) | Page::IndexInterior(_)) => {
-                    if *index > page.cells() * 2 {
-                        self.indexes.pop();
+                page_type @ (PageType::TableInterior | PageType::IndexInterior) => {
+                    if *index > page.header.cells * 2 {
                         self.pages.pop();
-                    } else if *index == page.cells() * 2 {
+                        self.indexes.pop();
+                    } else if *index == page.header.cells * 2 {
                         *index += 1;
 
-                        let right_pointer = match page {
-                            Page::TableInterior(t) => t.right_pointer,
-                            Page::IndexInterior(i) => i.right_pointer,
-                            _ => unreachable!(),
-                        };
+                        // TODO: find a way to return errors from here decently
+                        let right_pointer = page.right_pointer().unwrap();
 
                         let next_page = self.db.page(right_pointer).unwrap();
 
                         self.pages.push(next_page);
                         self.indexes.push(0);
                     } else if *index % 2 == 1 {
-                        match page {
-                            Page::TableInterior(_) => *index += 1,
-                            Page::IndexInterior(i) => {
-                                let pointers = page.pointers();
+                        match page_type {
+                            PageType::TableInterior => *index += 1,
+                            PageType::IndexInterior => {
+                                let pointers = &page.pointers;
                                 let offset = pointers[(*index - 1) / 2];
 
                                 *index += 1;
 
-                                let cell = i.cell(offset, &self.schema);
-                                let cell = Cell::IndexInterior(cell);
+                                let cell = page.cell(offset, &self.schema);
 
                                 if let Some(f) = &filter {
                                     if f(&cell).is_ge() {
@@ -196,45 +387,27 @@ impl<'a> BTreePage<'a> {
                             _ => unreachable!(),
                         }
                     } else {
-                        let pointers = page.pointers();
+                        let pointers = &page.pointers;
                         let offset = pointers[*index / 2];
 
                         *index += 1;
 
-                        let next_page = match (page, &filter) {
-                            (Page::TableInterior(t), None) => {
-                                let cell = t.cell(offset);
-                                Some(cell.page as usize)
+                        let next_page = match &filter {
+                            None => {
+                                let cell = page.cell(offset, &self.schema);
+                                let page = cell.page().unwrap();
+                                Some(page as usize)
                             }
-                            (Page::IndexInterior(i), None) => {
-                                let cell = i.cell(offset, &self.schema);
-                                Some(cell.page as usize)
-                            }
-                            (Page::TableInterior(t), Some(f)) => {
-                                let cell = t.cell(offset);
-                                let page = cell.page as usize;
-
-                                let cell = Cell::TableInterior(cell);
+                            Some(f) => {
+                                let cell = page.cell(offset, &self.schema);
 
                                 if f(&cell).is_ge() {
-                                    Some(page)
+                                    let page = cell.page().unwrap();
+                                    Some(page as usize)
                                 } else {
                                     None
                                 }
                             }
-                            (Page::IndexInterior(i), Some(f)) => {
-                                let cell = i.cell(offset, &self.schema);
-                                let page = cell.page as usize;
-
-                                let cell = Cell::IndexInterior(cell);
-
-                                if f(&cell).is_ge() {
-                                    Some(page)
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => unreachable!(),
                         };
 
                         if let Some(page) = next_page {
@@ -248,8 +421,37 @@ impl<'a> BTreePage<'a> {
         }
     }
 
-    fn search(&mut self, filters: &[(Cow<'a, str>, Value<'a>)]) -> Option<usize> {
-        let filter = if filters.is_empty() {
+    fn next_by_rowid(&mut self, rowid: usize) -> Option<Cell<'_>> {
+        let filter = move |cell: &Cell| {
+            let row = cell.rowid().unwrap() as usize;
+            row.cmp(&rowid)
+        };
+
+        self.loop_until(Some(filter))
+    }
+}
+
+impl<'a> Rows for BTreePage<'a> {
+    fn next(&mut self) -> Option<impl Row> {
+        // let filter: Option<impl Fn(&Cell) -> Ordering> = None;
+
+        // Type system hack, TODO: find a better way
+        let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
+        self.loop_until(filter)
+    }
+}
+
+#[derive(Debug)]
+pub struct BTreeIndex<'a> {
+    btreepage: BTreePage<'a>,
+    filters: Vec<(Cow<'a, str>, Value<'a>)>,
+}
+
+impl<'a> BTreeIndex<'a> {
+    fn next(&mut self) -> Option<usize> {
+        let filters = &self.filters;
+
+        let filter = if self.filters.is_empty() {
             None
         } else {
             Some(move |cell: &Cell| {
@@ -267,7 +469,8 @@ impl<'a> BTreePage<'a> {
             })
         };
 
-        let cell = self.loop_until(filter)?;
+        let cell = self.btreepage.loop_until(filter)?;
+        // println!("CELL: {:?} {:?}", cell.get("country"), cell.get("index"));
 
         let Value::Blob(blob) = cell.get("index").unwrap() else {
             panic!("wrong value");
@@ -277,95 +480,86 @@ impl<'a> BTreePage<'a> {
 
         Some(rowid)
     }
+}
 
-    fn next(&mut self, rowid: Option<usize>) -> Option<Cell<'_>> {
-        let filter = rowid.map(|rowid| {
-            move |cell: &Cell| {
-                let row = match cell {
-                    Cell::TableLeaf(l) => l.rowid,
-                    Cell::TableInterior(i) => i.key,
-                    _ => unreachable!(),
-                } as usize;
+#[derive(Debug)]
+pub struct IndexedRows<'a> {
+    btreepage: BTreePage<'a>,
+    btreeindex: BTreeIndex<'a>,
+}
 
-                row.cmp(&rowid)
-            }
-        });
-
-        self.loop_until(filter)
+impl<'a> Rows for IndexedRows<'a> {
+    fn next(&mut self) -> Option<impl Row> {
+        let rowid = self.btreeindex.next()?;
+        // println!("ROWID FOUND: {rowid}");
+        self.btreepage.next_by_rowid(rowid)
     }
 }
 
 #[derive(Debug)]
-pub struct Rows<'a> {
-    btreepage: BTreePage<'a>,
-    btreeindex: Option<BTreePage<'a>>,
-    filters: Vec<(Cow<'a, str>, Value<'a>)>,
+pub struct Cell<'a> {
+    r#type: PageType,
+    data: &'a [u8],
+    records: Vec<&'a [u8]>,
+    schema: &'a Schema,
 }
 
-impl<'a> Rows<'a> {
-    fn find_index(&self, filters: &[(Cow<'a, str>, Value<'a>)]) -> Result<Option<BTreePage<'a>>> {
-        let db = self.btreepage.db;
-        let root = db.root()?;
-        let mut iter = root.rows();
+impl<'a> Cell<'a> {
+    fn rowid(&self) -> Result<u32> {
+        // TODO: mabye split these
+        match self.r#type {
+            PageType::TableLeaf => {
+                let (_, size) = read_varint(self.data);
+                let (rowid, _) = read_varint(&self.data[size..]);
 
-        while let Some(index) = iter.next() {
-            let Value::Text(tbl_name) = index.get("name")? else {
-                panic!("expected \"tbl_name\" to be \"Text\"");
-            };
-
-            if tbl_name == "sqlite_sequence" {
-                continue;
+                Ok(rowid as u32)
             }
-
-            let Value::Text(sql) = index.get("sql")? else {
-                bail!("expected sql string");
-            };
-
-            if let Command::CreateIndex(CreateIndex { table, columns, .. }) =
-                Command::parse(&sql.to_lowercase())?
-            {
-                // TODO: add table name check
-
-                let mut count = 0;
-                for (col, _) in filters {
-                    for column in &columns {
-                        // TODO: find nearest
-                        if col == column {
-                            count += 1;
-                        }
-                    }
-                }
-
-                if count != filters.len() {
-                    continue;
-                }
-
-                let btreeindex = db.table(&tbl_name)?;
-                return Ok(Some(btreeindex));
-            };
+            PageType::TableInterior => {
+                let (key, _) = read_varint(&self.data[4..]);
+                Ok(key as u32)
+            }
+            _ => bail!("wrong page type"),
         }
-
-        Ok(None)
     }
 
-    pub fn filter(self, filters: Vec<(Cow<'a, str>, Value<'a>)>) -> Result<Self> {
-        let btreeindex = self.find_index(&filters)?;
-
-        Ok(Self {
-            btreeindex,
-            filters,
-            ..self
-        })
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Cell<'_>> {
-        if let Some(ref mut btree_page) = self.btreeindex {
-            let rowid = btree_page.search(&self.filters)?;
-            self.btreepage.next(Some(rowid))
-        } else {
-            self.btreepage.next(None)
+    fn page(&self) -> Result<u32> {
+        match self.r#type {
+            PageType::TableInterior | PageType::IndexInterior => Ok(u32::from_be_bytes([
+                self.data[0],
+                self.data[1],
+                self.data[2],
+                self.data[3],
+            ])),
+            _ => bail!("wrong page type"),
         }
+    }
+}
+
+impl<'a> Row<'a> for Cell<'a> {
+    fn get(&self, column: &str) -> Result<Value<'a>> {
+        let Some(index) = self.schema.0.iter().position(|(name, _)| name == column) else {
+            bail!("column: {column:?} not found")
+        };
+
+        let (_, r#type) = self.schema.0[index];
+        let data = self.records[index];
+
+        if data.is_empty() && column == "id" {
+            let rowid = self.rowid()?;
+            return Ok(Value::Integer(rowid));
+        } else if data.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        let value = match r#type {
+            Type::Null => Value::Null,
+            Type::Integer => Value::Integer(data[0] as u32),
+            Type::Float => todo!(),
+            Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
+            Type::Blob => Value::Blob(data),
+        };
+
+        Ok(value)
     }
 }
 
@@ -391,7 +585,7 @@ impl Header {
 #[derive(Debug)]
 pub struct Sqlite {
     file: File,
-    pub header: Header,
+    header: Header,
 }
 
 impl Sqlite {
@@ -405,17 +599,7 @@ impl Sqlite {
         Ok(Self { file, header })
     }
 
-    pub fn page(&self, index: usize) -> Result<Page> {
-        let offset = (index - 1) * self.header.page_size;
-
-        (&self.file).seek(SeekFrom::Start(offset as u64))?;
-        let mut data = vec![0; self.header.page_size];
-        (&self.file).read_exact(&mut data)?;
-
-        Page::read(data, index)
-    }
-
-    pub fn root(&self) -> Result<BTreePage> {
+    fn root(&self) -> Result<BTreePage> {
         let schema = Schema(vec![
             ("type".into(), Type::Text),
             ("name".into(), Type::Text),
@@ -427,12 +611,36 @@ impl Sqlite {
         BTreePage::read(self, 1, schema)
     }
 
-    pub fn table(&self, name: &str) -> Result<BTreePage> {
-        let table = self.root()?;
-        let mut iter = table.rows();
-        while let Some(cell) = iter.next() {
+    fn page(&self, index: usize) -> Result<Page> {
+        let offset = (index - 1) * self.header.page_size;
+
+        (&self.file).seek(SeekFrom::Start(offset as u64))?;
+        let mut data = vec![0; self.header.page_size];
+        (&self.file).read_exact(&mut data)?;
+
+        let page = Page::read(data, index)?;
+
+        let span = span!(Level::INFO, "Page Read");
+        let _enter = span.enter();
+
+        event!(
+            Level::INFO,
+            index = index,
+            r#type = tracing::field::debug(&page.r#type),
+        );
+
+        Ok(page)
+    }
+
+    fn table(&self, name: &str) -> Result<BTreePage> {
+        let span = span!(Level::INFO, "Page Search", name = name);
+        let _enter = span.enter();
+
+        let mut root = self.root()?;
+
+        while let Some(cell) = root.next() {
             let Value::Text(tbl_name) = cell.get("name")? else {
-                panic!("expected \"tbl_name\" to be \"Text\"");
+                bail!("Expected Text")
             };
 
             if name != tbl_name {
@@ -440,20 +648,22 @@ impl Sqlite {
             }
 
             let Value::Integer(rootpage) = cell.get("rootpage")? else {
-                bail!("expected integer");
+                bail!("Expected integer")
             };
 
             let Value::Text(sql) = cell.get("sql")? else {
-                bail!("expected sql string");
+                bail!("Expected text")
             };
 
             return match Command::parse(&sql.to_lowercase())? {
                 Command::CreateTable(CreateTable { schema, .. }) => {
                     BTreePage::read(self, rootpage as usize, schema)
                 }
-                Command::CreateIndex(CreateIndex { table, columns, .. }) => {
-                    // Each entry in the index b-tree corresponds to a single row in the associated SQL table.
-                    // The key to an index b-tree is a record composed of the columns that are being indexed followed by the key of the corresponding table row.
+                Command::CreateIndex(CreateIndex {
+                    index,
+                    table,
+                    columns,
+                }) => {
                     let mut schema = vec![];
                     let table = self.table(&table)?;
 
@@ -475,90 +685,158 @@ impl Sqlite {
             };
         }
 
-        bail!("table {name:?} not found")
+        bail!("table {name:?} not found");
+    }
+
+    pub fn show_schema(&self) -> Result<()> {
+        let mut table = self.root()?;
+
+        while let Some(table) = table.next() {
+            let Value::Text(name) = table.get("name")? else {
+                panic!("expected text");
+            };
+
+            if name == "sqlite_sequence" || name.starts_with("sqlite_autoindex") {
+                continue;
+            }
+
+            println!("schema {name:?}");
+
+            let Value::Text(sql) = table.get("sql")? else {
+                panic!("expected sql string");
+            };
+
+            match Command::parse(&sql.to_lowercase())? {
+                Command::CreateTable(CreateTable { schema, .. }) => {
+                    for (name, r#type) in schema.0.iter() {
+                        println!("{name:?}: {:?}", r#type);
+                    }
+                }
+                Command::CreateIndex(CreateIndex { table, columns, .. }) => {
+                    let mut cols = String::new();
+
+                    for (i, col) in columns.iter().enumerate() {
+                        if i != 0 {
+                            cols.push_str(", ");
+                        }
+                        cols += col;
+                    }
+
+                    println!("{table}({cols})");
+                }
+                _ => bail!("unexpected statement"),
+            }
+        }
+        Ok(())
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
-        // TODO: should return values here?
-        command.execute(self)
-        /*
-        match command {
-            Command::Select {
-                select,
-                from,
-                r#where,
-                limit,
-            } => {
-                let mut count = 0;
+        todo!()
+    }
+}
 
-                println!("{:?}", from.tables);
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use tracing::{error, span, trace, Level};
+    use tracing_test::traced_test;
 
-                let tablename = "asdf";
-                // let tablename = match from.tables.first() {
-                //     None => bail!("Empty query"),
-                //     Some(FromTable::Simple(name)) => name,
-                //     Some(FromTable::Alias(name, _)) => name,
-                // };
-                let table = self.table(tablename)?;
+    use crate::{BTreeIndex, IndexedRows, Row, Rows, Sqlite, Value};
 
-                let mut iter = table.rows();
+    #[traced_test]
+    #[test]
+    fn simple_db() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let mut table = db.table("apples")?;
 
-                if let Some(r#where) = &r#where {
-                    let filters = r#where.filters();
-                    if !filters.is_empty() {
-                        iter = iter.filter(filters)?;
-                    }
-                }
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
 
-                while let Some(cell) = iter.next() {
-                    if limit.as_ref().is_some_and(|l| count >= l.limit) {
-                        break;
-                    }
+        let mut i = 0;
+        while let Some(cell) = table.next() {
+            assert_eq!(cell.get("id")?, Value::Integer(i + 1));
+            i += 1;
+        }
 
-                    if let Some(w) = &r#where {
-                        if !w.r#match(&cell)? {
-                            continue;
-                        }
-                    };
+        assert_eq!(i, 4);
 
-                    let rows = select
-                        .columns
-                        .iter()
-                        .map(|column| match column {
-                            Column::Simple(s) => match s {
-                                SimpleColumn::Wildcard => cell.all(),
-                                SimpleColumn::String(name) => {
-                                    vec![cell.get(name)].into_iter().collect()
-                                }
-                                _ => todo!(),
-                            },
-                            _ => todo!(),
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
+        Ok(())
+    }
 
-                    for (i, row) in rows.iter().enumerate() {
-                        if i != 0 {
-                            print!("|")
-                        }
-                        print!("{row}");
-                    }
-                    println!();
+    #[traced_test]
+    #[test]
+    fn complex_db() -> Result<()> {
+        let db = Sqlite::read("companies.db")?;
+        let mut table = db.table("companies")?;
 
-                    count += 1;
-                }
-            }
-            Command::CreateTable { table, schema } => todo!(),
-            Command::CreateIndex {
-                index,
-                table,
-                columns,
-            } => todo!(),
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
+
+        let mut i = 0;
+        while let Some(cell) = table.next() {
+            cell.get("id")?;
+            i += 1;
+        }
+
+        // TODO: shouldn't be table.count()?
+        assert_eq!(i, 55991);
+
+        Ok(())
+    }
+
+    #[traced_test]
+    #[test]
+    fn simple_index() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+        let table = db.table("apples")?;
+        let index = db.table("apples_idx")?;
+
+        let mut indexed = IndexedRows {
+            btreepage: table,
+            btreeindex: BTreeIndex {
+                btreepage: index,
+                filters: vec![("name".into(), Value::Text("Fuji".into()))],
+            },
+        };
+
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
+
+        while let Some(cell) = indexed.next() {
+            cell.get("id")?;
+            cell.get("name")?;
         }
 
         Ok(())
-        */
+    }
+
+    #[traced_test]
+    #[test]
+    fn complex_index() -> Result<()> {
+        let db = Sqlite::read("companies.db")?;
+        let table = db.table("companies")?;
+        let index = db.table("idx_companies_country")?;
+
+        let mut indexed = IndexedRows {
+            btreepage: table,
+            btreeindex: BTreeIndex {
+                btreepage: index,
+                filters: vec![("country".into(), Value::Text("tuvalu".into()))],
+            },
+        };
+
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
+
+        let mut i = 0;
+        while let Some(cell) = indexed.next() {
+            let country = cell.get("country")?;
+            assert_eq!(country, Value::Text("tuvalu".into()));
+            i += 1;
+        }
+
+        assert_eq!(i, 25);
+
+        Ok(())
     }
 }

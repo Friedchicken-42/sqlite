@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{page::Cell, Rows, Schema, Sqlite, Type, Value};
+// use crate::{page::Cell, Rows, Schema, Sqlite, Type, Value};
+use crate::{Schema, Sqlite, Type, Value};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -208,26 +209,6 @@ impl<'a> Condition<'a> {
             expected,
         })
     }
-
-    pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
-        // let Ok(value) = cell.get(&self.column) else {
-        //     bail!("column {:?} not found", self.column)
-        // };
-
-        // match self.conditional {
-        //     Conditional::Equals => Ok(value == self.expected),
-        // }
-        todo!()
-    }
-
-    pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
-        // if self.conditional == Conditional::Equals {
-        //     vec![(self.column.clone().into(), self.expected.clone())]
-        // } else {
-        //     vec![]
-        // }
-        todo!()
-    }
 }
 
 #[derive(Debug)]
@@ -277,23 +258,6 @@ impl<'a> WhereClause<'a> {
         }
 
         Ok(condition.unwrap())
-    }
-
-    pub fn r#match(&self, cell: &Cell<'_>) -> Result<bool> {
-        match self {
-            WhereClause::Condition(cond) => cond.r#match(cell),
-            WhereClause::And(a, b) => Ok(a.r#match(cell)? && b.r#match(cell)?),
-            WhereClause::Or(a, b) => Ok(a.r#match(cell)? || b.r#match(cell)?),
-        }
-    }
-
-    // Returns a list of check needed
-    pub fn filters(&self) -> Vec<(Cow<'_, str>, Value<'_>)> {
-        match self {
-            WhereClause::Condition(cond) => cond.filters(),
-            WhereClause::And(a, b) => [a.filters(), b.filters()].concat(),
-            WhereClause::Or(_, _) => vec![],
-        }
     }
 }
 
@@ -351,51 +315,6 @@ impl<'a> Select<'a> {
     }
 
     pub fn execute(self, db: &Sqlite) -> Result<()> {
-        fn cartesian<F>(
-            tables: &[FromTable],
-            values: &[(&FromTable, &Cell)],
-            callback: &F,
-            db: &Sqlite,
-        ) -> Result<()>
-        where
-            F: Fn(&[(&FromTable, &Cell)]) -> Result<()>,
-        {
-            if tables.is_empty() {
-                return callback(&values);
-                // for (table, row) in values {
-                //     let (name, alias) = match table {
-                //         FromTable::Simple(n) => (n, n),
-                //         FromTable::Alias(n, a) => (n, a),
-                //     };
-
-                //     let column = "name";
-
-                //     let item = row.get(column).unwrap();
-                //     print!("{name} {alias}.{column} = {item:?}  ");
-                // }
-                // println!();
-                // return Ok(());
-            }
-
-            let fromtable = &tables[0];
-            let name = match fromtable {
-                FromTable::Simple(n) => n,
-                FromTable::Alias(n, _) => n,
-            };
-
-            let table = db.table(name)?;
-            let mut rows = table.rows();
-
-            while let Some(cell) = rows.next() {
-                let mut values = values.to_vec();
-                values.push((fromtable, &cell));
-                cartesian(&tables[1..], &values, callback, db)?;
-                values.pop();
-            }
-
-            Ok(())
-        }
-
         let Select {
             select,
             from: FromClause { tables, conditions },
@@ -422,31 +341,6 @@ impl<'a> Select<'a> {
 
         dbg!(&r#where);
         dbg!(&tables);
-
-        let callback = |values: &[(&FromTable, &Cell)]| -> Result<()> {
-            for (table, cell) in values {
-                for column in &select.columns {
-                    // TODO: add *
-                    let column = match column {
-                        Column::Alias(_, _) => todo!(),
-                        Column::Simple(s) => s,
-                    };
-
-                    let name = match column {
-                        SimpleColumn::Wildcard => todo!(),
-                        SimpleColumn::String(s) => s,
-                        SimpleColumn::Dotted(_) => todo!(),
-                    };
-                    let value = cell.get(name)?;
-
-                    print!("{value} ");
-                }
-            }
-            println!();
-            Ok(())
-        };
-
-        cartesian(&tables, &[], &callback, db)?;
 
         Ok(())
     }
