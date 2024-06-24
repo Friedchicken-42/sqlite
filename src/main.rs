@@ -21,21 +21,7 @@ fn main() -> Result<()> {
             let page = db.root()?;
             println!("number of tables: {}", page.count());
         }
-        ".tables" => {
-            let mut table = db.root()?;
-
-            while let Some(cell) = table.next() {
-                let Value::Text(name) = cell.get("name")? else {
-                    panic!("expected text");
-                };
-
-                if name != "sqlite_sequence" {
-                    print!("{name} ");
-                }
-            }
-
-            println!()
-        }
+        ".tables" => db.show_tables()?,
         ".schema" => db.show_schema()?,
         _command => {
             todo!()

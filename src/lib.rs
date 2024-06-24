@@ -268,12 +268,52 @@ impl Page {
     }
 }
 
+#[derive(Debug)]
+pub enum Table<'a> {
+    Rows(BTreePage<'a>),
+    IndexedRows(IndexedRows<'a>),
+}
+
 pub trait Rows: Debug {
-    fn next(&mut self) -> Option<impl Row>;
+    fn next(&mut self) -> Option<Item<'_>>;
+}
+
+impl<'a> Rows for Table<'a> {
+    fn next(&mut self) -> Option<Item<'_>> {
+        match self {
+            Table::Rows(table) => {
+                // Type system hack, TODO: find a better way
+                let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
+
+                let cell = table.loop_until(filter)?;
+
+                Some(Item::Cell(cell))
+            }
+            Table::IndexedRows(table) => {
+                let rowid = table.btreeindex.next()?;
+                let cell = table.btreepage.next_by_rowid(rowid)?;
+
+                Some(Item::Cell(cell))
+            }
+        }
+    }
 }
 
 pub trait Row<'a>: Debug {
     fn get(&self, column: &str) -> Result<Value<'a>>;
+}
+
+#[derive(Debug)]
+pub enum Item<'a> {
+    Cell(Cell<'a>),
+}
+
+impl<'a> Row<'a> for Item<'a> {
+    fn get(&self, column: &str) -> Result<Value<'a>> {
+        match self {
+            Item::Cell(cell) => cell.get(column),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -429,14 +469,6 @@ impl<'a> BTreePage<'a> {
     }
 }
 
-impl<'a> Rows for BTreePage<'a> {
-    fn next(&mut self) -> Option<impl Row> {
-        // Type system hack, TODO: find a better way
-        let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
-        self.loop_until(filter)
-    }
-}
-
 #[derive(Debug)]
 pub struct BTreeIndex<'a> {
     btreepage: BTreePage<'a>,
@@ -481,13 +513,6 @@ impl<'a> BTreeIndex<'a> {
 pub struct IndexedRows<'a> {
     btreepage: BTreePage<'a>,
     btreeindex: BTreeIndex<'a>,
-}
-
-impl<'a> Rows for IndexedRows<'a> {
-    fn next(&mut self) -> Option<impl Row> {
-        let rowid = self.btreeindex.next()?;
-        self.btreepage.next_by_rowid(rowid)
-    }
 }
 
 #[derive(Debug)]
@@ -633,7 +658,8 @@ impl Sqlite {
         let span = span!(Level::INFO, "Page Search", name = name);
         let _enter = span.enter();
 
-        let mut root = self.root()?;
+        let root = self.root()?;
+        let mut root = Table::Rows(root);
 
         while let Some(cell) = root.next() {
             let Value::Text(tbl_name) = cell.get("name")? else {
@@ -658,6 +684,79 @@ impl Sqlite {
         }
 
         bail!("table {name:?} not found");
+    }
+
+    fn find_index(&self, filters: &[(Cow<'_, str>, Value<'_>)]) -> Result<Option<BTreePage>> {
+        let root = self.root()?;
+        let mut root = Table::Rows(root);
+
+        while let Some(index) = root.next() {
+            let Value::Text(tbl_name) = index.get("name")? else {
+                panic!("expected \"tbl_name\" to be \"Text\"");
+            };
+
+            if tbl_name == "sqlite_sequence" {
+                continue;
+            }
+
+            let Value::Text(sql) = index.get("sql")? else {
+                bail!("expected sql string");
+            };
+
+            if let Command::CreateIndex(CreateIndex {
+                index,
+                table,
+                columns,
+            }) = Command::parse(&sql.to_lowercase())?
+            {
+                // TODO: add table name check
+
+                let mut count = 0;
+                for (col, _) in filters {
+                    for column in &columns {
+                        // TODO: find nearest
+                        if col == column {
+                            count += 1;
+                        }
+                    }
+                }
+
+                if count != filters.len() {
+                    continue;
+                }
+
+                let btreeindex = self.index(&tbl_name)?;
+                return Ok(Some(btreeindex));
+            };
+        }
+
+        Ok(None)
+    }
+
+    pub fn search<'a>(
+        &'a self,
+        name: &'a str,
+        filters: Vec<(Cow<'a, str>, Value<'a>)>,
+    ) -> Result<Table<'a>> {
+        let table = self.table(name)?;
+
+        if filters.is_empty() {
+            Ok(Table::Rows(table))
+        } else {
+            let Some(index) = self.find_index(&filters)? else {
+                return Ok(Table::Rows(table));
+            };
+
+            let indexed = IndexedRows {
+                btreepage: table,
+                btreeindex: BTreeIndex {
+                    btreepage: index,
+                    filters,
+                },
+            };
+
+            Ok(Table::IndexedRows(indexed))
+        }
     }
 
     pub fn table(&self, name: &str) -> Result<BTreePage> {
@@ -700,8 +799,28 @@ impl Sqlite {
         }
     }
 
+    pub fn show_tables(&self) -> Result<()> {
+        let table = self.root()?;
+        let mut table = Table::Rows(table);
+
+        while let Some(cell) = table.next() {
+            let Value::Text(name) = cell.get("name")? else {
+                panic!("expected text");
+            };
+
+            if name != "sqlite_sequence" {
+                print!("{name} ");
+            }
+        }
+
+        println!();
+
+        Ok(())
+    }
+
     pub fn show_schema(&self) -> Result<()> {
-        let mut table = self.root()?;
+        let root = self.root()?;
+        let mut table = Table::Rows(root);
 
         while let Some(table) = table.next() {
             let Value::Text(name) = table.get("name")? else {
@@ -760,7 +879,7 @@ mod tests {
     #[test]
     fn simple_db() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
-        let mut table = db.table("apples")?;
+        let mut table = db.search("apples", vec![])?;
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
@@ -780,7 +899,7 @@ mod tests {
     #[test]
     fn complex_db() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
-        let mut table = db.table("companies")?;
+        let mut table = db.search("companies", vec![])?;
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
@@ -801,16 +920,18 @@ mod tests {
     #[test]
     fn simple_index() -> Result<()> {
         let db = Sqlite::read("other.db")?;
-        let table = db.table("apples")?;
-        let index = db.index("apples_idx")?;
+        // let table = db.table("apples")?;
+        // let index = db.index("apples_idx")?;
 
-        let mut indexed = IndexedRows {
-            btreepage: table,
-            btreeindex: BTreeIndex {
-                btreepage: index,
-                filters: vec![("name".into(), Value::Text("Fuji".into()))],
-            },
-        };
+        // let mut indexed = IndexedRows {
+        //     btreepage: table,
+        //     btreeindex: BTreeIndex {
+        //         btreepage: index,
+        //         filters: vec![("name".into(), Value::Text("Fuji".into()))],
+        //     },
+        // };
+        let filters = vec![("name".into(), Value::Text("Fuji".into()))];
+        let mut indexed = db.search("apples", filters)?;
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
@@ -827,16 +948,18 @@ mod tests {
     #[test]
     fn complex_index() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
-        let table = db.table("companies")?;
-        let index = db.index("idx_companies_country")?;
-
-        let mut indexed = IndexedRows {
-            btreepage: table,
-            btreeindex: BTreeIndex {
-                btreepage: index,
-                filters: vec![("country".into(), Value::Text("tuvalu".into()))],
-            },
-        };
+        // let table = db.table("companies")?;
+        // let index = db.index("idx_companies_country")?;
+        //
+        // let mut indexed = IndexedRows {
+        //     btreepage: table,
+        //     btreeindex: BTreeIndex {
+        //         btreepage: index,
+        //         filters: vec![("country".into(), Value::Text("tuvalu".into()))],
+        //     },
+        // };
+        let filters = vec![("country".into(), Value::Text("tuvalu".into()))];
+        let mut indexed = db.search("companies", filters)?;
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
