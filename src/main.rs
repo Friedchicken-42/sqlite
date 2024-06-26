@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sqlite::{Row, Rows, Sqlite, Value};
+use sqlite::Sqlite;
 
 fn main() -> Result<()> {
     // Parse arguments

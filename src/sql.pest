@@ -56,7 +56,7 @@ table_column = { ( string | identifier ) ~ identifier ~ ASCII_ALPHANUMERIC* }
 
 table_columns = _{ table_column ~ ("," ~ table_column)* }
 
-create_table = { "create table" ~ identifier ~ "(" ~ table_columns ~ ")" }
+create_table = { "create table" ~ (identifier | ("\"" ~ identifier ~ "\"")) ~ "(" ~ table_columns ~ ")" }
 
 index_columns = { identifier ~ ("," ~ identifier)* }
 

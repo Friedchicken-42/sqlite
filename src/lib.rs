@@ -109,7 +109,7 @@ pub enum Value<'a> {
     Integer(u32),
     Float(f64),
     Text(Cow<'a, str>),
-    Blob(&'a [u8]),
+    Blob(Cow<'a, [u8]>),
 }
 
 impl<'a> Eq for Value<'a> {}
@@ -304,8 +304,158 @@ pub trait Row<'a>: Debug {
 }
 
 #[derive(Debug)]
+pub enum DisplayMode {
+    List,
+    Table,
+}
+
+impl<'a> Table<'a> {
+    fn schema(&self) -> &'_ Schema {
+        match self {
+            Table::Rows(table) => &table.schema,
+            Table::IndexedRows(table) => &table.btreepage.schema,
+        }
+    }
+    pub fn display(mut self, mode: DisplayMode) -> Result<()> {
+        match mode {
+            DisplayMode::List => {
+                let schema = self.schema();
+
+                for (i, (name, _)) in schema.0.iter().enumerate() {
+                    if i != 0 {
+                        print!("|")
+                    }
+
+                    print!("{name}")
+                }
+
+                println!();
+
+                while let Some(row) = self.next() {
+                    for (i, value) in row.all()?.iter().enumerate() {
+                        if i != 0 {
+                            print!("|");
+                        }
+
+                        print!("{value}");
+                    }
+
+                    println!();
+                }
+            }
+            DisplayMode::Table => {
+                // TODO: will move this
+                let backup_size = 10;
+                let mut backup: Vec<Vec<Value>> = Vec::with_capacity(backup_size);
+
+                for _ in 0..backup_size {
+                    let Some(row) = self.next() else {
+                        break;
+                    };
+
+                    let all = row.all()?;
+                    let mut vec = vec![];
+
+                    for value in all {
+                        let value = match value {
+                            Value::Null => Value::Null,
+                            Value::Integer(i) => Value::Integer(i),
+                            Value::Float(f) => Value::Float(f),
+                            Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
+                            Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+                        };
+
+                        vec.push(value.clone())
+                    }
+
+                    backup.push(vec);
+                }
+
+                let schema = self.schema();
+
+                let mut sizes = schema
+                    .0
+                    .iter()
+                    .map(|(name, _)| name.len())
+                    .collect::<Vec<_>>();
+
+                for values in &backup {
+                    for (i, value) in values.iter().enumerate() {
+                        sizes[i] = sizes[i].max(value.to_string().len());
+                    }
+                }
+
+                print!("+");
+                for size in &sizes {
+                    for _ in 0..*size + 2 {
+                        print!("-");
+                    }
+                    print!("+");
+                }
+                println!();
+
+                print!("|");
+                for (i, (name, _)) in schema.0.iter().enumerate() {
+                    let width = sizes[i];
+                    print!(" {name:^width$} |");
+                }
+                println!();
+
+                print!("+");
+                for size in &sizes {
+                    for _ in 0..*size + 2 {
+                        print!("-");
+                    }
+                    print!("+");
+                }
+                println!();
+
+                for row in backup.iter() {
+                    print!("|");
+                    for (i, value) in row.iter().enumerate() {
+                        let width = sizes[i];
+                        let value = value.to_string();
+                        print!(" {value:<width$} |");
+                    }
+                    println!();
+                }
+
+                while let Some(row) = self.next() {
+                    print!("|");
+                    for (i, value) in row.all()?.iter().enumerate() {
+                        let width = sizes[i];
+                        let value = value.to_string();
+                        print!(" {value:<width$} |");
+                    }
+                    println!();
+                }
+
+                print!("+");
+                for size in &sizes {
+                    for _ in 0..*size + 2 {
+                        print!("-");
+                    }
+                    print!("+");
+                }
+                println!();
+            }
+        };
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub enum Item<'a> {
     Cell(Cell<'a>),
+}
+
+impl<'a> Item<'a> {
+    pub fn all(&self) -> Result<Vec<Value<'a>>> {
+        match self {
+            Item::Cell(cell) => cell.all(),
+        }
+    }
 }
 
 impl<'a> Row<'a> for Item<'a> {
@@ -318,6 +468,7 @@ impl<'a> Row<'a> for Item<'a> {
 
 #[derive(Debug)]
 pub struct BTreePage<'a> {
+    pub name: String,
     pages: Vec<Page>,
     indexes: Vec<usize>,
     schema: Schema,
@@ -325,10 +476,11 @@ pub struct BTreePage<'a> {
 }
 
 impl<'a> BTreePage<'a> {
-    fn read(db: &'a Sqlite, index: usize, schema: Schema) -> Result<Self> {
+    fn read(db: &'a Sqlite, index: usize, name: String, schema: Schema) -> Result<Self> {
         let first_page = db.page(index)?;
 
         Ok(Self {
+            name,
             pages: vec![first_page],
             indexes: vec![0],
             schema,
@@ -551,6 +703,14 @@ impl<'a> Cell<'a> {
             _ => bail!("wrong page type"),
         }
     }
+
+    pub fn all(&self) -> Result<Vec<Value<'a>>> {
+        self.schema
+            .0
+            .iter()
+            .map(|(name, _)| self.get(name))
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
 impl<'a> Row<'a> for Cell<'a> {
@@ -574,7 +734,7 @@ impl<'a> Row<'a> for Cell<'a> {
             Type::Integer => Value::Integer(data[0] as u32),
             Type::Float => todo!(),
             Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
-            Type::Blob => Value::Blob(data),
+            Type::Blob => Value::Blob(Cow::Borrowed(data)),
         };
 
         Ok(value)
@@ -630,7 +790,7 @@ impl Sqlite {
             ("sql".into(), Type::Text),
         ]);
 
-        BTreePage::read(self, 1, schema)
+        BTreePage::read(self, 1, "root".into(), schema)
     }
 
     fn page(&self, index: usize) -> Result<Page> {
@@ -661,8 +821,8 @@ impl Sqlite {
         let root = self.root()?;
         let mut root = Table::Rows(root);
 
-        while let Some(cell) = root.next() {
-            let Value::Text(tbl_name) = cell.get("name")? else {
+        while let Some(row) = root.next() {
+            let Value::Text(tbl_name) = row.get("name")? else {
                 bail!("Expected Text")
             };
 
@@ -670,11 +830,11 @@ impl Sqlite {
                 continue;
             }
 
-            let Value::Integer(rootpage) = cell.get("rootpage")? else {
+            let Value::Integer(rootpage) = row.get("rootpage")? else {
                 bail!("Expected integer")
             };
 
-            let Value::Text(sql) = cell.get("sql")? else {
+            let Value::Text(sql) = row.get("sql")? else {
                 bail!("Expected text")
             };
 
@@ -763,7 +923,7 @@ impl Sqlite {
         let (rootpage, command) = self.find(name)?;
 
         if let Command::CreateTable(CreateTable { table, schema }) = command {
-            BTreePage::read(self, rootpage as usize, schema)
+            BTreePage::read(self, rootpage as usize, name.into(), schema)
         } else {
             bail!("{name:?} is not a table");
         }
@@ -793,7 +953,7 @@ impl Sqlite {
             // blob.iter().fold(0, |acc, x| (acc << 8) + x)
             schema.push(("index".into(), Type::Blob));
             let schema = Schema(schema);
-            BTreePage::read(self, rootpage as usize, schema)
+            BTreePage::read(self, rootpage as usize, name.into(), schema)
         } else {
             bail!("table {name:?} not found");
         }
@@ -803,8 +963,8 @@ impl Sqlite {
         let table = self.root()?;
         let mut table = Table::Rows(table);
 
-        while let Some(cell) = table.next() {
-            let Value::Text(name) = cell.get("name")? else {
+        while let Some(row) = table.next() {
+            let Value::Text(name) = row.get("name")? else {
                 panic!("expected text");
             };
 
@@ -863,7 +1023,7 @@ impl Sqlite {
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
-        todo!()
+        command.execute(self)
     }
 }
 
@@ -873,7 +1033,7 @@ mod tests {
     use tracing::{span, Level};
     use tracing_test::traced_test;
 
-    use crate::{BTreeIndex, IndexedRows, Row, Rows, Sqlite, Value};
+    use crate::{DisplayMode, IndexedRows, Row, Rows, Sqlite, Table, Value};
 
     #[traced_test]
     #[test]
@@ -884,9 +1044,14 @@ mod tests {
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
+        assert!(match &table {
+            Table::Rows(rows) => rows.name == "apples",
+            _ => false,
+        });
+
         let mut i = 0;
-        while let Some(cell) = table.next() {
-            assert_eq!(cell.get("id")?, Value::Integer(i + 1));
+        while let Some(row) = table.next() {
+            assert_eq!(row.get("id")?, Value::Integer(i + 1));
             i += 1;
         }
 
@@ -901,12 +1066,17 @@ mod tests {
         let db = Sqlite::read("companies.db")?;
         let mut table = db.search("companies", vec![])?;
 
+        assert!(match &table {
+            Table::Rows(rows) => rows.name == "companies",
+            _ => false,
+        });
+
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
         let mut i = 0;
-        while let Some(cell) = table.next() {
-            cell.get("id")?;
+        while let Some(row) = table.next() {
+            row.get("id")?;
             i += 1;
         }
 
@@ -920,25 +1090,25 @@ mod tests {
     #[test]
     fn simple_index() -> Result<()> {
         let db = Sqlite::read("other.db")?;
-        // let table = db.table("apples")?;
-        // let index = db.index("apples_idx")?;
-
-        // let mut indexed = IndexedRows {
-        //     btreepage: table,
-        //     btreeindex: BTreeIndex {
-        //         btreepage: index,
-        //         filters: vec![("name".into(), Value::Text("Fuji".into()))],
-        //     },
-        // };
         let filters = vec![("name".into(), Value::Text("Fuji".into()))];
         let mut indexed = db.search("apples", filters)?;
+
+        assert!(match &indexed {
+            Table::IndexedRows(IndexedRows {
+                btreepage,
+                btreeindex,
+            }) => {
+                btreepage.name == "apples" && btreeindex.btreepage.name == "apples_idx"
+            }
+            _ => false,
+        });
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
-        while let Some(cell) = indexed.next() {
-            cell.get("id")?;
-            cell.get("name")?;
+        while let Some(row) = indexed.next() {
+            row.get("id")?;
+            row.get("name")?;
         }
 
         Ok(())
@@ -948,30 +1118,66 @@ mod tests {
     #[test]
     fn complex_index() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
-        // let table = db.table("companies")?;
-        // let index = db.index("idx_companies_country")?;
-        //
-        // let mut indexed = IndexedRows {
-        //     btreepage: table,
-        //     btreeindex: BTreeIndex {
-        //         btreepage: index,
-        //         filters: vec![("country".into(), Value::Text("tuvalu".into()))],
-        //     },
-        // };
         let filters = vec![("country".into(), Value::Text("tuvalu".into()))];
         let mut indexed = db.search("companies", filters)?;
+
+        assert!(match &indexed {
+            Table::IndexedRows(IndexedRows {
+                btreepage,
+                btreeindex,
+            }) => {
+                btreepage.name == "companies"
+                    && btreeindex.btreepage.name == "idx_companies_country"
+            }
+            _ => false,
+        });
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
         let mut i = 0;
-        while let Some(cell) = indexed.next() {
-            let country = cell.get("country")?;
+        while let Some(row) = indexed.next() {
+            let country = row.get("country")?;
             assert_eq!(country, Value::Text("tuvalu".into()));
             i += 1;
         }
 
         assert_eq!(i, 25);
+
+        Ok(())
+    }
+
+    #[traced_test]
+    #[test]
+    fn simple_all() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let mut table = db.search("apples", vec![])?;
+
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
+
+        let mut i = 1;
+
+        while let Some(row) = table.next() {
+            let all = row.all()?;
+
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0], Value::Integer(i));
+            assert!(matches!(all[1], Value::Text(_)));
+            assert!(matches!(all[2], Value::Text(_)));
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn display() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let table = db.search("apples", vec![])?;
+
+        table.display(DisplayMode::Table)?;
 
         Ok(())
     }
