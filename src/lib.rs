@@ -1,7 +1,9 @@
 mod command;
+mod display;
 
 use anyhow::{bail, Result};
 use command::{Command, CreateIndex, CreateTable};
+use display::{display_list, display_table, DisplayMode};
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -303,10 +305,9 @@ pub trait Row<'a>: Debug {
     fn get(&self, column: &str) -> Result<Value<'a>>;
 }
 
-#[derive(Debug)]
-pub enum DisplayMode {
-    List,
-    Table,
+struct Output<'a> {
+    table: Table<'a>,
+    mode: DisplayMode,
 }
 
 impl<'a> Table<'a> {
@@ -316,130 +317,17 @@ impl<'a> Table<'a> {
             Table::IndexedRows(table) => &table.btreepage.schema,
         }
     }
+
     pub fn display(mut self, mode: DisplayMode) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::io::stdout();
+
         match mode {
-            DisplayMode::List => {
-                let schema = self.schema();
-
-                for (i, (name, _)) in schema.0.iter().enumerate() {
-                    if i != 0 {
-                        print!("|")
-                    }
-
-                    print!("{name}")
-                }
-
-                println!();
-
-                while let Some(row) = self.next() {
-                    for (i, value) in row.all()?.iter().enumerate() {
-                        if i != 0 {
-                            print!("|");
-                        }
-
-                        print!("{value}");
-                    }
-
-                    println!();
-                }
-            }
-            DisplayMode::Table => {
-                // TODO: will move this
-                let backup_size = 10;
-                let mut backup: Vec<Vec<Value>> = Vec::with_capacity(backup_size);
-
-                for _ in 0..backup_size {
-                    let Some(row) = self.next() else {
-                        break;
-                    };
-
-                    let all = row.all()?;
-                    let mut vec = vec![];
-
-                    for value in all {
-                        let value = match value {
-                            Value::Null => Value::Null,
-                            Value::Integer(i) => Value::Integer(i),
-                            Value::Float(f) => Value::Float(f),
-                            Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
-                            Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                        };
-
-                        vec.push(value.clone())
-                    }
-
-                    backup.push(vec);
-                }
-
-                let schema = self.schema();
-
-                let mut sizes = schema
-                    .0
-                    .iter()
-                    .map(|(name, _)| name.len())
-                    .collect::<Vec<_>>();
-
-                for values in &backup {
-                    for (i, value) in values.iter().enumerate() {
-                        sizes[i] = sizes[i].max(value.to_string().len());
-                    }
-                }
-
-                print!("+");
-                for size in &sizes {
-                    for _ in 0..*size + 2 {
-                        print!("-");
-                    }
-                    print!("+");
-                }
-                println!();
-
-                print!("|");
-                for (i, (name, _)) in schema.0.iter().enumerate() {
-                    let width = sizes[i];
-                    print!(" {name:^width$} |");
-                }
-                println!();
-
-                print!("+");
-                for size in &sizes {
-                    for _ in 0..*size + 2 {
-                        print!("-");
-                    }
-                    print!("+");
-                }
-                println!();
-
-                for row in backup.iter() {
-                    print!("|");
-                    for (i, value) in row.iter().enumerate() {
-                        let width = sizes[i];
-                        let value = value.to_string();
-                        print!(" {value:<width$} |");
-                    }
-                    println!();
-                }
-
-                while let Some(row) = self.next() {
-                    print!("|");
-                    for (i, value) in row.all()?.iter().enumerate() {
-                        let width = sizes[i];
-                        let value = value.to_string();
-                        print!(" {value:<width$} |");
-                    }
-                    println!();
-                }
-
-                print!("+");
-                for size in &sizes {
-                    for _ in 0..*size + 2 {
-                        print!("-");
-                    }
-                    print!("+");
-                }
-                println!();
-            }
+            DisplayMode::List => display_list(self, &mut f)?,
+            DisplayMode::Table => display_table(self, &mut f)?,
         };
+
+        f.flush()?;
 
         Ok(())
     }
@@ -1033,7 +921,8 @@ mod tests {
     use tracing::{span, Level};
     use tracing_test::traced_test;
 
-    use crate::{DisplayMode, IndexedRows, Row, Rows, Sqlite, Table, Value};
+    use crate::display::DisplayMode;
+    use crate::{IndexedRows, Row, Rows, Sqlite, Table, Value};
 
     #[traced_test]
     #[test]
@@ -1177,7 +1066,7 @@ mod tests {
         let db = Sqlite::read("sample.db")?;
         let table = db.search("apples", vec![])?;
 
-        table.display(DisplayMode::Table)?;
+        table.display(DisplayMode::List)?;
 
         Ok(())
     }
