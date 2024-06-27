@@ -3,13 +3,13 @@ mod display;
 
 use anyhow::{bail, Result};
 use command::{Command, CreateIndex, CreateTable};
-use display::{display_list, display_table, DisplayMode};
+use display::{display, DisplayMode};
 use std::{
     borrow::Cow,
     cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
 };
 use tracing::{event, span, Level};
 
@@ -303,6 +303,7 @@ impl<'a> Rows for Table<'a> {
 
 pub trait Row<'a>: Debug {
     fn get(&self, column: &str) -> Result<Value<'a>>;
+    fn all(&self) -> Result<Vec<Value<'a>>>;
 }
 
 struct Output<'a> {
@@ -318,18 +319,8 @@ impl<'a> Table<'a> {
         }
     }
 
-    pub fn display(mut self, mode: DisplayMode) -> Result<()> {
-        use std::io::Write;
-        let mut f = std::io::stdout();
-
-        match mode {
-            DisplayMode::List => display_list(self, &mut f)?,
-            DisplayMode::Table => display_table(self, &mut f)?,
-        };
-
-        f.flush()?;
-
-        Ok(())
+    pub fn display(mut self, f: &mut impl Write, mode: DisplayMode) -> Result<()> {
+        display(f, self, mode)
     }
 }
 
@@ -350,6 +341,12 @@ impl<'a> Row<'a> for Item<'a> {
     fn get(&self, column: &str) -> Result<Value<'a>> {
         match self {
             Item::Cell(cell) => cell.get(column),
+        }
+    }
+
+    fn all(&self) -> Result<Vec<Value<'a>>> {
+        match self {
+            Item::Cell(cell) => cell.all(),
         }
     }
 }
@@ -591,14 +588,6 @@ impl<'a> Cell<'a> {
             _ => bail!("wrong page type"),
         }
     }
-
-    pub fn all(&self) -> Result<Vec<Value<'a>>> {
-        self.schema
-            .0
-            .iter()
-            .map(|(name, _)| self.get(name))
-            .collect::<Result<Vec<_>>>()
-    }
 }
 
 impl<'a> Row<'a> for Cell<'a> {
@@ -626,6 +615,14 @@ impl<'a> Row<'a> for Cell<'a> {
         };
 
         Ok(value)
+    }
+
+    fn all(&self) -> Result<Vec<Value<'a>>> {
+        self.schema
+            .0
+            .iter()
+            .map(|(name, _)| self.get(name))
+            .collect::<Result<Vec<_>>>()
     }
 }
 
@@ -734,7 +731,11 @@ impl Sqlite {
         bail!("table {name:?} not found");
     }
 
-    fn find_index(&self, filters: &[(Cow<'_, str>, Value<'_>)]) -> Result<Option<BTreePage>> {
+    fn find_index(
+        &self,
+        from: &BTreePage,
+        filters: &[(Cow<'_, str>, Value<'_>)],
+    ) -> Result<Option<BTreePage>> {
         let root = self.root()?;
         let mut root = Table::Rows(root);
 
@@ -757,7 +758,9 @@ impl Sqlite {
                 columns,
             }) = Command::parse(&sql.to_lowercase())?
             {
-                // TODO: add table name check
+                if table != from.name {
+                    continue;
+                }
 
                 let mut count = 0;
                 for (col, _) in filters {
@@ -791,7 +794,7 @@ impl Sqlite {
         if filters.is_empty() {
             Ok(Table::Rows(table))
         } else {
-            let Some(index) = self.find_index(&filters)? else {
+            let Some(index) = self.find_index(&table, &filters)? else {
                 return Ok(Table::Rows(table));
             };
 
@@ -1063,10 +1066,14 @@ mod tests {
 
     #[test]
     fn display() -> Result<()> {
+        let mut f = std::io::stdout();
         let db = Sqlite::read("sample.db")?;
-        let table = db.search("apples", vec![])?;
 
-        table.display(DisplayMode::List)?;
+        let table = db.search("apples", vec![])?;
+        table.display(&mut f, DisplayMode::List)?;
+
+        let table = db.search("apples", vec![])?;
+        table.display(&mut f, DisplayMode::Table)?;
 
         Ok(())
     }

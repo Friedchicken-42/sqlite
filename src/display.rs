@@ -1,48 +1,111 @@
-use std::io::Write;
+use std::{borrow::Cow, io::Write};
 
 use anyhow::Result;
 
-use crate::{Rows, Table};
+use crate::{Row, Rows, Schema, Table, Value};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
     List,
     Table,
 }
 
-pub fn display_list(mut table: Table<'_>, f: &mut impl Write) -> Result<()> {
-    let schema = table.schema();
+struct DisplayOptions {
+    mode: DisplayMode,
+    column_sizes: Option<Vec<usize>>,
+    separators: [char; 3],
+}
 
-    for (i, (name, _)) in schema.0.iter().enumerate() {
-        if i != 0 {
-            write!(f, "|")?;
+fn display_spacer(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
+    write!(f, "{}", opts.separators[2])?;
+
+    if let Some(ref sizes) = opts.column_sizes {
+        for size in sizes {
+            for _ in 0..*size + 2 {
+                write!(f, "{}", opts.separators[1])?;
+            }
+            write!(f, "{}", opts.separators[2])?;
         }
-
-        write!(f, "{name}")?;
     }
 
     writeln!(f)?;
 
-    while let Some(row) = table.next() {
-        for (i, value) in row.all()?.iter().enumerate() {
-            if i != 0 {
-                write!(f, "|")?;
-            }
+    Ok(())
+}
 
-            write!(f, "{value}")?;
+fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) -> Result<()> {
+    write!(f, "{}", opts.separators[0])?;
+
+    for (i, (name, _)) in schema.0.iter().enumerate() {
+        let width = match &opts.column_sizes {
+            Some(arr) => arr[i],
+            None => 0,
+        };
+
+        if width == 0 {
+            write!(f, "{name}{}", opts.separators[0])?;
+        } else {
+            write!(f, " {name:<width$} {}", opts.separators[0])?;
         }
+    }
 
-        writeln!(f)?;
+    writeln!(f)?;
+
+    Ok(())
+}
+
+fn display_value(
+    f: &mut impl Write,
+    value: &Value,
+    index: usize,
+    opts: &DisplayOptions,
+) -> Result<()> {
+    if index == 0 {
+        write!(f, "{}", opts.separators[0])?;
+    }
+
+    let width = match &opts.column_sizes {
+        Some(arr) => arr[index],
+        None => 0,
+    };
+
+    let value = value.to_string();
+
+    if width == 0 {
+        write!(f, "{value}{}", opts.separators[0])?;
+    } else {
+        write!(f, " {value:<width$} {}", opts.separators[0])?;
     }
     Ok(())
 }
 
-pub fn display_table(mut table: Table<'_>, f: &mut impl Write) -> Result<()> {
+fn display_row<'a>(f: &mut impl Write, row: impl Row<'a>, opts: &DisplayOptions) -> Result<()> {
+    for (i, value) in row.all()?.iter().enumerate() {
+        display_value(f, value, i, opts)?;
+    }
+
+    writeln!(f)?;
+
+    Ok(())
+}
+
+pub fn display_list(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOptions) -> Result<()> {
+    let schema = table.schema();
+
+    display_schema(f, &schema, &opts)?;
+
+    while let Some(row) = table.next() {
+        display_row(f, row, &opts)?;
+    }
+    Ok(())
+}
+
+pub fn display_table(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOptions) -> Result<()> {
     let backup_size = 10;
     let mut backup: Vec<Vec<Value>> = Vec::with_capacity(backup_size);
 
     for _ in 0..backup_size {
-        let Some(row) = self.next() else {
+        let Some(row) = table.next() else {
             break;
         };
 
@@ -64,7 +127,7 @@ pub fn display_table(mut table: Table<'_>, f: &mut impl Write) -> Result<()> {
         backup.push(vec);
     }
 
-    let schema = self.schema();
+    let schema = table.schema();
 
     let mut sizes = schema
         .0
@@ -78,58 +141,47 @@ pub fn display_table(mut table: Table<'_>, f: &mut impl Write) -> Result<()> {
         }
     }
 
-    print!("+");
-    for size in &sizes {
-        for _ in 0..*size + 2 {
-            print!("-");
-        }
-        print!("+");
-    }
-    println!();
+    let opts = DisplayOptions {
+        column_sizes: Some(sizes),
+        ..opts
+    };
 
-    print!("|");
-    for (i, (name, _)) in schema.0.iter().enumerate() {
-        let width = sizes[i];
-        print!(" {name:^width$} |");
-    }
-    println!();
+    display_spacer(f, &opts)?;
 
-    print!("+");
-    for size in &sizes {
-        for _ in 0..*size + 2 {
-            print!("-");
-        }
-        print!("+");
-    }
-    println!();
+    display_schema(f, &schema, &opts)?;
+
+    display_spacer(f, &opts)?;
 
     for row in backup.iter() {
-        print!("|");
         for (i, value) in row.iter().enumerate() {
-            let width = sizes[i];
-            let value = value.to_string();
-            print!(" {value:<width$} |");
+            display_value(f, value, i, &opts)?;
         }
-        println!();
+        writeln!(f)?;
     }
 
-    while let Some(row) = self.next() {
-        print!("|");
-        for (i, value) in row.all()?.iter().enumerate() {
-            let width = sizes[i];
-            let value = value.to_string();
-            print!(" {value:<width$} |");
-        }
-        println!();
+    while let Some(row) = table.next() {
+        display_row(f, row, &opts)?;
     }
 
-    print!("+");
-    for size in &sizes {
-        for _ in 0..*size + 2 {
-            print!("-");
-        }
-        print!("+");
-    }
-    println!();
+    display_spacer(f, &opts)?;
+
+    Ok(())
+}
+
+pub fn display(f: &mut impl Write, mut table: Table<'_>, mode: DisplayMode) -> Result<()> {
+    let options = DisplayOptions {
+        mode,
+        column_sizes: None,
+        separators: ['|', '-', '+'],
+        // padded: mode == DisplayMode::Table,
+    };
+
+    match mode {
+        DisplayMode::List => display_list(f, table, options)?,
+        DisplayMode::Table => display_table(f, table, options)?,
+    };
+
+    f.flush()?;
+
     Ok(())
 }
