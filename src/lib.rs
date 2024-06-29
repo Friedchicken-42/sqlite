@@ -1,13 +1,15 @@
 mod command;
+mod display;
 
 use anyhow::{bail, Result};
 use command::{Command, CreateIndex, CreateTable};
+use display::{display, DisplayMode};
 use std::{
     borrow::Cow,
     cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
 };
 use tracing::{event, span, Level};
 
@@ -103,16 +105,22 @@ pub enum Type {
     Blob,
 }
 
-#[derive(Debug, PartialEq, Clone, PartialOrd)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value<'a> {
     Null,
     Integer(u32),
     Float(f64),
     Text(Cow<'a, str>),
-    Blob(&'a [u8]),
+    Blob(Cow<'a, [u8]>),
 }
 
 impl<'a> Eq for Value<'a> {}
+
+impl<'a> PartialOrd for Value<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl<'a> Ord for Value<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -262,16 +270,90 @@ impl Page {
     }
 }
 
+#[derive(Debug)]
+pub enum Table<'a> {
+    Rows(BTreePage<'a>),
+    IndexedRows(IndexedRows<'a>),
+}
+
 pub trait Rows: Debug {
-    fn next(&mut self) -> Option<impl Row>;
+    fn next(&mut self) -> Option<Item<'_>>;
+}
+
+impl<'a> Rows for Table<'a> {
+    fn next(&mut self) -> Option<Item<'_>> {
+        match self {
+            Table::Rows(table) => {
+                // Type system hack, TODO: find a better way
+                let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
+
+                let cell = table.loop_until(filter)?;
+
+                Some(Item::Cell(cell))
+            }
+            Table::IndexedRows(table) => {
+                let rowid = table.btreeindex.next()?;
+                let cell = table.btreepage.next_by_rowid(rowid)?;
+
+                Some(Item::Cell(cell))
+            }
+        }
+    }
 }
 
 pub trait Row<'a>: Debug {
     fn get(&self, column: &str) -> Result<Value<'a>>;
+    fn all(&self) -> Result<Vec<Value<'a>>>;
+}
+
+struct Output<'a> {
+    table: Table<'a>,
+    mode: DisplayMode,
+}
+
+impl<'a> Table<'a> {
+    fn schema(&self) -> &'_ Schema {
+        match self {
+            Table::Rows(table) => &table.schema,
+            Table::IndexedRows(table) => &table.btreepage.schema,
+        }
+    }
+
+    pub fn display(mut self, f: &mut impl Write, mode: DisplayMode) -> Result<()> {
+        display(f, self, mode)
+    }
+}
+
+#[derive(Debug)]
+pub enum Item<'a> {
+    Cell(Cell<'a>),
+}
+
+impl<'a> Item<'a> {
+    pub fn all(&self) -> Result<Vec<Value<'a>>> {
+        match self {
+            Item::Cell(cell) => cell.all(),
+        }
+    }
+}
+
+impl<'a> Row<'a> for Item<'a> {
+    fn get(&self, column: &str) -> Result<Value<'a>> {
+        match self {
+            Item::Cell(cell) => cell.get(column),
+        }
+    }
+
+    fn all(&self) -> Result<Vec<Value<'a>>> {
+        match self {
+            Item::Cell(cell) => cell.all(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct BTreePage<'a> {
+    pub name: String,
     pages: Vec<Page>,
     indexes: Vec<usize>,
     schema: Schema,
@@ -279,10 +361,11 @@ pub struct BTreePage<'a> {
 }
 
 impl<'a> BTreePage<'a> {
-    fn read(db: &'a Sqlite, index: usize, schema: Schema) -> Result<Self> {
+    fn read(db: &'a Sqlite, index: usize, name: String, schema: Schema) -> Result<Self> {
         let first_page = db.page(index)?;
 
         Ok(Self {
+            name,
             pages: vec![first_page],
             indexes: vec![0],
             schema,
@@ -423,14 +506,6 @@ impl<'a> BTreePage<'a> {
     }
 }
 
-impl<'a> Rows for BTreePage<'a> {
-    fn next(&mut self) -> Option<impl Row> {
-        // Type system hack, TODO: find a better way
-        let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
-        self.loop_until(filter)
-    }
-}
-
 #[derive(Debug)]
 pub struct BTreeIndex<'a> {
     btreepage: BTreePage<'a>,
@@ -477,13 +552,6 @@ pub struct IndexedRows<'a> {
     btreeindex: BTreeIndex<'a>,
 }
 
-impl<'a> Rows for IndexedRows<'a> {
-    fn next(&mut self) -> Option<impl Row> {
-        let rowid = self.btreeindex.next()?;
-        self.btreepage.next_by_rowid(rowid)
-    }
-}
-
 #[derive(Debug)]
 pub struct Cell<'a> {
     r#type: PageType,
@@ -494,7 +562,6 @@ pub struct Cell<'a> {
 
 impl<'a> Cell<'a> {
     fn rowid(&self) -> Result<u32> {
-        // TODO: mabye split these
         match self.r#type {
             PageType::TableLeaf => {
                 let (_, size) = read_varint(self.data);
@@ -544,10 +611,18 @@ impl<'a> Row<'a> for Cell<'a> {
             Type::Integer => Value::Integer(data[0] as u32),
             Type::Float => todo!(),
             Type::Text => Value::Text(Cow::Borrowed(std::str::from_utf8(data)?)),
-            Type::Blob => Value::Blob(data),
+            Type::Blob => Value::Blob(Cow::Borrowed(data)),
         };
 
         Ok(value)
+    }
+
+    fn all(&self) -> Result<Vec<Value<'a>>> {
+        self.schema
+            .0
+            .iter()
+            .map(|(name, _)| self.get(name))
+            .collect::<Result<Vec<_>>>()
     }
 }
 
@@ -600,7 +675,7 @@ impl Sqlite {
             ("sql".into(), Type::Text),
         ]);
 
-        BTreePage::read(self, 1, schema)
+        BTreePage::read(self, 1, "root".into(), schema)
     }
 
     fn page(&self, index: usize) -> Result<Page> {
@@ -628,10 +703,11 @@ impl Sqlite {
         let span = span!(Level::INFO, "Page Search", name = name);
         let _enter = span.enter();
 
-        let mut root = self.root()?;
+        let root = self.root()?;
+        let mut root = Table::Rows(root);
 
-        while let Some(cell) = root.next() {
-            let Value::Text(tbl_name) = cell.get("name")? else {
+        while let Some(row) = root.next() {
+            let Value::Text(tbl_name) = row.get("name")? else {
                 bail!("Expected Text")
             };
 
@@ -639,11 +715,11 @@ impl Sqlite {
                 continue;
             }
 
-            let Value::Integer(rootpage) = cell.get("rootpage")? else {
+            let Value::Integer(rootpage) = row.get("rootpage")? else {
                 bail!("Expected integer")
             };
 
-            let Value::Text(sql) = cell.get("sql")? else {
+            let Value::Text(sql) = row.get("sql")? else {
                 bail!("Expected text")
             };
 
@@ -655,13 +731,92 @@ impl Sqlite {
         bail!("table {name:?} not found");
     }
 
+    fn find_index(
+        &self,
+        from: &BTreePage,
+        filters: &[(Cow<'_, str>, Value<'_>)],
+    ) -> Result<Option<BTreePage>> {
+        let root = self.root()?;
+        let mut root = Table::Rows(root);
+
+        while let Some(index) = root.next() {
+            let Value::Text(tbl_name) = index.get("name")? else {
+                panic!("expected \"tbl_name\" to be \"Text\"");
+            };
+
+            if tbl_name == "sqlite_sequence" {
+                continue;
+            }
+
+            let Value::Text(sql) = index.get("sql")? else {
+                bail!("expected sql string");
+            };
+
+            if let Command::CreateIndex(CreateIndex {
+                index,
+                table,
+                columns,
+            }) = Command::parse(&sql.to_lowercase())?
+            {
+                if table != from.name {
+                    continue;
+                }
+
+                let mut count = 0;
+                for (col, _) in filters {
+                    for column in &columns {
+                        // TODO: find nearest
+                        if col == column {
+                            count += 1;
+                        }
+                    }
+                }
+
+                if count != filters.len() {
+                    continue;
+                }
+
+                let btreeindex = self.index(&tbl_name)?;
+                return Ok(Some(btreeindex));
+            };
+        }
+
+        Ok(None)
+    }
+
+    pub fn search<'a>(
+        &'a self,
+        name: &'a str,
+        filters: Vec<(Cow<'a, str>, Value<'a>)>,
+    ) -> Result<Table<'a>> {
+        let table = self.table(name)?;
+
+        if filters.is_empty() {
+            Ok(Table::Rows(table))
+        } else {
+            let Some(index) = self.find_index(&table, &filters)? else {
+                return Ok(Table::Rows(table));
+            };
+
+            let indexed = IndexedRows {
+                btreepage: table,
+                btreeindex: BTreeIndex {
+                    btreepage: index,
+                    filters,
+                },
+            };
+
+            Ok(Table::IndexedRows(indexed))
+        }
+    }
+
     pub fn table(&self, name: &str) -> Result<BTreePage> {
         let (rootpage, command) = self.find(name)?;
 
         if let Command::CreateTable(CreateTable { table, schema }) = command {
-            BTreePage::read(self, rootpage as usize, schema)
+            BTreePage::read(self, rootpage as usize, name.into(), schema)
         } else {
-            bail!("{name:?} is not a table")
+            bail!("{name:?} is not a table");
         }
     }
 
@@ -689,14 +844,34 @@ impl Sqlite {
             // blob.iter().fold(0, |acc, x| (acc << 8) + x)
             schema.push(("index".into(), Type::Blob));
             let schema = Schema(schema);
-            BTreePage::read(self, rootpage as usize, schema)
+            BTreePage::read(self, rootpage as usize, name.into(), schema)
         } else {
-            bail!("{name:?} is not a table")
+            bail!("table {name:?} not found");
         }
     }
 
+    pub fn show_tables(&self) -> Result<()> {
+        let table = self.root()?;
+        let mut table = Table::Rows(table);
+
+        while let Some(row) = table.next() {
+            let Value::Text(name) = row.get("name")? else {
+                panic!("expected text");
+            };
+
+            if name != "sqlite_sequence" {
+                print!("{name} ");
+            }
+        }
+
+        println!();
+
+        Ok(())
+    }
+
     pub fn show_schema(&self) -> Result<()> {
-        let mut table = self.root()?;
+        let root = self.root()?;
+        let mut table = Table::Rows(root);
 
         while let Some(table) = table.next() {
             let Value::Text(name) = table.get("name")? else {
@@ -720,51 +895,58 @@ impl Sqlite {
                     }
                 }
                 Command::CreateIndex(CreateIndex { table, columns, .. }) => {
-                    let mut cols = String::new();
-
+                    print!("{table}(");
                     for (i, col) in columns.iter().enumerate() {
                         if i != 0 {
-                            cols.push_str(", ");
+                            print!(", ");
                         }
-                        cols += col;
+                        print!("{col}");
                     }
 
-                    println!("{table}({cols})");
+                    println!(")");
                 }
                 _ => bail!("unexpected statement"),
             }
 
-            println!()
+            println!();
         }
 
         Ok(())
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
-        todo!()
+        command.execute(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufWriter;
+
     use anyhow::Result;
-    use tracing::{error, span, trace, Level};
+    use tracing::{span, Level};
     use tracing_test::traced_test;
 
-    use crate::{BTreeIndex, IndexedRows, Row, Rows, Sqlite, Value};
+    use crate::display::DisplayMode;
+    use crate::{IndexedRows, Row, Rows, Sqlite, Table, Value};
 
     #[traced_test]
     #[test]
     fn simple_db() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
-        let mut table = db.table("apples")?;
+        let mut table = db.search("apples", vec![])?;
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
+        assert!(match &table {
+            Table::Rows(rows) => rows.name == "apples",
+            _ => false,
+        });
+
         let mut i = 0;
-        while let Some(cell) = table.next() {
-            assert_eq!(cell.get("id")?, Value::Integer(i + 1));
+        while let Some(row) = table.next() {
+            assert_eq!(row.get("id")?, Value::Integer(i + 1));
             i += 1;
         }
 
@@ -777,14 +959,19 @@ mod tests {
     #[test]
     fn complex_db() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
-        let mut table = db.table("companies")?;
+        let mut table = db.search("companies", vec![])?;
+
+        assert!(match &table {
+            Table::Rows(rows) => rows.name == "companies",
+            _ => false,
+        });
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
         let mut i = 0;
-        while let Some(cell) = table.next() {
-            cell.get("id")?;
+        while let Some(row) = table.next() {
+            row.get("id")?;
             i += 1;
         }
 
@@ -798,23 +985,25 @@ mod tests {
     #[test]
     fn simple_index() -> Result<()> {
         let db = Sqlite::read("other.db")?;
-        let table = db.table("apples")?;
-        let index = db.index("apples_idx")?;
+        let filters = vec![("name".into(), Value::Text("Fuji".into()))];
+        let mut indexed = db.search("apples", filters)?;
 
-        let mut indexed = IndexedRows {
-            btreepage: table,
-            btreeindex: BTreeIndex {
-                btreepage: index,
-                filters: vec![("name".into(), Value::Text("Fuji".into()))],
-            },
-        };
+        assert!(match &indexed {
+            Table::IndexedRows(IndexedRows {
+                btreepage,
+                btreeindex,
+            }) => {
+                btreepage.name == "apples" && btreeindex.btreepage.name == "apples_idx"
+            }
+            _ => false,
+        });
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
-        while let Some(cell) = indexed.next() {
-            cell.get("id")?;
-            cell.get("name")?;
+        while let Some(row) = indexed.next() {
+            row.get("id")?;
+            row.get("name")?;
         }
 
         Ok(())
@@ -824,28 +1013,74 @@ mod tests {
     #[test]
     fn complex_index() -> Result<()> {
         let db = Sqlite::read("companies.db")?;
-        let table = db.table("companies")?;
-        let index = db.index("idx_companies_country")?;
+        let filters = vec![("country".into(), Value::Text("tuvalu".into()))];
+        let mut indexed = db.search("companies", filters)?;
 
-        let mut indexed = IndexedRows {
-            btreepage: table,
-            btreeindex: BTreeIndex {
-                btreepage: index,
-                filters: vec![("country".into(), Value::Text("tuvalu".into()))],
-            },
-        };
+        assert!(match &indexed {
+            Table::IndexedRows(IndexedRows {
+                btreepage,
+                btreeindex,
+            }) => {
+                btreepage.name == "companies"
+                    && btreeindex.btreepage.name == "idx_companies_country"
+            }
+            _ => false,
+        });
 
         let span = span!(Level::INFO, "Loop");
         let _enter = span.enter();
 
         let mut i = 0;
-        while let Some(cell) = indexed.next() {
-            let country = cell.get("country")?;
+        while let Some(row) = indexed.next() {
+            let country = row.get("country")?;
             assert_eq!(country, Value::Text("tuvalu".into()));
             i += 1;
         }
 
         assert_eq!(i, 25);
+
+        Ok(())
+    }
+
+    #[traced_test]
+    #[test]
+    fn simple_all() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let mut table = db.search("apples", vec![])?;
+
+        let span = span!(Level::INFO, "Loop");
+        let _enter = span.enter();
+
+        let mut i = 1;
+
+        while let Some(row) = table.next() {
+            let all = row.all()?;
+
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[0], Value::Integer(i));
+            assert!(matches!(all[1], Value::Text(_)));
+            assert!(matches!(all[2], Value::Text(_)));
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn display() -> Result<()> {
+        use std::io::Cursor;
+        let mut f = Cursor::new(vec![]);
+
+        let db = Sqlite::read("sample.db")?;
+
+        let table = db.search("apples", vec![])?;
+        table.display(&mut f, DisplayMode::List)?;
+
+        let table = db.search("apples", vec![])?;
+        table.display(&mut f, DisplayMode::Table)?;
+
+        println!("{}", std::str::from_utf8(f.get_ref())?);
 
         Ok(())
     }

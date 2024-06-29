@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sqlite::{Row, Rows, Sqlite, Value};
+use sqlite::Sqlite;
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -21,27 +21,12 @@ fn main() -> Result<()> {
             let page = db.root()?;
             println!("number of tables: {}", page.count());
         }
-        ".tables" => {
-            let mut table = db.root()?;
-
-            while let Some(cell) = table.next() {
-                let Value::Text(name) = cell.get("name")? else {
-                    panic!("expected text");
-                };
-
-                if name != "sqlite_sequence" {
-                    print!("{name} ");
-                }
-            }
-
-            println!()
-        }
+        ".tables" => db.show_tables()?,
         ".schema" => db.show_schema()?,
-        command => {
-            // let command = Command::parse(command)?;
-            // db.execute(command)?;
+        _command => {
             todo!()
         }
-    };
+    }
+
     Ok(())
 }
