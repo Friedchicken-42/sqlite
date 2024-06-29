@@ -920,6 +920,8 @@ impl Sqlite {
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufWriter;
+
     use anyhow::Result;
     use tracing::{span, Level};
     use tracing_test::traced_test;
@@ -1066,7 +1068,9 @@ mod tests {
 
     #[test]
     fn display() -> Result<()> {
-        let mut f = std::io::stdout();
+        use std::io::Cursor;
+        let mut f = Cursor::new(vec![]);
+
         let db = Sqlite::read("sample.db")?;
 
         let table = db.search("apples", vec![])?;
@@ -1074,6 +1078,8 @@ mod tests {
 
         let table = db.search("apples", vec![])?;
         table.display(&mut f, DisplayMode::Table)?;
+
+        println!("{}", std::str::from_utf8(f.get_ref())?);
 
         Ok(())
     }
