@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{Schema, Sqlite, Type, Value};
+use crate::{display::DisplayMode, Schema, Sqlite, Table, Type, Value};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -313,7 +313,7 @@ impl<'a> Select<'a> {
         })
     }
 
-    pub fn execute(self, db: &Sqlite) -> Result<()> {
+    pub fn execute(self, db: &'a Sqlite) -> Result<()> {
         let Select {
             select,
             from: FromClause { tables, conditions },
@@ -321,25 +321,33 @@ impl<'a> Select<'a> {
             limit,
         } = self;
 
-        let condition = conditions
-            .into_iter()
-            .fold(None, |acc, cond| match (acc, cond) {
-                (None, c) => Some(WhereClause::Condition(c)),
-                (Some(a), b) => {
-                    let a = Box::new(a);
-                    let c = Box::new(WhereClause::Condition(b));
-                    Some(WhereClause::And(a, c))
-                }
-            });
+        // let view = View::new(select, tables, db)?;
+        // let table = Table::View(view);
+        //
+        // use std::io::Cursor;
+        // let mut f = Cursor::new(vec![]);
+        // table.display(&mut f, DisplayMode::Table)?;
+        // println!("{}", std::str::from_utf8(f.get_ref())?);
 
-        let r#where = match (r#where, condition) {
-            (None, None) => None,
-            (Some(r), Some(c)) => Some(WhereClause::And(Box::new(r), Box::new(c))),
-            (Some(x), _) | (_, Some(x)) => Some(x),
-        };
-
-        dbg!(&r#where);
-        dbg!(&tables);
+        // let condition = conditions
+        //     .into_iter()
+        //     .fold(None, |acc, cond| match (acc, cond) {
+        //         (None, c) => Some(WhereClause::Condition(c)),
+        //         (Some(a), b) => {
+        //             let a = Box::new(a);
+        //             let c = Box::new(WhereClause::Condition(b));
+        //             Some(WhereClause::And(a, c))
+        //         }
+        //     });
+        //
+        // let r#where = match (r#where, condition) {
+        //     (None, None) => None,
+        //     (Some(r), Some(c)) => Some(WhereClause::And(Box::new(r), Box::new(c))),
+        //     (Some(x), _) | (_, Some(x)) => Some(x),
+        // };
+        //
+        // dbg!(&r#where);
+        // dbg!(&tables);
 
         Ok(())
     }

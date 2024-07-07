@@ -2,7 +2,7 @@ use std::{borrow::Cow, io::Write};
 
 use anyhow::Result;
 
-use crate::{Row, Rows, Schema, Table, Value};
+use crate::{Row, Schema, Table, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
@@ -89,7 +89,7 @@ fn display_row<'a>(f: &mut impl Write, row: impl Row<'a>, opts: &DisplayOptions)
     Ok(())
 }
 
-pub fn display_list(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOptions) -> Result<()> {
+fn display_list(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
     let schema = table.schema();
 
     display_schema(f, &schema, &opts)?;
@@ -100,7 +100,7 @@ pub fn display_list(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOptio
     Ok(())
 }
 
-pub fn display_table(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOptions) -> Result<()> {
+fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
     let backup_size = 10;
     let mut backup: Vec<Vec<Value>> = Vec::with_capacity(backup_size);
 
@@ -168,7 +168,7 @@ pub fn display_table(f: &mut impl Write, mut table: Table<'_>, opts: DisplayOpti
     Ok(())
 }
 
-pub fn display(f: &mut impl Write, mut table: Table<'_>, mode: DisplayMode) -> Result<()> {
+pub fn display(f: &mut impl Write, table: impl Table, mode: DisplayMode) -> Result<()> {
     let options = DisplayOptions {
         mode,
         column_sizes: None,
