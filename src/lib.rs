@@ -12,7 +12,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
 };
-use tracing::{event, span, Level};
+use tracing::{event, span, Instrument, Level};
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -272,13 +272,23 @@ impl Page {
 }
 
 pub trait Table: Debug {
-    fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>>;
+    fn current(&self) -> Option<Box<dyn Row<'_> + '_>>;
+    fn advance(&mut self);
     fn schema(&self) -> &Schema;
+
+    fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
+        self.advance();
+        self.current()
+    }
 }
 
 impl<T: Table + ?Sized> Table for Box<T> {
-    fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
-        (**self).next()
+    fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
+        (**self).current()
+    }
+
+    fn advance(&mut self) {
+        (**self).advance()
     }
 
     fn schema(&self) -> &Schema {
@@ -306,6 +316,7 @@ pub struct BTreePage<'a> {
     pub name: String,
     pages: Vec<Page>,
     indexes: Vec<usize>,
+    offset: usize,
     schema: Schema,
     db: &'a Sqlite,
 }
@@ -318,6 +329,7 @@ impl<'a> BTreePage<'a> {
             name,
             pages: vec![first_page],
             indexes: vec![0],
+            offset: 0,
             schema,
             db,
         })
@@ -331,13 +343,13 @@ impl<'a> BTreePage<'a> {
             .cells
     }
 
-    fn loop_until<F>(&mut self, filter: Option<F>) -> Option<Cell<'_>>
+    fn loop_until<F>(&mut self, filter: Option<F>)
     where
         F: Fn(&Cell) -> Ordering,
     {
         loop {
             if self.pages.is_empty() {
-                return None;
+                return;
             }
 
             let page = self.pages.last().unwrap();
@@ -350,26 +362,30 @@ impl<'a> BTreePage<'a> {
                         self.indexes.pop();
                     } else {
                         let pointers = &page.pointers;
-                        let offset = pointers[*index];
+                        self.offset = pointers[*index];
 
                         *index += 1;
 
                         match (page_type, &filter) {
                             (_, None) => {
-                                return Some(page.cell(offset, &self.schema));
+                                return;
                             }
                             (PageType::TableLeaf, Some(f)) => {
-                                let cell = page.cell(offset, &self.schema);
+                                let cell = page.cell(self.offset, &self.schema);
                                 if f(&cell).is_eq() {
-                                    return Some(cell);
+                                    return;
                                 }
                             }
                             (PageType::IndexLeaf, Some(f)) => {
-                                let cell = page.cell(offset, &self.schema);
+                                let cell = page.cell(self.offset, &self.schema);
                                 match f(&cell) {
                                     Ordering::Less => {}
-                                    Ordering::Equal => return Some(cell),
-                                    Ordering::Greater => return None,
+                                    Ordering::Equal => return,
+                                    Ordering::Greater => {
+                                        self.pages.clear();
+                                        self.indexes.clear();
+                                        return;
+                                    }
                                 }
                             }
                             _ => unreachable!(),
@@ -395,36 +411,36 @@ impl<'a> BTreePage<'a> {
                             PageType::TableInterior => *index += 1,
                             PageType::IndexInterior => {
                                 let pointers = &page.pointers;
-                                let offset = pointers[(*index - 1) / 2];
+                                self.offset = pointers[(*index - 1) / 2];
 
                                 *index += 1;
 
-                                let cell = page.cell(offset, &self.schema);
+                                let cell = page.cell(self.offset, &self.schema);
 
                                 if let Some(f) = &filter {
                                     if f(&cell).is_ge() {
-                                        return Some(cell);
+                                        return;
                                     }
                                 } else {
-                                    return Some(cell);
+                                    return;
                                 }
                             }
                             _ => unreachable!(),
                         }
                     } else {
                         let pointers = &page.pointers;
-                        let offset = pointers[*index / 2];
+                        self.offset = pointers[*index / 2];
 
                         *index += 1;
 
                         let next_page = match &filter {
                             None => {
-                                let cell = page.cell(offset, &self.schema);
+                                let cell = page.cell(self.offset, &self.schema);
                                 let page = cell.page().unwrap();
                                 Some(page as usize)
                             }
                             Some(f) => {
-                                let cell = page.cell(offset, &self.schema);
+                                let cell = page.cell(self.offset, &self.schema);
 
                                 if f(&cell).is_ge() {
                                     let page = cell.page().unwrap();
@@ -446,24 +462,31 @@ impl<'a> BTreePage<'a> {
         }
     }
 
-    fn next_by_rowid(&mut self, rowid: usize) -> Option<Cell<'_>> {
+    fn next_by_rowid(&mut self, rowid: usize) {
         let filter = move |cell: &Cell| {
             let row = cell.rowid().unwrap() as usize;
             row.cmp(&rowid)
         };
 
-        self.loop_until(Some(filter))
+        self.loop_until(Some(filter));
     }
 }
 
 impl<'a> Table for BTreePage<'a> {
-    fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
-        // Type system hack, TODO: find a better way
-        let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
+    fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
+        if self.pages.is_empty() {
+            return None;
+        }
 
-        let cell = self.loop_until(filter)?;
+        let page = self.pages.last().unwrap();
 
+        let cell = page.cell(self.offset, &self.schema);
         Some(Box::new(cell))
+    }
+
+    fn advance(&mut self) {
+        let filter = None.map(|_: ()| |_cell: &Cell| Ordering::Equal);
+        self.loop_until(filter);
     }
 
     fn schema(&self) -> &Schema {
@@ -499,7 +522,8 @@ impl<'a> BTreeIndex<'a> {
             })
         };
 
-        let cell = self.btreepage.loop_until(filter)?;
+        self.btreepage.loop_until(filter);
+        let cell = self.btreepage.current()?;
 
         let Value::Blob(blob) = cell.get("index").unwrap() else {
             panic!("wrong value");
@@ -518,11 +542,18 @@ pub struct IndexedRows<'a> {
 }
 
 impl<'a> Table for IndexedRows<'a> {
-    fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
-        let rowid = self.btreeindex.next()?;
-        let cell = self.btreepage.next_by_rowid(rowid)?;
+    fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
+        self.btreepage.current()
+    }
 
-        Some(Box::new(cell))
+    fn advance(&mut self) {
+        match self.btreeindex.next() {
+            Some(rowid) => self.btreepage.next_by_rowid(rowid),
+            None => {
+                self.btreepage.pages.clear();
+                self.btreepage.indexes.clear();
+            }
+        }
     }
 
     fn schema(&self) -> &Schema {
@@ -931,6 +962,22 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn current() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let mut table = db.search("apples", vec![])?;
+
+        table.advance();
+
+        let first = table.current().unwrap();
+        let second = table.current().unwrap();
+
+        assert!(first.get("id")? == second.get("id")?);
+        assert!(first.get("name")? == second.get("name")?);
+
+        Ok(())
+    }
+
     #[traced_test]
     #[test]
     fn complex_db() -> Result<()> {
@@ -1060,12 +1107,4 @@ mod tests {
 
         Ok(())
     }
-
-    // #[test]
-    // fn view() -> Result<()> {
-    //     let db = Sqlite::read("sample.db")?;
-    //     let command = Command::parse("select name from apples")?;
-    //     db.execute(command)?;
-    //     todo!()
-    // }
 }

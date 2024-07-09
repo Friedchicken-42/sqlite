@@ -92,7 +92,7 @@ fn display_row<'a>(f: &mut impl Write, row: impl Row<'a>, opts: &DisplayOptions)
 fn display_list(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
     let schema = table.schema();
 
-    display_schema(f, &schema, &opts)?;
+    display_schema(f, schema, &opts)?;
 
     while let Some(row) = table.next() {
         display_row(f, row, &opts)?;
@@ -101,10 +101,10 @@ fn display_list(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions)
 }
 
 fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
-    let backup_size = 10;
-    let mut backup: Vec<Vec<Value>> = Vec::with_capacity(backup_size);
+    const BACKUP_SIZE: usize = 20;
+    let mut backup: Vec<Vec<Value>> = Vec::with_capacity(BACKUP_SIZE);
 
-    for _ in 0..backup_size {
+    for _ in 0..BACKUP_SIZE {
         let Some(row) = table.next() else {
             break;
         };
@@ -148,7 +148,7 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
 
     display_spacer(f, &opts)?;
 
-    display_schema(f, &schema, &opts)?;
+    display_schema(f, schema, &opts)?;
 
     display_spacer(f, &opts)?;
 
