@@ -12,7 +12,6 @@ struct SQLParser;
 
 #[derive(Debug)]
 pub enum SimpleColumn {
-    Wildcard,
     String(String),
     Dotted(Vec<String>),
 }
@@ -24,7 +23,6 @@ impl SimpleColumn {
                 let string = pair.as_span().as_str().to_string();
                 Ok(Self::String(string))
             }
-            Rule::wildcard => Ok(Self::Wildcard),
             Rule::dotted_field => {
                 let inner = pair.into_inner();
                 let strings = inner.map(|p| p.as_span().as_str().to_string()).collect();
@@ -38,6 +36,7 @@ impl SimpleColumn {
 
 #[derive(Debug)]
 pub enum Column {
+    Wildcard,
     Alias(SimpleColumn, String),
     Simple(SimpleColumn),
 }
@@ -45,6 +44,7 @@ pub enum Column {
 impl Column {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         match pair.as_rule() {
+            Rule::wildcard => Ok(Self::Wildcard),
             Rule::simple_field => {
                 let mut inner = pair.into_inner();
                 let simple = inner.next().unwrap();
