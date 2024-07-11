@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sqlite::Sqlite;
+use sqlite::{command::Command, Sqlite};
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -23,8 +23,9 @@ fn main() -> Result<()> {
         }
         ".tables" => db.show_tables()?,
         ".schema" => db.show_schema()?,
-        _command => {
-            todo!()
+        command => {
+            let command = Command::parse(command)?;
+            db.execute(command)?;
         }
     }
 

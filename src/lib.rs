@@ -1,4 +1,4 @@
-mod command;
+pub mod command;
 mod display;
 mod view;
 
@@ -12,7 +12,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
 };
-use tracing::{event, span, Instrument, Level};
+use tracing::{event, span, Level};
 
 fn read_varint(data: &[u8]) -> (u64, usize) {
     let mut i = 0;
@@ -155,8 +155,47 @@ impl<'a> Display for Value<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Column {
+    String(String),
+    Dotted { table: String, column: String },
+}
+
+impl From<&str> for Column {
+    fn from(value: &str) -> Self {
+        let dot = value.chars().position(|c| c == '.');
+
+        match dot {
+            Some(pos) => {
+                let (table, column) = value.split_at(pos);
+                Self::Dotted {
+                    table: table.to_string(),
+                    column: column[1..].to_string(),
+                }
+            }
+            None => Self::String(value.to_string()),
+        }
+    }
+}
+
+impl Column {
+    pub fn name(&self) -> &str {
+        match self {
+            Column::String(n) => n,
+            Column::Dotted { column, .. } => column,
+        }
+    }
+
+    pub fn full(&self) -> String {
+        match self {
+            Column::String(s) => s.to_string(),
+            Column::Dotted { table, column } => format!("{table}.{column}"),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct Schema(Vec<(String, Type)>);
+pub struct Schema(Vec<(Column, Type)>);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum PageType {
@@ -297,12 +336,12 @@ impl<T: Table + ?Sized> Table for Box<T> {
 }
 
 pub trait Row<'a>: Debug {
-    fn get(&self, column: &str) -> Result<Value<'a>>;
+    fn get(&self, column: &Column) -> Result<Value<'a>>;
     fn all(&self) -> Result<Vec<Value<'a>>>;
 }
 
 impl<'a, T: Row<'a> + ?Sized> Row<'a> for Box<T> {
-    fn get(&self, column: &str) -> Result<Value<'a>> {
+    fn get(&self, column: &Column) -> Result<Value<'a>> {
         (**self).get(column)
     }
 
@@ -312,11 +351,18 @@ impl<'a, T: Row<'a> + ?Sized> Row<'a> for Box<T> {
 }
 
 #[derive(Debug)]
+enum BTreeState {
+    Start,
+    Next(usize),
+    End,
+}
+
+#[derive(Debug)]
 pub struct BTreePage<'a> {
     pub name: String,
     pages: Vec<Page>,
     indexes: Vec<usize>,
-    offset: usize,
+    state: BTreeState,
     schema: Schema,
     db: &'a Sqlite,
 }
@@ -329,7 +375,7 @@ impl<'a> BTreePage<'a> {
             name,
             pages: vec![first_page],
             indexes: vec![0],
-            offset: 0,
+            state: BTreeState::Start,
             schema,
             db,
         })
@@ -349,6 +395,7 @@ impl<'a> BTreePage<'a> {
     {
         loop {
             if self.pages.is_empty() {
+                self.state = BTreeState::End;
                 return;
             }
 
@@ -362,7 +409,8 @@ impl<'a> BTreePage<'a> {
                         self.indexes.pop();
                     } else {
                         let pointers = &page.pointers;
-                        self.offset = pointers[*index];
+                        let offset = pointers[*index];
+                        self.state = BTreeState::Next(offset);
 
                         *index += 1;
 
@@ -371,19 +419,18 @@ impl<'a> BTreePage<'a> {
                                 return;
                             }
                             (PageType::TableLeaf, Some(f)) => {
-                                let cell = page.cell(self.offset, &self.schema);
+                                let cell = page.cell(offset, &self.schema);
                                 if f(&cell).is_eq() {
                                     return;
                                 }
                             }
                             (PageType::IndexLeaf, Some(f)) => {
-                                let cell = page.cell(self.offset, &self.schema);
+                                let cell = page.cell(offset, &self.schema);
                                 match f(&cell) {
                                     Ordering::Less => {}
                                     Ordering::Equal => return,
                                     Ordering::Greater => {
-                                        self.pages.clear();
-                                        self.indexes.clear();
+                                        self.state = BTreeState::End;
                                         return;
                                     }
                                 }
@@ -411,11 +458,12 @@ impl<'a> BTreePage<'a> {
                             PageType::TableInterior => *index += 1,
                             PageType::IndexInterior => {
                                 let pointers = &page.pointers;
-                                self.offset = pointers[(*index - 1) / 2];
+                                let offset = pointers[(*index - 1) / 2];
+                                self.state = BTreeState::Next(offset);
 
                                 *index += 1;
 
-                                let cell = page.cell(self.offset, &self.schema);
+                                let cell = page.cell(offset, &self.schema);
 
                                 if let Some(f) = &filter {
                                     if f(&cell).is_ge() {
@@ -429,18 +477,19 @@ impl<'a> BTreePage<'a> {
                         }
                     } else {
                         let pointers = &page.pointers;
-                        self.offset = pointers[*index / 2];
+                        let offset = pointers[*index / 2];
+                        self.state = BTreeState::Next(offset);
 
                         *index += 1;
 
                         let next_page = match &filter {
                             None => {
-                                let cell = page.cell(self.offset, &self.schema);
+                                let cell = page.cell(offset, &self.schema);
                                 let page = cell.page().unwrap();
                                 Some(page as usize)
                             }
                             Some(f) => {
-                                let cell = page.cell(self.offset, &self.schema);
+                                let cell = page.cell(offset, &self.schema);
 
                                 if f(&cell).is_ge() {
                                     let page = cell.page().unwrap();
@@ -474,14 +523,15 @@ impl<'a> BTreePage<'a> {
 
 impl<'a> Table for BTreePage<'a> {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
-        if self.pages.is_empty() {
-            return None;
+        match self.state {
+            BTreeState::Start | BTreeState::End => None,
+            BTreeState::Next(offset) => {
+                let page = self.pages.last().unwrap();
+
+                let cell = page.cell(offset, &self.schema);
+                Some(Box::new(cell))
+            }
         }
-
-        let page = self.pages.last().unwrap();
-
-        let cell = page.cell(self.offset, &self.schema);
-        Some(Box::new(cell))
     }
 
     fn advance(&mut self) {
@@ -497,7 +547,7 @@ impl<'a> Table for BTreePage<'a> {
 #[derive(Debug)]
 pub struct BTreeIndex<'a> {
     btreepage: BTreePage<'a>,
-    filters: Vec<(Cow<'a, str>, Value<'a>)>,
+    filters: Vec<(Column, Value<'a>)>,
 }
 
 impl<'a> BTreeIndex<'a> {
@@ -525,7 +575,7 @@ impl<'a> BTreeIndex<'a> {
         self.btreepage.loop_until(filter);
         let cell = self.btreepage.current()?;
 
-        let Value::Blob(blob) = cell.get("index").unwrap() else {
+        let Value::Blob(blob) = cell.get(&"index".into()).unwrap() else {
             panic!("wrong value");
         };
 
@@ -549,10 +599,7 @@ impl<'a> Table for IndexedRows<'a> {
     fn advance(&mut self) {
         match self.btreeindex.next() {
             Some(rowid) => self.btreepage.next_by_rowid(rowid),
-            None => {
-                self.btreepage.pages.clear();
-                self.btreepage.indexes.clear();
-            }
+            None => self.btreepage.state = BTreeState::End,
         }
     }
 
@@ -600,15 +647,15 @@ impl<'a> Cell<'a> {
 }
 
 impl<'a> Row<'a> for Cell<'a> {
-    fn get(&self, column: &str) -> Result<Value<'a>> {
-        let Some(index) = self.schema.0.iter().position(|(name, _)| name == column) else {
+    fn get(&self, column: &Column) -> Result<Value<'a>> {
+        let Some(index) = self.schema.0.iter().position(|(col, _)| col == column) else {
             bail!("column: {column:?} not found")
         };
 
         let (_, r#type) = self.schema.0[index];
         let data = self.records[index];
 
-        if data.is_empty() && column == "id" {
+        if data.is_empty() && column.name() == "id" {
             let rowid = self.rowid()?;
             return Ok(Value::Integer(rowid));
         } else if data.is_empty() {
@@ -630,7 +677,7 @@ impl<'a> Row<'a> for Cell<'a> {
         self.schema
             .0
             .iter()
-            .map(|(name, _)| self.get(name))
+            .map(|(col, _)| self.get(col))
             .collect::<Result<Vec<_>>>()
     }
 }
@@ -715,7 +762,7 @@ impl Sqlite {
         let mut root = self.root()?;
 
         while let Some(row) = root.next() {
-            let Value::Text(tbl_name) = row.get("name")? else {
+            let Value::Text(tbl_name) = row.get(&"name".into())? else {
                 bail!("Expected Text")
             };
 
@@ -723,11 +770,11 @@ impl Sqlite {
                 continue;
             }
 
-            let Value::Integer(rootpage) = row.get("rootpage")? else {
+            let Value::Integer(rootpage) = row.get(&"rootpage".into())? else {
                 bail!("Expected integer")
             };
 
-            let Value::Text(sql) = row.get("sql")? else {
+            let Value::Text(sql) = row.get(&"sql".into())? else {
                 bail!("Expected text")
             };
 
@@ -742,12 +789,12 @@ impl Sqlite {
     fn find_index(
         &self,
         from: &BTreePage,
-        filters: &[(Cow<'_, str>, Value<'_>)],
+        filters: &[(Column, Value<'_>)],
     ) -> Result<Option<BTreePage>> {
         let mut root = self.root()?;
 
         while let Some(index) = root.next() {
-            let Value::Text(tbl_name) = index.get("name")? else {
+            let Value::Text(tbl_name) = index.get(&"name".into())? else {
                 panic!("expected \"tbl_name\" to be \"Text\"");
             };
 
@@ -755,7 +802,7 @@ impl Sqlite {
                 continue;
             }
 
-            let Value::Text(sql) = index.get("sql")? else {
+            let Value::Text(sql) = index.get(&"sql".into())? else {
                 bail!("expected sql string");
             };
 
@@ -773,7 +820,7 @@ impl Sqlite {
                 for (col, _) in filters {
                     for column in &columns {
                         // TODO: find nearest
-                        if col == column {
+                        if col.name() == column {
                             count += 1;
                         }
                     }
@@ -794,7 +841,7 @@ impl Sqlite {
     pub fn search<'a>(
         &'a self,
         name: &str,
-        filters: Vec<(Cow<'a, str>, Value<'a>)>,
+        filters: Vec<(Column, Value<'a>)>,
     ) -> Result<Box<dyn Table + 'a>> {
         let table = self.table(name)?;
 
@@ -839,10 +886,10 @@ impl Sqlite {
             let mut schema = vec![];
             let table = self.table(&table)?;
 
-            for column in columns {
-                for (name, r#type) in &table.schema.0 {
-                    if column == *name {
-                        schema.push((column.clone(), *r#type));
+            for col in columns {
+                for (column, r#type) in &table.schema.0 {
+                    if col == column.name() {
+                        schema.push((col.as_str().into(), *r#type));
                     }
                 }
             }
@@ -861,7 +908,7 @@ impl Sqlite {
         let mut table = self.root()?;
 
         while let Some(row) = table.next() {
-            let Value::Text(name) = row.get("name")? else {
+            let Value::Text(name) = row.get(&"name".into())? else {
                 panic!("expected text");
             };
 
@@ -879,7 +926,7 @@ impl Sqlite {
         let mut table = self.root()?;
 
         while let Some(table) = table.next() {
-            let Value::Text(name) = table.get("name")? else {
+            let Value::Text(name) = table.get(&"name".into())? else {
                 panic!("expected text");
             };
 
@@ -889,7 +936,7 @@ impl Sqlite {
 
             println!("schema {name:?}");
 
-            let Value::Text(sql) = table.get("sql")? else {
+            let Value::Text(sql) = table.get(&"sql".into())? else {
                 panic!("expected sql string");
             };
 
@@ -953,7 +1000,7 @@ mod tests {
 
         let mut i = 0;
         while let Some(row) = table.next() {
-            assert_eq!(row.get("id")?, Value::Integer(i + 1));
+            assert_eq!(row.get(&"id".into())?, Value::Integer(i + 1));
             i += 1;
         }
 
@@ -972,8 +1019,8 @@ mod tests {
         let first = table.current().unwrap();
         let second = table.current().unwrap();
 
-        assert!(first.get("id")? == second.get("id")?);
-        assert!(first.get("name")? == second.get("name")?);
+        assert!(first.get(&"id".into())? == second.get(&"id".into())?);
+        assert!(first.get(&"name".into())? == second.get(&"name".into())?);
 
         Ok(())
     }
@@ -994,7 +1041,7 @@ mod tests {
 
         let mut i = 0;
         while let Some(row) = table.next() {
-            row.get("id")?;
+            row.get(&"id".into())?;
             i += 1;
         }
 
@@ -1025,8 +1072,8 @@ mod tests {
         let _enter = span.enter();
 
         while let Some(row) = indexed.next() {
-            row.get("id")?;
-            row.get("name")?;
+            row.get(&"id".into())?;
+            row.get(&"name".into())?;
         }
 
         Ok(())
@@ -1055,7 +1102,7 @@ mod tests {
 
         let mut i = 0;
         while let Some(row) = indexed.next() {
-            let country = row.get("country")?;
+            let country = row.get(&"country".into())?;
             assert_eq!(country, Value::Text("tuvalu".into()));
             i += 1;
         }

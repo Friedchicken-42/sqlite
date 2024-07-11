@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{display::DisplayMode, Schema, Sqlite, Table, Type, Value};
+use crate::{display::DisplayMode, view::View, Schema, Sqlite, Table, Type, Value};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -35,13 +35,13 @@ impl SimpleColumn {
 }
 
 #[derive(Debug)]
-pub enum Column {
+pub enum InputColumn {
     Wildcard,
     Alias(SimpleColumn, String),
     Simple(SimpleColumn),
 }
 
-impl Column {
+impl InputColumn {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         match pair.as_rule() {
             Rule::wildcard => Ok(Self::Wildcard),
@@ -69,14 +69,14 @@ impl Column {
 
 #[derive(Debug)]
 pub struct SelectClause {
-    pub columns: Vec<Column>,
+    pub columns: Vec<InputColumn>,
 }
 
 impl SelectClause {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         let columns = pair
             .into_inner()
-            .map(Column::new)
+            .map(InputColumn::new)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self { columns })
@@ -131,16 +131,12 @@ impl<'a> FromClause<'a> {
                     tables.push(table);
                 }
                 Rule::condition => {
-                    dbg!(&pair);
                     let condition = Condition::new(pair)?;
                     conditions.push(condition);
                 }
                 _ => bail!("[From Clause] Malformed query"),
             }
         }
-
-        dbg!(&tables);
-        dbg!(&conditions);
 
         Ok(Self { tables, conditions })
     }
@@ -154,7 +150,7 @@ pub enum Conditional {
 #[derive(Debug)]
 pub enum Expected<'a> {
     Value(Value<'a>),
-    Column(Column),
+    Column(InputColumn),
 }
 
 impl<'a> Expected<'a> {
@@ -173,7 +169,7 @@ impl<'a> Expected<'a> {
             Self::Value(Value::Float(number))
         } else {
             let column = SimpleColumn::new(pair)?;
-            Self::Column(Column::Simple(column))
+            Self::Column(InputColumn::Simple(column))
         };
 
         Ok(expected)
@@ -182,7 +178,7 @@ impl<'a> Expected<'a> {
 
 #[derive(Debug)]
 pub struct Condition<'a> {
-    column: Column,
+    column: InputColumn,
     conditional: Conditional,
     expected: Expected<'a>,
 }
@@ -192,7 +188,7 @@ impl<'a> Condition<'a> {
         let mut inner = pair.into_inner();
         let column = inner.next().unwrap();
         let column = SimpleColumn::new(column)?;
-        let column = Column::Simple(column);
+        let column = InputColumn::Simple(column);
 
         let conditional = match inner.next().unwrap().as_span().as_str() {
             "=" => Conditional::Equals,
@@ -313,13 +309,17 @@ impl<'a> Select<'a> {
         })
     }
 
-    pub fn execute(self, db: &'a Sqlite) -> Result<()> {
+    pub fn execute(self, db: &'a Sqlite) -> Result<Box<dyn Table + '_>> {
         let Select {
             select,
             from: FromClause { tables, conditions },
             r#where,
             limit,
         } = self;
+
+        let view = View::new(select, tables, db)?;
+
+        Ok(Box::new(view))
 
         // let view = View::new(select, tables, db)?;
         // let table = Table::View(view);
@@ -348,8 +348,6 @@ impl<'a> Select<'a> {
         //
         // dbg!(&r#where);
         // dbg!(&tables);
-
-        Ok(())
     }
 }
 
@@ -381,7 +379,7 @@ impl CreateTable {
                         t => bail!("Missing type: {t:?}"),
                     };
 
-                    schema.push((name, r#type));
+                    schema.push((name.as_str().into(), r#type));
                 }
                 _ => bail!("[Create Table Command] Malformed query"),
             }
@@ -466,7 +464,14 @@ impl<'a> Command<'a> {
 
     pub fn execute(self, db: &Sqlite) -> Result<()> {
         match self {
-            Command::Select(select) => select.execute(db),
+            Command::Select(select) => {
+                use std::io::Cursor;
+                let mut f = Cursor::new(vec![]);
+                let view = select.execute(db)?;
+                db.display(&mut f, view, DisplayMode::Table)?;
+                println!("{}", std::str::from_utf8(f.get_ref())?);
+                Ok(())
+            }
             Command::CreateTable(createtable) => createtable.execute(db),
             Command::CreateIndex(createindex) => createindex.execute(db),
         }

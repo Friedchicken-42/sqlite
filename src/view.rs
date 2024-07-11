@@ -1,10 +1,11 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::{
-    command::{Column, FromTable, SelectClause, SimpleColumn},
-    Row, Schema, Sqlite, Table, Value,
+    command::{FromTable, InputColumn, SelectClause, SimpleColumn},
+    Column, Row, Schema, Sqlite, Table, Value,
 };
 
+// TODO: change and/or add sub-schema with `table.column`
 #[derive(Debug)]
 pub struct ViewRow<'a> {
     schema: &'a Schema,
@@ -12,7 +13,7 @@ pub struct ViewRow<'a> {
 }
 
 impl<'a> Row<'a> for ViewRow<'a> {
-    fn get(&self, column: &str) -> Result<Value<'a>> {
+    fn get(&self, column: &Column) -> Result<Value<'a>> {
         for row in &self.rows {
             let value = row.get(column);
             if value.is_ok() {
@@ -41,7 +42,7 @@ pub struct View<'a> {
 }
 
 impl<'a> View<'a> {
-    fn new(select: SelectClause, from: Vec<FromTable>, db: &'a Sqlite) -> Result<Self> {
+    pub fn new(select: SelectClause, from: Vec<FromTable>, db: &'a Sqlite) -> Result<Self> {
         let names = from
             .iter()
             .map(|table| match table {
@@ -66,12 +67,12 @@ impl<'a> View<'a> {
             .columns
             .iter()
             .map(|column| match column {
-                Column::Simple(SimpleColumn::String(column)) => {
+                InputColumn::Simple(SimpleColumn::String(column)) => {
                     let vec = tables
                         .iter()
                         .map(|table| table.schema())
                         .flat_map(|schema| schema.0.clone())
-                        .filter(|(name, _)| *name == *column)
+                        .filter(|(col, _)| col.name() == *column)
                         .collect::<Vec<_>>();
 
                     match vec.len() {
@@ -80,9 +81,9 @@ impl<'a> View<'a> {
                         _ => Err(anyhow!("multiple columns {column:?}")),
                     }
                 }
-                Column::Alias(_, _) => todo!(),
-                Column::Simple(SimpleColumn::Dotted(_)) => todo!(),
-                Column::Wildcard => Ok(tables
+                InputColumn::Alias(_, _) => todo!(),
+                InputColumn::Simple(SimpleColumn::Dotted(_)) => todo!(),
+                InputColumn::Wildcard => Ok(tables
                     .iter()
                     .flat_map(|t| t.schema().0.clone())
                     .collect::<Vec<_>>()),
@@ -151,7 +152,7 @@ mod tests {
     use anyhow::{bail, Result};
 
     use crate::{
-        command::{Column, FromTable, SelectClause, SimpleColumn},
+        command::{FromTable, InputColumn, SelectClause, SimpleColumn},
         display::DisplayMode,
         Sqlite, Table, Type,
     };
@@ -164,8 +165,8 @@ mod tests {
 
         let select = SelectClause {
             columns: vec![
-                Column::Simple(SimpleColumn::String("color".into())),
-                Column::Simple(SimpleColumn::String("description".into())),
+                InputColumn::Simple(SimpleColumn::String("color".into())),
+                InputColumn::Simple(SimpleColumn::String("description".into())),
             ],
         };
 
@@ -185,8 +186,8 @@ mod tests {
         );
 
         while let Some(row) = view.next() {
-            row.get("color")?;
-            row.get("description")?;
+            row.get(&"color".into())?;
+            row.get(&"description".into())?;
         }
 
         Ok(())
@@ -200,8 +201,8 @@ mod tests {
             columns: vec![
                 // Column::Simple(SimpleColumn::String("color".into())),
                 // Column::Simple(SimpleColumn::String("description".into())),
-                Column::Wildcard,
-                Column::Simple(SimpleColumn::String("color".into())),
+                InputColumn::Wildcard,
+                InputColumn::Simple(SimpleColumn::String("color".into())),
             ],
         };
 
@@ -230,7 +231,7 @@ mod tests {
         let db = Sqlite::read("sample.db")?;
 
         let select = SelectClause {
-            columns: vec![Column::Wildcard],
+            columns: vec![InputColumn::Wildcard],
         };
 
         let from = vec![FromTable::Simple("apples".into())];
@@ -242,9 +243,9 @@ mod tests {
         loop {
             match (view.next(), base.next()) {
                 (Some(a), Some(b)) => {
-                    assert_eq!(a.get("id")?, b.get("id")?);
-                    assert_eq!(a.get("name")?, b.get("name")?);
-                    assert_eq!(a.get("color")?, b.get("color")?);
+                    assert_eq!(a.get(&"id".into())?, b.get(&"id".into())?);
+                    assert_eq!(a.get(&"name".into())?, b.get(&"name".into())?);
+                    assert_eq!(a.get(&"color".into())?, b.get(&"color".into())?);
                 }
                 (None, None) => break,
                 _ => bail!("view differ from table"),

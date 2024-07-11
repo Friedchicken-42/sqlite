@@ -15,11 +15,11 @@ dotted_field = { identifier ~ ("." ~ identifier)+ }
 
 wildcard = { "*" }
 
-simple_field = { wildcard | function | dotted_field | identifier }
+simple_field = { function | dotted_field | identifier }
 
 aliased_field = { simple_field ~ "as" ~ identifier }
 
-field = _{ aliased_field | simple_field }
+field = _{ aliased_field | simple_field | wildcard }
 
 fields = _{ field ~ ("," ~ field)* }
 
