@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{display::DisplayMode, view::View, Schema, Sqlite, Table, Type, Value};
+use crate::{display::DisplayMode, view::View, Column, Row, Schema, Sqlite, Table, Type, Value};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -112,6 +112,20 @@ impl FromTable {
             _ => bail!("[From Table] Malformed query"),
         }
     }
+
+    pub fn name(&self) -> &str {
+        match self {
+            FromTable::Simple(n) => n,
+            FromTable::Alias(n, _) => n,
+        }
+    }
+
+    pub fn alias(&self) -> &str {
+        match self {
+            FromTable::Simple(n) => n,
+            FromTable::Alias(_, n) => n,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +167,7 @@ pub enum Conditional {
 #[derive(Debug)]
 pub enum Expected<'a> {
     Value(Value<'a>),
-    Column(InputColumn),
+    Column(Column),
 }
 
 impl<'a> Expected<'a> {
@@ -171,8 +185,8 @@ impl<'a> Expected<'a> {
         } else if let Ok(number) = expected.parse::<f64>() {
             Self::Value(Value::Float(number))
         } else {
-            let column = SimpleColumn::new(pair)?;
-            Self::Column(InputColumn::Simple(column))
+            let column = pair.as_str().into();
+            Self::Column(column)
         };
 
         Ok(expected)
@@ -181,7 +195,7 @@ impl<'a> Expected<'a> {
 
 #[derive(Debug)]
 pub struct Condition<'a> {
-    column: InputColumn,
+    column: Column,
     conditional: Conditional,
     expected: Expected<'a>,
 }
@@ -190,8 +204,7 @@ impl<'a> Condition<'a> {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         let mut inner = pair.into_inner();
         let column = inner.next().unwrap();
-        let column = SimpleColumn::new(column)?;
-        let column = InputColumn::Simple(column);
+        let column = column.as_str().into();
 
         let conditional = match inner.next().unwrap().as_span().as_str() {
             "=" => Conditional::Equals,
@@ -200,12 +213,24 @@ impl<'a> Condition<'a> {
 
         let expected = inner.next().unwrap();
         let expected = Expected::new(expected)?;
-
         Ok(Self {
             column,
             conditional,
             expected,
         })
+    }
+
+    fn matches(&self, row: &dyn Row) -> bool {
+        let value = row.get(&self.column).unwrap();
+
+        let other = match &self.expected {
+            Expected::Value(value) => value,
+            Expected::Column(col) => &row.get(col).unwrap(),
+        };
+
+        match self.conditional {
+            Conditional::Equals => value == *other,
+        }
     }
 }
 
@@ -256,6 +281,14 @@ impl<'a> WhereClause<'a> {
         }
 
         Ok(condition.unwrap())
+    }
+
+    pub fn matches(&self, row: &dyn Row) -> bool {
+        match self {
+            WhereClause::Condition(cond) => cond.matches(row),
+            WhereClause::And(a, b) => a.matches(row) && b.matches(row),
+            WhereClause::Or(a, b) => a.matches(row) || b.matches(row),
+        }
     }
 }
 
@@ -315,12 +348,12 @@ impl<'a> Select<'a> {
     pub fn execute(self, db: &'a Sqlite) -> Result<Box<dyn Table + '_>> {
         let Select {
             select,
-            from: FromClause { tables, conditions },
+            from,
             r#where,
             limit,
         } = self;
 
-        let view = View::new(select, tables, db)?;
+        let view = View::new(select, from, db, r#where)?;
 
         Ok(Box::new(view))
 

@@ -1,7 +1,9 @@
+use std::thread::current;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::{
-    command::{FromTable, InputColumn, SelectClause, SimpleColumn},
+    command::{FromClause, InputColumn, SelectClause, SimpleColumn, WhereClause},
     Column, Row, Schema, Sqlite, Table, Value,
 };
 
@@ -47,19 +49,22 @@ impl<'a> Row<'a> for ViewRow<'a> {
 pub struct View<'a> {
     names: Vec<String>,
     tables: Vec<Box<dyn Table + 'a>>,
+    r#where: Option<WhereClause<'a>>,
     schema: Schema,
     db: &'a Sqlite,
 }
 
 impl<'a> View<'a> {
-    pub fn new(select: SelectClause, from: Vec<FromTable>, db: &'a Sqlite) -> Result<Self> {
+    pub fn new(
+        select: SelectClause,
+        from: FromClause,
+        db: &'a Sqlite,
+        r#where: Option<WhereClause<'a>>,
+    ) -> Result<Self> {
         let names = from
+            .tables
             .iter()
-            .map(|table| match table {
-                FromTable::Simple(n) => n,
-                FromTable::Alias(n, _) => n,
-            })
-            .map(|name| name.to_string())
+            .map(|table| table.name().to_string())
             .collect::<Vec<_>>();
 
         let mut tables = names
@@ -77,16 +82,12 @@ impl<'a> View<'a> {
             .columns
             .iter()
             .map(|column| match column {
-                InputColumn::Wildcard => Ok(tables
+                InputColumn::Wildcard => Ok(names
                     .iter()
-                    .map(|table| match table.name() {
-                        Some(name) => Ok((name, &table.schema().0)),
-                        None => Err(anyhow!("ASED")),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flat_map(|(name, vec)| {
-                        vec.iter().map(|(col, r#type)| {
+                    .zip(tables.iter())
+                    .flat_map(|(name, table)| {
+                        let schema = table.schema();
+                        schema.0.iter().map(|(col, r#type)| {
                             (
                                 Column::Dotted {
                                     table: name.to_string(),
@@ -142,6 +143,7 @@ impl<'a> View<'a> {
         Ok(Self {
             names,
             tables,
+            r#where,
             schema: Schema(schema),
             db,
         })
@@ -180,9 +182,14 @@ impl<'a> Table for View<'a> {
             } else if self.tables.len() < self.names.len() {
                 let name = &self.names[self.tables.len()];
                 let new_table = self.db.search(name, vec![]).unwrap();
-                // new_table.advance();
 
                 self.tables.push(new_table);
+            } else if let Some(r#where) = &self.r#where {
+                if let Some(row) = self.current() {
+                    if r#where.matches(&row) {
+                        break;
+                    }
+                }
             } else {
                 break;
             }
@@ -192,10 +199,6 @@ impl<'a> Table for View<'a> {
     fn schema(&self) -> &Schema {
         &self.schema
     }
-
-    fn name(&self) -> Option<&str> {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -203,7 +206,7 @@ mod tests {
     use anyhow::{bail, Result};
 
     use crate::{
-        command::{FromTable, InputColumn, SelectClause, SimpleColumn},
+        command::{FromClause, FromTable, InputColumn, SelectClause, SimpleColumn},
         display::DisplayMode,
         Column, Sqlite, Table, Type,
     };
@@ -221,12 +224,15 @@ mod tests {
             ],
         };
 
-        let from = vec![
-            FromTable::Simple("apples".into()),
-            FromTable::Simple("oranges".into()),
-        ];
+        let from = FromClause {
+            tables: vec![
+                FromTable::Simple("apples".into()),
+                FromTable::Simple("oranges".into()),
+            ],
+            conditions: vec![],
+        };
 
-        let mut view = View::new(select, from, &db)?;
+        let mut view = View::new(select, from, &db, None)?;
 
         assert_eq!(
             view.schema().0,
@@ -255,12 +261,15 @@ mod tests {
             ],
         };
 
-        let from = vec![
-            FromTable::Simple("apples".into()),
-            FromTable::Simple("oranges".into()),
-        ];
+        let from = FromClause {
+            tables: vec![
+                FromTable::Simple("apples".into()),
+                FromTable::Simple("oranges".into()),
+            ],
+            conditions: vec![],
+        };
 
-        let view = View::new(select, from, &db)?;
+        let view = View::new(select, from, &db, None)?;
 
         assert_eq!(
             view.schema().0,
@@ -291,9 +300,12 @@ mod tests {
             columns: vec![InputColumn::Wildcard],
         };
 
-        let from = vec![FromTable::Simple("apples".into())];
+        let from = FromClause {
+            tables: vec![FromTable::Simple("apples".into())],
+            conditions: vec![],
+        };
 
-        let mut view = View::new(select, from, &db)?;
+        let mut view = View::new(select, from, &db, None)?;
 
         let mut base = db.search("apples", vec![])?;
 

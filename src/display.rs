@@ -11,7 +11,6 @@ pub enum DisplayMode {
 }
 
 struct DisplayOptions {
-    mode: DisplayMode,
     column_sizes: Option<Vec<usize>>,
     separators: [char; 3],
 }
@@ -170,10 +169,8 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
 
 pub fn display(f: &mut impl Write, table: impl Table, mode: DisplayMode) -> Result<()> {
     let options = DisplayOptions {
-        mode,
         column_sizes: None,
         separators: ['|', '-', '+'],
-        // padded: mode == DisplayMode::Table,
     };
 
     match mode {

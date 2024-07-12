@@ -170,7 +170,7 @@ impl From<&str> for Column {
                 let (table, column) = value.split_at(pos);
                 Self::Dotted {
                     table: table.to_string(),
-                    column: column[1..].to_string(),
+                    column: column[1..].trim_end().to_string(),
                 }
             }
             None => Self::String(value.to_string()),
@@ -314,8 +314,6 @@ pub trait Table: Debug {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>>;
     fn advance(&mut self);
     fn schema(&self) -> &Schema;
-    // TODO: mabye remove `name` and handle it in `From`
-    fn name(&self) -> Option<&str>;
 
     fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
         self.advance();
@@ -334,10 +332,6 @@ impl<T: Table + ?Sized> Table for Box<T> {
 
     fn schema(&self) -> &Schema {
         (**self).schema()
-    }
-
-    fn name(&self) -> Option<&str> {
-        (**self).name()
     }
 }
 
@@ -548,10 +542,6 @@ impl<'a> Table for BTreePage<'a> {
     fn schema(&self) -> &Schema {
         &self.schema
     }
-
-    fn name(&self) -> Option<&str> {
-        Some(&self.name)
-    }
 }
 
 #[derive(Debug)]
@@ -615,10 +605,6 @@ impl<'a> Table for IndexedRows<'a> {
 
     fn schema(&self) -> &Schema {
         &self.btreepage.schema
-    }
-
-    fn name(&self) -> Option<&str> {
-        Some(&self.btreepage.name)
     }
 }
 
