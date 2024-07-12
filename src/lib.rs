@@ -314,6 +314,8 @@ pub trait Table: Debug {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>>;
     fn advance(&mut self);
     fn schema(&self) -> &Schema;
+    // TODO: mabye remove `name` and handle it in `From`
+    fn name(&self) -> Option<&str>;
 
     fn next(&mut self) -> Option<Box<dyn Row<'_> + '_>> {
         self.advance();
@@ -332,6 +334,10 @@ impl<T: Table + ?Sized> Table for Box<T> {
 
     fn schema(&self) -> &Schema {
         (**self).schema()
+    }
+
+    fn name(&self) -> Option<&str> {
+        (**self).name()
     }
 }
 
@@ -542,6 +548,10 @@ impl<'a> Table for BTreePage<'a> {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
 }
 
 #[derive(Debug)]
@@ -606,6 +616,10 @@ impl<'a> Table for IndexedRows<'a> {
     fn schema(&self) -> &Schema {
         &self.btreepage.schema
     }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.btreepage.name)
+    }
 }
 
 #[derive(Debug)]
@@ -648,7 +662,12 @@ impl<'a> Cell<'a> {
 
 impl<'a> Row<'a> for Cell<'a> {
     fn get(&self, column: &Column) -> Result<Value<'a>> {
-        let Some(index) = self.schema.0.iter().position(|(col, _)| col == column) else {
+        let Some(index) = self
+            .schema
+            .0
+            .iter()
+            .position(|(col, _)| col.name() == column.name())
+        else {
             bail!("column: {column:?} not found")
         };
 

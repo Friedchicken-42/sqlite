@@ -43,9 +43,9 @@ fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) ->
         };
 
         if width == 0 {
-            write!(f, "{}{}", col.full(), opts.separators[0])?;
+            write!(f, "{}{}", col.name(), opts.separators[0])?;
         } else {
-            write!(f, " {:<width$} {}", col.full(), opts.separators[0])?;
+            write!(f, " {:<width$} {}", col.name(), opts.separators[0])?;
         }
     }
 
@@ -132,7 +132,7 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
     let mut sizes = schema
         .0
         .iter()
-        .map(|(col, _)| col.full().len())
+        .map(|(col, _)| col.name().len())
         .collect::<Vec<_>>();
 
     for values in &backup {

@@ -13,7 +13,7 @@ struct SQLParser;
 #[derive(Debug)]
 pub enum SimpleColumn {
     String(String),
-    Dotted(Vec<String>),
+    Dotted { table: String, column: String },
 }
 
 impl SimpleColumn {
@@ -24,10 +24,13 @@ impl SimpleColumn {
                 Ok(Self::String(string))
             }
             Rule::dotted_field => {
-                let inner = pair.into_inner();
-                let strings = inner.map(|p| p.as_span().as_str().to_string()).collect();
+                let mut inner = pair.into_inner();
+                let table = inner.next().unwrap();
+                let table = table.as_span().as_str().to_string();
+                let column = inner.next().unwrap();
+                let column = column.as_span().as_str().to_string();
 
-                Ok(Self::Dotted(strings))
+                Ok(Self::Dotted { table, column })
             }
             _ => bail!("[Simple Column] Malformed query"),
         }
