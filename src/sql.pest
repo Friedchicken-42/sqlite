@@ -38,7 +38,7 @@ tables = _{ table ~ ( join | ( "," ~  table) )* }
 
 from_clause = { "from" ~ tables }
 
-conditional = { "=" }
+conditional = { "<" | "<=" | "=" | "!=" | ">=" | ">" }
 
 condition = { ( dotted_field | identifier ) ~ conditional ~ ( dotted_field | string | identifier ) }
 

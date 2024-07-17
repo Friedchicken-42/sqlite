@@ -13,6 +13,7 @@ pub enum DisplayMode {
 struct DisplayOptions {
     column_sizes: Option<Vec<usize>>,
     separators: [char; 3],
+    full_column: bool,
 }
 
 fn display_spacer(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
@@ -41,11 +42,15 @@ fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) ->
             None => 0,
         };
 
-        if width == 0 {
-            write!(f, "{}{}", col.name(), opts.separators[0])?;
-        } else {
-            write!(f, " {:<width$} {}", col.name(), opts.separators[0])?;
-        }
+        let col = match opts.full_column {
+            true => &col.full(),
+            false => col.name(),
+        };
+
+        match width {
+            0 => write!(f, "{}{}", col, opts.separators[0]),
+            _ => write!(f, " {:<width$} {}", col, opts.separators[0]),
+        }?;
     }
 
     writeln!(f)?;
@@ -131,7 +136,10 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
     let mut sizes = schema
         .0
         .iter()
-        .map(|(col, _)| col.name().len())
+        .map(|(col, _)| match opts.full_column {
+            true => col.full().len(),
+            false => col.name().len(),
+        })
         .collect::<Vec<_>>();
 
     for values in &backup {
@@ -171,6 +179,7 @@ pub fn display(f: &mut impl Write, table: impl Table, mode: DisplayMode) -> Resu
     let options = DisplayOptions {
         column_sizes: None,
         separators: ['|', '-', '+'],
+        full_column: true,
     };
 
     match mode {

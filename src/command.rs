@@ -86,7 +86,7 @@ impl SelectClause {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FromTable {
     Simple(String),
     Alias(String, String),
@@ -161,7 +161,12 @@ impl<'a> FromClause<'a> {
 
 #[derive(Debug, PartialEq)]
 pub enum Conditional {
-    Equals,
+    Less,
+    LessEqual,
+    Equal,
+    NotEqual,
+    GreaterEqual,
+    Greater,
 }
 
 #[derive(Debug)]
@@ -207,7 +212,12 @@ impl<'a> Condition<'a> {
         let column = column.as_str().into();
 
         let conditional = match inner.next().unwrap().as_span().as_str() {
-            "=" => Conditional::Equals,
+            "<" => Conditional::Less,
+            "<=" => Conditional::LessEqual,
+            "=" => Conditional::Equal,
+            "!=" => Conditional::NotEqual,
+            ">=" => Conditional::GreaterEqual,
+            ">" => Conditional::Greater,
             _ => bail!("[Condition] Malformed query"),
         };
 
@@ -229,7 +239,12 @@ impl<'a> Condition<'a> {
         };
 
         match self.conditional {
-            Conditional::Equals => value == *other,
+            Conditional::Less => value < *other,
+            Conditional::LessEqual => value <= *other,
+            Conditional::Equal => value == *other,
+            Conditional::NotEqual => value != *other,
+            Conditional::GreaterEqual => value >= *other,
+            Conditional::Greater => value > *other,
         }
     }
 }
