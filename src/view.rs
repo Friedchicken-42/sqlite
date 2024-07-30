@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::{
     command::{FromClause, FromTable, InputColumn, SelectClause, SimpleColumn, WhereClause},
-    Column, Row, Schema, Sqlite, Table, Type, Value,
+    Column, Key, Row, Schema, SchemaRow, Sqlite, Table, Value,
 };
 
 #[derive(Debug)]
@@ -17,15 +17,13 @@ impl<'a> Row<'a> for ViewRow<'a> {
     fn get(&self, column: &Column) -> Result<Value<'a>> {
         let pos = self
             .schema
-            .0
             .iter()
-            .position(|(col, _)| column.name() == col.name());
+            .position(|row| column.name() == row.column.name());
 
         let Some(index) = pos else {
             bail!("missing column: {column:?}")
         };
 
-        // TODO: fix extra cloning
         let name = self.output[index].clone();
 
         let column = match column {
@@ -58,29 +56,28 @@ impl<'a> Row<'a> for ViewRow<'a> {
 
     fn all(&self) -> Result<Vec<Value<'a>>> {
         self.schema
-            .0
             .iter()
-            .map(|(name, _)| self.get(name))
+            .map(|row| self.get(&row.column))
             .collect::<Result<Vec<_>>>()
     }
 }
 
-fn simple_column_pair(
+fn simple_column_schema(
     column: &SimpleColumn,
     tables: &[Box<dyn Table + '_>],
     input: &[FromTable],
-) -> Result<(Column, Type)> {
+) -> Result<SchemaRow> {
     match column {
         SimpleColumn::String(name) => {
-            let pairs = tables
+            let rows = tables
                 .iter()
-                .flat_map(|table| &table.schema().0)
-                .filter(|(col, _)| col.name() == name)
+                .flat_map(|table| table.schema())
+                .filter(|row| row.column.name() == name)
                 .collect::<Vec<_>>();
 
-            match pairs[..] {
+            match rows[..] {
                 [] => bail!("column {name:?} not found"),
-                [pair] => Ok(pair.clone()),
+                [row] => Ok(row.clone()),
                 _ => bail!(""),
             }
         }
@@ -90,20 +87,19 @@ fn simple_column_pair(
                 .position(|tbl| *tbl.alias() == *table)
                 .ok_or(anyhow!("Missing table {table:?}"))?;
 
-            let (_, r#type) = tables[index]
+            let schema = tables[index]
                 .schema()
-                .0
                 .iter()
-                .find(|(col, _)| col.name() == *column)
+                .find(|row| row.column.name() == *column)
                 .ok_or(anyhow!("Missing column {column:?}"))?;
 
-            Ok((
-                Column::Dotted {
+            Ok(SchemaRow {
+                column: Column::Dotted {
                     table: table.to_string(),
                     column: column.to_string(),
                 },
-                *r#type,
-            ))
+                ..schema.clone()
+            })
         }
     }
 }
@@ -113,7 +109,7 @@ fn build_schema(
     tables: &[Box<dyn Table + '_>],
     input: &[FromTable],
 ) -> Result<(Schema, Vec<String>)> {
-    let (schema, output): (Vec<(Column, Type)>, Vec<String>) = select
+    let (schema, output): (Schema, Vec<String>) = select
         .columns
         .iter()
         .map(|column| match column {
@@ -122,36 +118,41 @@ fn build_schema(
                 .zip(tables.iter())
                 .flat_map(|(from, table)| {
                     let schema = table.schema();
-                    schema.0.iter().map(|(col, r#type)| {
+                    schema.iter().map(|row| {
                         (
-                            Column::Dotted {
-                                table: from.alias().to_string(),
-                                column: col.name().to_string(),
+                            SchemaRow {
+                                column: Column::Dotted {
+                                    table: from.alias().to_string(),
+                                    column: row.column.name().to_string(),
+                                },
+                                r#type: row.r#type,
+                                key: Key::Other,
                             },
-                            *r#type,
-                            col.name().to_string(),
+                            row.column.name().to_string(),
                         )
                     })
                 })
                 .collect::<Vec<_>>()),
             InputColumn::Simple(column) => {
-                let (column, r#type) = simple_column_pair(column, tables, input)?;
-                let name = column.name().to_string();
-                Ok(vec![(column, r#type, name)])
+                let schema = simple_column_schema(column, tables, input)?;
+                let name = schema.column.name().to_string();
+                Ok(vec![(schema, name)])
             }
             InputColumn::Alias(column, alias) => {
-                let (column, r#type) = simple_column_pair(column, tables, input)?;
-                let name = column.name().to_string();
+                let schema = simple_column_schema(column, tables, input)?;
+                let name = schema.column.name().to_string();
 
                 Ok(vec![(
-                    match column {
-                        Column::String(_) => Column::String(alias.to_string()),
-                        Column::Dotted { table, column } => Column::Dotted {
-                            table,
-                            column: alias.to_string(),
+                    SchemaRow {
+                        column: match schema.column {
+                            Column::String(_) => Column::String(alias.to_string()),
+                            Column::Dotted { table, column } => Column::Dotted {
+                                table,
+                                column: alias.to_string(),
+                            },
                         },
+                        ..schema
                     },
-                    r#type,
                     name,
                 )])
             }
@@ -159,10 +160,10 @@ fn build_schema(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .map(|item| ((item.0, item.1), item.2))
+        // .map(|item| ((item.0, item.1, item.2), item.3))
         .unzip();
 
-    Ok((Schema(schema), output))
+    Ok((schema, output))
 }
 
 #[derive(Debug)]
@@ -267,7 +268,7 @@ mod tests {
     use crate::{
         command::{FromClause, FromTable, InputColumn, SelectClause, SimpleColumn},
         display::DisplayMode,
-        Column, Sqlite, Table, Type,
+        Column, Key, SchemaRow, Sqlite, Table, Type,
     };
 
     use super::View;
@@ -294,10 +295,18 @@ mod tests {
         let mut view = View::new(select, from, &db, None)?;
 
         assert_eq!(
-            view.schema().0,
-            [
-                ("color".into(), Type::Text),
-                ("description".into(), Type::Text),
+            view.schema(),
+            &[
+                SchemaRow {
+                    column: "color".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "description".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
             ]
         );
 
@@ -331,15 +340,43 @@ mod tests {
         let view = View::new(select, from, &db, None)?;
 
         assert_eq!(
-            view.schema().0,
-            [
-                ("apples.id".into(), Type::Integer),
-                ("apples.name".into(), Type::Text),
-                ("apples.color".into(), Type::Text),
-                ("oranges.id".into(), Type::Integer),
-                ("oranges.name".into(), Type::Text),
-                ("oranges.description".into(), Type::Text),
-                (Column::String("color".into()), Type::Text),
+            view.schema(),
+            &[
+                SchemaRow {
+                    column: "apples.id".into(),
+                    r#type: Type::Integer,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "apples.name".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "apples.color".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "oranges.id".into(),
+                    r#type: Type::Integer,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "oranges.name".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: "oranges.description".into(),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
+                SchemaRow {
+                    column: Column::String("color".into()),
+                    r#type: Type::Text,
+                    key: Key::Other
+                },
             ]
         );
 
@@ -401,7 +438,14 @@ mod tests {
 
         let mut view = View::new(select, from, &db, None)?;
 
-        assert_eq!(view.schema().0, [("a.id".into(), Type::Integer)]);
+        assert_eq!(
+            view.schema(),
+            &[SchemaRow {
+                column: "a.id".into(),
+                r#type: Type::Integer,
+                key: Key::Other
+            }]
+        );
 
         while let Some(row) = view.next() {
             assert!(row.get(&"id".into()).is_ok());
@@ -430,7 +474,14 @@ mod tests {
 
         let mut view = View::new(select, from, &db, None)?;
 
-        assert_eq!(view.schema().0, [("test".into(), Type::Integer)]);
+        assert_eq!(
+            view.schema(),
+            &[SchemaRow {
+                column: "test".into(),
+                r#type: Type::Integer,
+                key: Key::Other
+            }]
+        );
 
         while let Some(row) = view.next() {
             assert!(row.get(&"test".into()).is_ok());

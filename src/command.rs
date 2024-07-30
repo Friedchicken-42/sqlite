@@ -4,7 +4,10 @@ use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
-use crate::{display::DisplayMode, view::View, Column, Row, Schema, Sqlite, Table, Type, Value};
+use crate::{
+    display::DisplayMode, view::View, Column, Key, Row, Schema, SchemaRow, Sqlite, Table, Type,
+    Value,
+};
 
 #[derive(Parser)]
 #[grammar = "sql.pest"]
@@ -411,7 +414,7 @@ pub struct CreateTable {
 impl CreateTable {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
         let mut table = None;
-        let mut schema = vec![];
+        let mut schema = Schema::new();
 
         for p in pair.into_inner() {
             match p.as_rule() {
@@ -430,7 +433,12 @@ impl CreateTable {
                         t => bail!("Missing type: {t:?}"),
                     };
 
-                    schema.push((name.as_str().into(), r#type));
+                    // add primary key to `table_column`
+                    schema.push(SchemaRow {
+                        column: name.as_str().into(),
+                        r#type,
+                        key: Key::Other,
+                    });
                 }
                 _ => bail!("[Create Table Command] Malformed query"),
             }
@@ -439,8 +447,6 @@ impl CreateTable {
         let Some(table) = table else {
             bail!("[Create Table Command] Malformed query")
         };
-
-        let schema = Schema(schema);
 
         Ok(CreateTable { table, schema })
     }

@@ -194,8 +194,21 @@ impl Column {
     }
 }
 
-#[derive(Debug)]
-pub struct Schema(Vec<(Column, Type)>);
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Key {
+    Primary,
+    Foreign, // add field
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaRow {
+    column: Column,
+    r#type: Type,
+    key: Key,
+}
+
+type Schema = Vec<SchemaRow>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum PageType {
@@ -650,14 +663,13 @@ impl<'a> Row<'a> for Cell<'a> {
     fn get(&self, column: &Column) -> Result<Value<'a>> {
         let Some(index) = self
             .schema
-            .0
             .iter()
-            .position(|(col, _)| col.name() == column.name())
+            .position(|row| row.column.name() == column.name())
         else {
             bail!("column: {column:?} not found")
         };
 
-        let (_, r#type) = self.schema.0[index];
+        let r#type = self.schema[index].r#type;
         let data = self.records[index];
 
         if data.is_empty() && column.name() == "id" {
@@ -680,9 +692,8 @@ impl<'a> Row<'a> for Cell<'a> {
 
     fn all(&self) -> Result<Vec<Value<'a>>> {
         self.schema
-            .0
             .iter()
-            .map(|(col, _)| self.get(col))
+            .map(|row| self.get(&row.column))
             .collect::<Result<Vec<_>>>()
     }
 }
@@ -728,13 +739,33 @@ impl Sqlite {
     }
 
     pub fn root(&self) -> Result<BTreePage> {
-        let schema = Schema(vec![
-            ("type".into(), Type::Text),
-            ("name".into(), Type::Text),
-            ("tbl_name".into(), Type::Text),
-            ("rootpage".into(), Type::Integer),
-            ("sql".into(), Type::Text),
-        ]);
+        let schema = vec![
+            SchemaRow {
+                column: "type".into(),
+                r#type: Type::Text,
+                key: Key::Other,
+            },
+            SchemaRow {
+                column: "name".into(),
+                r#type: Type::Text,
+                key: Key::Primary,
+            },
+            SchemaRow {
+                column: "tbl_name".into(),
+                r#type: Type::Text,
+                key: Key::Other,
+            },
+            SchemaRow {
+                column: "rootpage".into(),
+                r#type: Type::Integer,
+                key: Key::Other,
+            },
+            SchemaRow {
+                column: "sql".into(),
+                r#type: Type::Text,
+                key: Key::Other,
+            },
+        ];
 
         BTreePage::read(self, 1, "root".into(), schema)
     }
@@ -892,17 +923,24 @@ impl Sqlite {
             let table = self.table(&table)?;
 
             for col in columns {
-                for (column, r#type) in &table.schema.0 {
-                    if col == column.name() {
-                        schema.push((col.as_str().into(), *r#type));
+                for row in &table.schema {
+                    if col == row.column.name() {
+                        schema.push(SchemaRow {
+                            column: col.as_str().into(),
+                            ..row.clone()
+                        });
                     }
                 }
             }
 
             // why the FUCK is this not a varint (even if it should be)?
             // blob.iter().fold(0, |acc, x| (acc << 8) + x)
-            schema.push(("index".into(), Type::Blob));
-            let schema = Schema(schema);
+            schema.push(SchemaRow {
+                column: "index".into(),
+                r#type: Type::Blob,
+                key: Key::Other,
+            });
+
             BTreePage::read(self, rootpage as usize, name.into(), schema)
         } else {
             bail!("table {name:?} not found");
@@ -947,8 +985,8 @@ impl Sqlite {
 
             match Command::parse(&sql.to_lowercase())? {
                 Command::CreateTable(CreateTable { schema, .. }) => {
-                    for (name, r#type) in schema.0.iter() {
-                        println!("{name:?}: {:?}", r#type);
+                    for row in schema.iter() {
+                        println!("{row:?}");
                     }
                 }
                 Command::CreateIndex(CreateIndex { table, columns, .. }) => {

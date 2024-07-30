@@ -36,15 +36,15 @@ fn display_spacer(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
 fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) -> Result<()> {
     write!(f, "{}", opts.separators[0])?;
 
-    for (i, (col, _)) in schema.0.iter().enumerate() {
+    for (i, row) in schema.iter().enumerate() {
         let width = match &opts.column_sizes {
             Some(arr) => arr[i],
             None => 0,
         };
 
         let col = match opts.full_column {
-            true => &col.full(),
-            false => col.name(),
+            true => &row.column.full(),
+            false => row.column.name(),
         };
 
         match width {
@@ -134,11 +134,10 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
     let schema = table.schema();
 
     let mut sizes = schema
-        .0
         .iter()
-        .map(|(col, _)| match opts.full_column {
-            true => col.full().len(),
-            false => col.name().len(),
+        .map(|row| match opts.full_column {
+            true => row.column.full().len(),
+            false => row.column.name().len(),
         })
         .collect::<Vec<_>>();
 
