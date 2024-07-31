@@ -9,7 +9,7 @@ string = {
     "\"" ~ (ASCII_ALPHANUMERIC | " " | "_" )* ~ "\"" 
 }
 
-function = { identifier ~ "(" ~ identifier ~ ")" }
+function = { identifier ~ "(" ~ field ~ ")" }
 
 dotted_field = { identifier ~ ("." ~ identifier)+ }
 
@@ -25,9 +25,6 @@ fields = _{ field ~ ("," ~ field)* }
 
 select_clause = { "select" ~ fields }
 
-// table_as = { identifier ~ "as" ~ identifier }
-// table_concat = ${ identifier ~ identifier }
-// aliased_table = @{ table_as | table_concat }
 aliased_table = { identifier ~ "as" ~ identifier }
 
 table = _{ aliased_table | identifier } 
@@ -50,7 +47,9 @@ where_clause = { "where" ~ binary_expression }
 
 limit_clause = { "limit" ~ number }
 
-select_query = { select_clause ~  from_clause ~ where_clause? ~ limit_clause? }
+groupby_clause = { "group by" ~ ( dotted_field | identifier ) ~ ( "," ~ ( dotted_field | identifier ) )* }
+
+select_query = { select_clause ~  from_clause ~ where_clause? ~ limit_clause? ~ groupby_clause? }
 
 table_column = { ( string | identifier ) ~ identifier ~ ASCII_ALPHANUMERIC* }
 

@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, num::NonZeroUsize};
 
 use anyhow::{bail, Result};
 use pest::{iterators::Pair, Parser};
@@ -13,10 +13,17 @@ use crate::{
 #[grammar = "sql.pest"]
 struct SQLParser;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SimpleColumn {
     String(String),
-    Dotted { table: String, column: String },
+    Dotted {
+        table: String,
+        column: String,
+    },
+    Function {
+        name: String,
+        param: Box<InputColumn>,
+    },
 }
 
 impl SimpleColumn {
@@ -35,12 +42,23 @@ impl SimpleColumn {
 
                 Ok(Self::Dotted { table, column })
             }
+            Rule::function => {
+                let mut inner = pair.into_inner();
+                let name = inner.next().unwrap();
+                let name = name.as_span().as_str().to_string();
+
+                let param = inner.next().unwrap();
+                let param = InputColumn::new(param)?;
+                let param = Box::new(param);
+
+                Ok(Self::Function { name, param })
+            }
             _ => bail!("[Simple Column] Malformed query"),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum InputColumn {
     Wildcard,
     Alias(SimpleColumn, String),
@@ -312,16 +330,26 @@ impl<'a> WhereClause<'a> {
 
 #[derive(Debug)]
 pub struct LimitClause {
-    pub limit: usize,
+    pub limit: NonZeroUsize,
 }
 
 impl LimitClause {
-    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+    fn new(pair: Pair<'_, Rule>) -> Result<Option<Self>> {
         let number = pair.into_inner().next().unwrap();
         let number = number.as_span().as_str();
         let limit = str::parse::<usize>(number)?;
+        let limit = NonZeroUsize::new(limit);
 
-        Ok(LimitClause { limit })
+        Ok(limit.map(|limit| LimitClause { limit }))
+    }
+}
+
+#[derive(Debug)]
+pub struct GroupbyClause {}
+
+impl GroupbyClause {
+    fn new(pair: Pair<'_, Rule>) -> Result<Self> {
+        todo!()
     }
 }
 
@@ -331,6 +359,7 @@ pub struct Select<'a> {
     pub from: FromClause<'a>,
     pub r#where: Option<WhereClause<'a>>,
     pub limit: Option<LimitClause>,
+    pub groupby: Option<GroupbyClause>,
 }
 
 impl<'a> Select<'a> {
@@ -339,6 +368,7 @@ impl<'a> Select<'a> {
         let mut from = None;
         let mut r#where = None;
         let mut limit = None;
+        let mut groupby = None;
 
         for p in pair.into_inner() {
             match p.as_rule() {
@@ -346,7 +376,8 @@ impl<'a> Select<'a> {
                 Rule::select_clause => select = Some(SelectClause::new(p)?),
                 Rule::from_clause => from = Some(FromClause::new(p)?),
                 Rule::where_clause => r#where = Some(WhereClause::new(p)?),
-                Rule::limit_clause => limit = Some(LimitClause::new(p)?),
+                Rule::limit_clause => limit = LimitClause::new(p)?,
+                Rule::groupby_clause => groupby = Some(GroupbyClause::new(p)?),
                 _ => bail!("[Select Command] Malformed query"),
             }
         }
@@ -360,48 +391,18 @@ impl<'a> Select<'a> {
             from,
             r#where,
             limit,
+            groupby,
         })
     }
 
     pub fn execute(self, db: &'a Sqlite) -> Result<Box<dyn Table + '_>> {
-        let Select {
-            select,
-            from,
-            r#where,
-            limit,
-        } = self;
-
-        let view = View::new(select, from, db, r#where)?;
-
-        Ok(Box::new(view))
-
-        // let view = View::new(select, tables, db)?;
-        // let table = Table::View(view);
-        //
-        // use std::io::Cursor;
-        // let mut f = Cursor::new(vec![]);
-        // table.display(&mut f, DisplayMode::Table)?;
-        // println!("{}", std::str::from_utf8(f.get_ref())?);
-
-        // let condition = conditions
-        //     .into_iter()
-        //     .fold(None, |acc, cond| match (acc, cond) {
-        //         (None, c) => Some(WhereClause::Condition(c)),
-        //         (Some(a), b) => {
-        //             let a = Box::new(a);
-        //             let c = Box::new(WhereClause::Condition(b));
-        //             Some(WhereClause::And(a, c))
-        //         }
-        //     });
-        //
-        // let r#where = match (r#where, condition) {
-        //     (None, None) => None,
-        //     (Some(r), Some(c)) => Some(WhereClause::And(Box::new(r), Box::new(c))),
-        //     (Some(x), _) | (_, Some(x)) => Some(x),
-        // };
-        //
-        // dbg!(&r#where);
-        // dbg!(&tables);
+        if self.select.columns == vec![InputColumn::Wildcard] && self.from.tables.len() == 1 {
+            let table = &self.from.tables[0];
+            db.search(table.name(), vec![])
+        } else {
+            let view = View::new(self, db)?;
+            Ok(Box::new(view))
+        }
     }
 }
 

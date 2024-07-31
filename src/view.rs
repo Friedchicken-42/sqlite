@@ -1,8 +1,10 @@
+use std::num::NonZeroUsize;
+
 use anyhow::{anyhow, bail, Result};
 
 use crate::{
-    command::{FromClause, FromTable, InputColumn, SelectClause, SimpleColumn, WhereClause},
-    Column, Key, Row, Schema, SchemaRow, Sqlite, Table, Value,
+    command::{FromTable, InputColumn, Select, SelectClause, SimpleColumn, WhereClause},
+    Column, Key, Row, Schema, SchemaRow, Sqlite, Table, TableState, Value,
 };
 
 #[derive(Debug)]
@@ -101,6 +103,7 @@ fn simple_column_schema(
                 ..schema.clone()
             })
         }
+        SimpleColumn::Function { .. } => bail!("cannot compute a function inside of a view"),
     }
 }
 
@@ -146,7 +149,7 @@ fn build_schema(
                     SchemaRow {
                         column: match schema.column {
                             Column::String(_) => Column::String(alias.to_string()),
-                            Column::Dotted { table, column } => Column::Dotted {
+                            Column::Dotted { table, .. } => Column::Dotted {
                                 table,
                                 column: alias.to_string(),
                             },
@@ -173,16 +176,21 @@ pub struct View<'a> {
     tables: Vec<Box<dyn Table + 'a>>,
     r#where: Option<WhereClause<'a>>,
     schema: Schema,
+    limit: Option<NonZeroUsize>,
+    state: TableState,
     db: &'a Sqlite,
 }
 
 impl<'a> View<'a> {
-    pub fn new(
-        select: SelectClause,
-        from: FromClause,
-        db: &'a Sqlite,
-        r#where: Option<WhereClause<'a>>,
-    ) -> Result<Self> {
+    pub fn new(select: Select<'a>, db: &'a Sqlite) -> Result<Self> {
+        let Select {
+            select,
+            from,
+            r#where,
+            limit,
+            groupby,
+        } = select;
+
         let input = from.tables.clone();
 
         let mut tables = input
@@ -198,12 +206,16 @@ impl<'a> View<'a> {
 
         let (schema, output) = build_schema(select, &tables, &input)?;
 
+        let limit = limit.map(|clause| clause.limit);
+
         Ok(Self {
             input,
             output,
             tables,
             r#where,
             schema,
+            limit,
+            state: TableState::Next(1),
             db,
         })
     }
@@ -211,7 +223,7 @@ impl<'a> View<'a> {
 
 impl<'a> Table for View<'a> {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
-        if self.tables.is_empty() {
+        if self.state == TableState::End {
             return None;
         }
 
@@ -230,8 +242,16 @@ impl<'a> Table for View<'a> {
     }
 
     fn advance(&mut self) {
+        self.state = match (self.limit, &self.state) {
+            (Some(limit), TableState::Next(index)) if *index > limit.get() => TableState::End,
+            (_, TableState::Next(index)) => TableState::Next(index + 1),
+            (_, TableState::Start) => TableState::Next(1),
+            (_, TableState::End) => TableState::End,
+        };
+
         loop {
             if self.tables.is_empty() {
+                self.state = TableState::End;
                 break;
             }
 
@@ -266,33 +286,21 @@ mod tests {
     use anyhow::{bail, Result};
 
     use crate::{
-        command::{FromClause, FromTable, InputColumn, SelectClause, SimpleColumn},
-        display::DisplayMode,
-        Column, Key, SchemaRow, Sqlite, Table, Type,
+        command::Command, display::DisplayMode, Column, Key, SchemaRow, Sqlite, Table, Type,
     };
 
     use super::View;
 
     #[test]
-    fn view_get() -> Result<()> {
+    fn get() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
 
-        let select = SelectClause {
-            columns: vec![
-                InputColumn::Simple(SimpleColumn::String("color".into())),
-                InputColumn::Simple(SimpleColumn::String("description".into())),
-            ],
+        let query = "select color, description from apples join oranges";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let from = FromClause {
-            tables: vec![
-                FromTable::Simple("apples".into()),
-                FromTable::Simple("oranges".into()),
-            ],
-            conditions: vec![],
-        };
-
-        let mut view = View::new(select, from, &db, None)?;
+        let mut view = View::new(select, &db)?;
 
         assert_eq!(
             view.schema(),
@@ -319,25 +327,43 @@ mod tests {
     }
 
     #[test]
-    fn view_all() -> Result<()> {
+    fn wildcard() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
 
-        let select = SelectClause {
-            columns: vec![
-                InputColumn::Wildcard,
-                InputColumn::Simple(SimpleColumn::String("color".into())),
-            ],
+        let query = "select * from apples";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let from = FromClause {
-            tables: vec![
-                FromTable::Simple("apples".into()),
-                FromTable::Simple("oranges".into()),
-            ],
-            conditions: vec![],
+        let mut view = View::new(select, &db)?;
+
+        let mut base = db.search("apples", vec![])?;
+
+        loop {
+            match (view.next(), base.next()) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.get(&"id".into())?, b.get(&"id".into())?);
+                    assert_eq!(a.get(&"name".into())?, b.get(&"name".into())?);
+                    assert_eq!(a.get(&"color".into())?, b.get(&"color".into())?);
+                }
+                (None, None) => break,
+                _ => bail!("view differ from table"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn all_columns() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+
+        let query = "select *, color from apples join oranges";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let view = View::new(select, from, &db, None)?;
+        let view = View::new(select, &db)?;
 
         assert_eq!(
             view.schema(),
@@ -389,54 +415,37 @@ mod tests {
     }
 
     #[test]
-    fn view_single() -> Result<()> {
+    fn limit() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
 
-        let select = SelectClause {
-            columns: vec![InputColumn::Wildcard],
+        let query = "select id from apples limit 2";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let from = FromClause {
-            tables: vec![FromTable::Simple("apples".into())],
-            conditions: vec![],
-        };
+        let mut view = View::new(select, &db)?;
 
-        let mut view = View::new(select, from, &db, None)?;
-
-        let mut base = db.search("apples", vec![])?;
-
-        loop {
-            match (view.next(), base.next()) {
-                (Some(a), Some(b)) => {
-                    assert_eq!(a.get(&"id".into())?, b.get(&"id".into())?);
-                    assert_eq!(a.get(&"name".into())?, b.get(&"name".into())?);
-                    assert_eq!(a.get(&"color".into())?, b.get(&"color".into())?);
-                }
-                (None, None) => break,
-                _ => bail!("view differ from table"),
-            }
+        let mut count = 0;
+        while let Some(row) = view.next() {
+            assert!(row.get(&"id".into()).is_ok());
+            count += 1;
         }
+
+        assert_eq!(count, 2);
 
         Ok(())
     }
 
     #[test]
-    fn view_alias_table() -> Result<()> {
+    fn alias_table() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
 
-        let select = SelectClause {
-            columns: vec![InputColumn::Simple(SimpleColumn::Dotted {
-                table: "a".to_string(),
-                column: "id".to_string(),
-            })],
+        let query = "select a.id from apples as a";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let from = FromClause {
-            tables: vec![FromTable::Alias("apples".into(), "a".into())],
-            conditions: vec![],
-        };
-
-        let mut view = View::new(select, from, &db, None)?;
+        let mut view = View::new(select, &db)?;
 
         assert_eq!(
             view.schema(),
@@ -457,22 +466,15 @@ mod tests {
     }
 
     #[test]
-    fn view_alias_column() -> Result<()> {
+    fn alias_column() -> Result<()> {
         let db = Sqlite::read("sample.db")?;
 
-        let select = SelectClause {
-            columns: vec![InputColumn::Alias(
-                SimpleColumn::String("id".to_string()),
-                "test".to_string(),
-            )],
+        let query = "select id as test from apples";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
         };
 
-        let from = FromClause {
-            tables: vec![FromTable::Simple("apples".to_string())],
-            conditions: vec![],
-        };
-
-        let mut view = View::new(select, from, &db, None)?;
+        let mut view = View::new(select, &db)?;
 
         assert_eq!(
             view.schema(),

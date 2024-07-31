@@ -1,5 +1,6 @@
 pub mod command;
 mod display;
+mod materialized;
 mod view;
 
 use anyhow::{bail, Result};
@@ -10,6 +11,7 @@ use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
+    hash::Hash,
     io::{Read, Seek, SeekFrom, Write},
 };
 use tracing::{event, span, Level};
@@ -139,6 +141,19 @@ impl<'a> Ord for Value<'a> {
             (_, Value::Integer(_) | Value::Float(_)) => Ordering::Greater,
             (Value::Text(_), _) => Ordering::Less,
             (_, Value::Text(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl<'a> Hash for Value<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Float(f) if f.is_nan() => (-1_i8).hash(state),
+            Value::Float(f) => {
+                let bytes = f64::to_be_bytes(*f);
+                bytes.hash(state);
+            }
+            v => core::mem::discriminant(v).hash(state),
         }
     }
 }
@@ -363,8 +378,8 @@ impl<'a, T: Row<'a> + ?Sized> Row<'a> for Box<T> {
     }
 }
 
-#[derive(Debug)]
-enum BTreeState {
+#[derive(Debug, PartialEq)]
+enum TableState {
     Start,
     Next(usize),
     End,
@@ -375,7 +390,7 @@ pub struct BTreePage<'a> {
     pub name: String,
     pages: Vec<Page>,
     indexes: Vec<usize>,
-    state: BTreeState,
+    state: TableState,
     schema: Schema,
     db: &'a Sqlite,
 }
@@ -388,7 +403,7 @@ impl<'a> BTreePage<'a> {
             name,
             pages: vec![first_page],
             indexes: vec![0],
-            state: BTreeState::Start,
+            state: TableState::Start,
             schema,
             db,
         })
@@ -408,7 +423,7 @@ impl<'a> BTreePage<'a> {
     {
         loop {
             if self.pages.is_empty() {
-                self.state = BTreeState::End;
+                self.state = TableState::End;
                 return;
             }
 
@@ -423,7 +438,7 @@ impl<'a> BTreePage<'a> {
                     } else {
                         let pointers = &page.pointers;
                         let offset = pointers[*index];
-                        self.state = BTreeState::Next(offset);
+                        self.state = TableState::Next(offset);
 
                         *index += 1;
 
@@ -443,7 +458,7 @@ impl<'a> BTreePage<'a> {
                                     Ordering::Less => {}
                                     Ordering::Equal => return,
                                     Ordering::Greater => {
-                                        self.state = BTreeState::End;
+                                        self.state = TableState::End;
                                         return;
                                     }
                                 }
@@ -472,7 +487,7 @@ impl<'a> BTreePage<'a> {
                             PageType::IndexInterior => {
                                 let pointers = &page.pointers;
                                 let offset = pointers[(*index - 1) / 2];
-                                self.state = BTreeState::Next(offset);
+                                self.state = TableState::Next(offset);
 
                                 *index += 1;
 
@@ -491,7 +506,7 @@ impl<'a> BTreePage<'a> {
                     } else {
                         let pointers = &page.pointers;
                         let offset = pointers[*index / 2];
-                        self.state = BTreeState::Next(offset);
+                        self.state = TableState::Next(offset);
 
                         *index += 1;
 
@@ -537,8 +552,8 @@ impl<'a> BTreePage<'a> {
 impl<'a> Table for BTreePage<'a> {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
         match self.state {
-            BTreeState::Start | BTreeState::End => None,
-            BTreeState::Next(offset) => {
+            TableState::Start | TableState::End => None,
+            TableState::Next(offset) => {
                 let page = self.pages.last().unwrap();
 
                 let cell = page.cell(offset, &self.schema);
@@ -612,7 +627,7 @@ impl<'a> Table for IndexedRows<'a> {
     fn advance(&mut self) {
         match self.btreeindex.next() {
             Some(rowid) => self.btreepage.next_by_rowid(rowid),
-            None => self.btreepage.state = BTreeState::End,
+            None => self.btreepage.state = TableState::End,
         }
     }
 
