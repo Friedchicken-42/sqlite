@@ -17,13 +17,10 @@ pub struct Materialized<'a> {
 }
 
 impl<'a> Materialized<'a> {
-    pub fn new(input: Select, table: Box<dyn Table + '_>) -> Result<Self> {
-        let tables = vec![&table];
-
-        let (schema, columns) = build_schema(&input.select, &tables, &input.from.tables)?;
+    pub fn new(input: Select, mut table: Box<dyn Table + '_>) -> Result<Self> {
+        let (schema, columns) = build_schema(&input.select, &[&table], &input.from.tables)?;
 
         let mut data: Vec<Vec<Value>> = vec![];
-        let mut table = table;
 
         let table_name = input.from.tables[0].clone();
 
@@ -64,35 +61,50 @@ impl<'a> Materialized<'a> {
                 } else {
                     bail!("missing column {:?} in input", column.name());
                 }
+            }
 
-                for (i, _) in schema.iter().enumerate() {
-                    if new_row[i].is_none() {
-                        let column = &columns[i];
-                        match column {
-                            Column::Function(f) => {
-                                previous = data.iter().position(|row| {
-                                    for (i, value) in row.iter().enumerate() {
-                                        if let Some(v) = &new_row[i] {
-                                            if v != value {
-                                                return false;
-                                            }
+            for (i, _) in schema.iter().enumerate() {
+                if new_row[i].is_none() {
+                    let column = &columns[i];
+                    match column {
+                        Column::Function(f) => {
+                            previous = data.iter().position(|row| {
+                                for (i, value) in row.iter().enumerate() {
+                                    if let Some(v) = &new_row[i] {
+                                        if v != value {
+                                            return false;
                                         }
                                     }
+                                }
 
-                                    true
-                                });
+                                true
+                            });
 
-                                let new = match previous {
-                                    Some(index) => {
-                                        let old = &data[index];
-                                        f.apply(&new_row, old, &columns, i)?
-                                    }
-                                    None => f.default(&new_row, &schema),
-                                };
+                            let new = match previous {
+                                Some(index) => {
+                                    let old = &data[index];
+                                    f.apply(&new_row, old, &columns, i)?
+                                }
+                                None => f.default(&new_row, &schema),
+                            };
 
-                                new_row[i] = Some(new);
-                            }
-                            c => bail!("column {:?} must be inside group by clause", c.name()),
+                            new_row[i] = Some(new);
+                        }
+                        c if !groupby.is_empty() => {
+                            bail!("column {:?} must be inside group by clause", c.name())
+                        }
+                        _ => {
+                            let value = row.get(column)?;
+
+                            let value = match value {
+                                Value::Null => Value::Null,
+                                Value::Integer(i) => Value::Integer(i),
+                                Value::Float(f) => Value::Float(f),
+                                Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
+                                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+                            };
+
+                            new_row[i] = Some(value);
                         }
                     }
                 }
@@ -176,6 +188,8 @@ mod tests {
 
     use crate::{command::Command, Sqlite, Table, Value};
 
+    use super::Materialized;
+
     #[test]
     fn groupby_count() -> Result<()> {
         let db = Sqlite::read("other.db")?;
@@ -214,6 +228,43 @@ mod tests {
             assert!(row.get(&"name".into()).is_ok());
             assert!(row.get(&"c".into()).is_ok());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn materialized() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+
+        let query = "select name from apples";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        let table = select.execute(&db)?;
+
+        let query = "select name from apples";
+        let Command::Select(input) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        let mut out = Materialized::new(input, table)?;
+
+        while let Some(row) = out.next() {
+            assert!(row.get(&"name".into()).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn extra_column() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+
+        let query = "select name, count(*), id from apples group by name";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        assert!(select.execute(&db).is_err());
         Ok(())
     }
 }
