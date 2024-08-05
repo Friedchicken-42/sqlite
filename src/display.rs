@@ -49,7 +49,7 @@ fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) ->
 
         match width {
             0 => write!(f, "{}{}", col, opts.separators[0]),
-            _ => write!(f, " {:<width$} {}", col, opts.separators[0]),
+            _ => write!(f, " {:^width$} {}", col, opts.separators[0]),
         }?;
     }
 

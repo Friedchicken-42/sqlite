@@ -5,8 +5,8 @@ use pest::{iterators::Pair, Parser};
 use pest_derive::Parser;
 
 use crate::{
-    display::DisplayMode, view::View, Column, Key, Row, Schema, SchemaRow, Sqlite, Table, Type,
-    Value,
+    display::DisplayMode, materialized::Materialized, view::View, Column, Row, Schema, SchemaRow,
+    Sqlite, Table, Type, Value,
 };
 
 #[derive(Parser)]
@@ -149,7 +149,7 @@ impl FromTable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FromClause<'a> {
     pub tables: Vec<FromTable>,
     pub conditions: Vec<Condition<'a>>,
@@ -180,7 +180,7 @@ impl<'a> FromClause<'a> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Conditional {
     Less,
     LessEqual,
@@ -190,7 +190,7 @@ pub enum Conditional {
     Greater,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expected<'a> {
     Value(Value<'a>),
     Column(Column),
@@ -219,7 +219,7 @@ impl<'a> Expected<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Condition<'a> {
     column: Column,
     conditional: Conditional,
@@ -345,11 +345,18 @@ impl LimitClause {
 }
 
 #[derive(Debug)]
-pub struct GroupbyClause {}
+pub struct GroupbyClause {
+    pub columns: Vec<SimpleColumn>,
+}
 
 impl GroupbyClause {
     fn new(pair: Pair<'_, Rule>) -> Result<Self> {
-        todo!()
+        let columns = pair
+            .into_inner()
+            .map(SimpleColumn::new)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { columns })
     }
 }
 
@@ -396,7 +403,26 @@ impl<'a> Select<'a> {
     }
 
     pub fn execute(self, db: &'a Sqlite) -> Result<Box<dyn Table + '_>> {
-        if self.select.columns == vec![InputColumn::Wildcard] && self.from.tables.len() == 1 {
+        let materielized = self.groupby.is_some();
+        let btreepage =
+            self.select.columns == vec![InputColumn::Wildcard] && self.from.tables.len() == 1;
+
+        if materielized {
+            let primary = Self {
+                select: SelectClause {
+                    columns: vec![InputColumn::Wildcard], // TODO: check if this is necessaary
+                },
+                from: self.from.clone(),
+                groupby: None,
+                limit: None,
+                r#where: None,
+            };
+
+            let table = primary.execute(db)?;
+
+            let materialized = Materialized::new(self, table)?;
+            Ok(Box::new(materialized))
+        } else if btreepage {
             let table = &self.from.tables[0];
             db.search(table.name(), vec![])
         } else {
@@ -434,11 +460,9 @@ impl CreateTable {
                         t => bail!("Missing type: {t:?}"),
                     };
 
-                    // add primary key to `table_column`
                     schema.push(SchemaRow {
                         column: name.as_str().into(),
                         r#type,
-                        key: Key::Other,
                     });
                 }
                 _ => bail!("[Create Table Command] Malformed query"),

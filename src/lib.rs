@@ -1,11 +1,13 @@
 pub mod command;
 mod display;
 mod materialized;
+mod schema;
 mod view;
 
 use anyhow::{bail, Result};
-use command::{Command, CreateIndex, CreateTable};
+use command::{Command, CreateIndex, CreateTable, InputColumn};
 use display::{display, DisplayMode};
+use schema::{Schema, SchemaRow};
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -171,24 +173,87 @@ impl<'a> Display for Value<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum FunctionParam {
+    Wildcard,
+    Column(Box<Column>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Function {
+    Count(FunctionParam),
+}
+
+impl Function {
+    pub fn default<'a>(&self, new: &[Option<Value>], schema: &Schema) -> Value<'a> {
+        match self {
+            Self::Count(FunctionParam::Wildcard) => Value::Integer(1),
+            _ => todo!(),
+        }
+    }
+
+    pub fn apply<'a>(
+        &self,
+        new: &[Option<Value>],
+        old: &[Value],
+        columns: &[Column],
+        position: usize,
+    ) -> Result<Value<'a>> {
+        match self {
+            Self::Count(FunctionParam::Wildcard) => {
+                let Value::Integer(v) = old[position] else {
+                    bail!("wrong value found")
+                };
+                Ok(Value::Integer(v + 1))
+            }
+            _ => todo!(),
+        }
+    }
+}
+
+impl Function {
+    fn name(&self) -> &str {
+        match self {
+            Function::Count(_) => "count",
+        }
+    }
+
+    fn full(&self) -> String {
+        match self {
+            Function::Count(FunctionParam::Wildcard) => "count(*)".to_string(),
+            Function::Count(FunctionParam::Column(inner)) => format!("count({})", inner.full()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Column {
     String(String),
     Dotted { table: String, column: String },
+    Function(Function),
 }
 
 impl From<&str> for Column {
     fn from(value: &str) -> Self {
-        let dot = value.chars().position(|c| c == '.');
+        if value.contains("(") {
+            let (function, inner) = value.split_once("(").unwrap();
 
-        match dot {
-            Some(pos) => {
-                let (table, column) = value.split_at(pos);
-                Self::Dotted {
-                    table: table.to_string(),
-                    column: column[1..].trim_end().to_string(),
-                }
+            let inner = match &inner[..inner.len() - 1] {
+                "*" => FunctionParam::Wildcard,
+                param => FunctionParam::Column(Box::new(param.into())),
+            };
+
+            match function {
+                "count" => Self::Function(Function::Count(inner)),
+                _ => panic!(),
             }
-            None => Self::String(value.to_string()),
+        } else if value.contains(".") {
+            let (table, column) = value.split_once(".").unwrap();
+            Self::Dotted {
+                table: table.to_string(),
+                column: column.trim_end().to_string(),
+            }
+        } else {
+            Self::String(value.to_string())
         }
     }
 }
@@ -198,6 +263,7 @@ impl Column {
         match self {
             Column::String(n) => n,
             Column::Dotted { column, .. } => column,
+            Column::Function(f) => f.name(),
         }
     }
 
@@ -205,25 +271,10 @@ impl Column {
         match self {
             Column::String(s) => s.to_string(),
             Column::Dotted { table, column } => format!("{table}.{column}"),
+            Column::Function(f) => f.full().to_string(),
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Key {
-    Primary,
-    Foreign, // add field
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SchemaRow {
-    column: Column,
-    r#type: Type,
-    key: Key,
-}
-
-type Schema = Vec<SchemaRow>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum PageType {
@@ -758,27 +809,22 @@ impl Sqlite {
             SchemaRow {
                 column: "type".into(),
                 r#type: Type::Text,
-                key: Key::Other,
             },
             SchemaRow {
                 column: "name".into(),
                 r#type: Type::Text,
-                key: Key::Primary,
             },
             SchemaRow {
                 column: "tbl_name".into(),
                 r#type: Type::Text,
-                key: Key::Other,
             },
             SchemaRow {
                 column: "rootpage".into(),
                 r#type: Type::Integer,
-                key: Key::Other,
             },
             SchemaRow {
                 column: "sql".into(),
                 r#type: Type::Text,
-                key: Key::Other,
             },
         ];
 
@@ -953,7 +999,6 @@ impl Sqlite {
             schema.push(SchemaRow {
                 column: "index".into(),
                 r#type: Type::Blob,
-                key: Key::Other,
             });
 
             BTreePage::read(self, rootpage as usize, name.into(), schema)
