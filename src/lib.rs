@@ -184,33 +184,6 @@ pub enum Function {
 }
 
 impl Function {
-    pub fn default<'a>(&self, new: &[Option<Value>], schema: &Schema) -> Value<'a> {
-        match self {
-            Self::Count(FunctionParam::Wildcard) => Value::Integer(1),
-            _ => todo!(),
-        }
-    }
-
-    pub fn apply<'a>(
-        &self,
-        new: &[Option<Value>],
-        old: &[Value],
-        columns: &[Column],
-        position: usize,
-    ) -> Result<Value<'a>> {
-        match self {
-            Self::Count(FunctionParam::Wildcard) => {
-                let Value::Integer(v) = old[position] else {
-                    bail!("wrong value found")
-                };
-                Ok(Value::Integer(v + 1))
-            }
-            _ => todo!(),
-        }
-    }
-}
-
-impl Function {
     fn name(&self) -> &str {
         match self {
             Function::Count(_) => "count",

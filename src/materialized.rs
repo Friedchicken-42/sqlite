@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use crate::{
     command::{FromTable, Select, SimpleColumn},
     schema::build_schema,
-    Column, Row, Schema, Table, TableState, Value,
+    Column, Function, FunctionParam, Row, Schema, Table, TableState, Value,
 };
 
 use anyhow::{bail, Result};
@@ -16,11 +16,65 @@ pub struct Materialized<'a> {
     state: TableState,
 }
 
+#[derive(Debug, Clone)]
+enum Func {
+    CountWild(u32),
+}
+
+#[derive(Debug, Clone)]
+enum Item<'a> {
+    Value(Value<'a>),
+    Function(Func),
+}
+
+impl<'a> Item<'a> {
+    fn value(self) -> Value<'a> {
+        match self {
+            Item::Value(v) => v,
+            Item::Function(Func::CountWild(c)) => Value::Integer(c),
+        }
+    }
+}
+
+fn apply<'a>(
+    f: &Function,
+    old_row: &Option<&[Item]>,
+    new_row: &[Option<Item>],
+    columns: &[Column],
+    index: usize,
+) -> Result<Item<'a>> {
+    let func = match (old_row, f) {
+        (None, Function::Count(FunctionParam::Wildcard)) => Func::CountWild(1),
+        (Some(old), Function::Count(FunctionParam::Wildcard)) => {
+            let Item::Function(Func::CountWild(v)) = old[index] else {
+                bail!("asdf");
+            };
+            Func::CountWild(v + 1)
+        }
+        _ => todo!(),
+    };
+
+    Ok(Item::Function(func))
+}
+
+fn row_position<'a>(data: &'a [Vec<Item<'a>>], new: &'a [Option<Item<'a>>]) -> Option<usize> {
+    data.iter().position(|row| {
+        for (i, value) in row.iter().enumerate() {
+            match (&new[i], value) {
+                (Some(Item::Value(a)), Item::Value(b)) if a != b => return false,
+                _ => {}
+            }
+        }
+
+        true
+    })
+}
+
 impl<'a> Materialized<'a> {
     pub fn new(input: Select, mut table: Box<dyn Table + '_>) -> Result<Self> {
         let (schema, columns) = build_schema(&input.select, &[&table], &input.from.tables)?;
 
-        let mut data: Vec<Vec<Value>> = vec![];
+        let mut data: Vec<Vec<Item>> = vec![];
 
         let table_name = input.from.tables[0].clone();
 
@@ -57,7 +111,7 @@ impl<'a> Materialized<'a> {
                     .iter()
                     .position(|sr| sr.column.name() == column.name())
                 {
-                    new_row[index] = Some(value);
+                    new_row[index] = Some(Item::Value(value));
                 } else {
                     bail!("missing column {:?} in input", column.name());
                 }
@@ -68,25 +122,10 @@ impl<'a> Materialized<'a> {
                     let column = &columns[i];
                     match column {
                         Column::Function(f) => {
-                            previous = data.iter().position(|row| {
-                                for (i, value) in row.iter().enumerate() {
-                                    if let Some(v) = &new_row[i] {
-                                        if v != value {
-                                            return false;
-                                        }
-                                    }
-                                }
+                            previous = row_position(&data, &new_row);
+                            let old_row = previous.map(|index| data[index].as_ref());
 
-                                true
-                            });
-
-                            let new = match previous {
-                                Some(index) => {
-                                    let old = &data[index];
-                                    f.apply(&new_row, old, &columns, i)?
-                                }
-                                None => f.default(&new_row, &schema),
-                            };
+                            let new = apply(f, &old_row, &new_row, &columns, i)?;
 
                             new_row[i] = Some(new);
                         }
@@ -104,7 +143,7 @@ impl<'a> Materialized<'a> {
                                 Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
                             };
 
-                            new_row[i] = Some(value);
+                            new_row[i] = Some(Item::Value(value));
                         }
                     }
                 }
@@ -116,6 +155,13 @@ impl<'a> Materialized<'a> {
                 None => data.push(row),
             }
         }
+
+        println!("{data:?}");
+
+        let data = data
+            .into_iter()
+            .map(|row| row.into_iter().map(|item| item.value()).collect())
+            .collect::<Vec<_>>();
 
         Ok(Self {
             schema,
