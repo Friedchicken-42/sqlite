@@ -19,6 +19,7 @@ pub struct Materialized<'a> {
 #[derive(Debug, Clone)]
 enum Func {
     CountWild(u32),
+    Count(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,7 @@ impl<'a> Item<'a> {
         match self {
             Item::Value(v) => v,
             Item::Function(Func::CountWild(c)) => Value::Integer(c),
+            Item::Function(Func::Count(c)) => Value::Integer(c),
         }
     }
 }
@@ -39,19 +41,33 @@ impl<'a> Item<'a> {
 fn apply<'a>(
     f: &Function,
     old_row: &Option<&[Item]>,
-    new_row: &[Option<Item>],
-    columns: &[Column],
+    row: &(dyn Row + '_),
     index: usize,
 ) -> Result<Item<'a>> {
     let func = match (old_row, f) {
         (None, Function::Count(FunctionParam::Wildcard)) => Func::CountWild(1),
         (Some(old), Function::Count(FunctionParam::Wildcard)) => {
             let Item::Function(Func::CountWild(v)) = old[index] else {
-                bail!("asdf");
+                bail!("expected function `count(*)`");
             };
             Func::CountWild(v + 1)
         }
-        _ => todo!(),
+        (_, Function::Count(FunctionParam::Column(column))) => {
+            let inc = match row.get(column)? {
+                Value::Null => 0,
+                _ => 1,
+            };
+
+            match old_row {
+                None => Func::Count(inc),
+                Some(old) => {
+                    let Item::Function(Func::Count(v)) = old[index] else {
+                        bail!("expected function `count`");
+                    };
+                    Func::Count(v + inc)
+                }
+            }
+        }
     };
 
     Ok(Item::Function(func))
@@ -125,7 +141,7 @@ impl<'a> Materialized<'a> {
                             previous = row_position(&data, &new_row);
                             let old_row = previous.map(|index| data[index].as_ref());
 
-                            let new = apply(f, &old_row, &new_row, &columns, i)?;
+                            let new = apply(f, &old_row, &row, i)?;
 
                             new_row[i] = Some(new);
                         }
@@ -155,8 +171,6 @@ impl<'a> Materialized<'a> {
                 None => data.push(row),
             }
         }
-
-        println!("{data:?}");
 
         let data = data
             .into_iter()
@@ -311,6 +325,19 @@ mod tests {
         };
 
         assert!(select.execute(&db).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn count_column() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+
+        let query = "select name, count(id) from apples group by name";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        assert!(select.execute(&db).is_ok());
         Ok(())
     }
 }

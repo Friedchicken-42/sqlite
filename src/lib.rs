@@ -1018,8 +1018,8 @@ impl Sqlite {
 
             match Command::parse(&sql.to_lowercase())? {
                 Command::CreateTable(CreateTable { schema, .. }) => {
-                    for row in schema.iter() {
-                        println!("{row:?}");
+                    for sr in schema.iter() {
+                        println!("{:?}: {:?}", sr.column.full(), sr.r#type);
                     }
                 }
                 Command::CreateIndex(CreateIndex { table, columns, .. }) => {
