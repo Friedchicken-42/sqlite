@@ -117,17 +117,25 @@ fn build_schema_simple_column(
             })
         }
         SimpleColumn::Function { name, param } => {
-            let inner = match **param {
-                InputColumn::Wildcard => FunctionParam::Wildcard,
-                _ => {
+            let (function, r#type) = match name.as_str() {
+                "count" => {
+                    let inner = match **param {
+                        InputColumn::Wildcard => FunctionParam::Wildcard,
+                        _ => {
+                            let inner = build_schema_column(param, tables, input)?;
+                            let (sr, _) = &inner[0];
+                            let inner = Box::new(sr.column.clone());
+                            FunctionParam::Column(inner)
+                        }
+                    };
+                    (Function::Count(inner), Type::Integer)
+                }
+                "max" => {
                     let inner = build_schema_column(param, tables, input)?;
                     let (sr, _) = &inner[0];
-                    FunctionParam::Column(Box::new(sr.column.clone()))
+                    let inner = Box::new(sr.column.clone());
+                    (Function::Max(inner), Type::Integer)
                 }
-            };
-
-            let (function, r#type) = match name.as_str() {
-                "count" => (Function::Count(inner), Type::Integer),
                 f => bail!("missing function {f:?}"),
             };
 

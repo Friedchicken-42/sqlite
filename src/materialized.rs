@@ -20,6 +20,7 @@ pub struct Materialized<'a> {
 enum Func {
     CountWild(u32),
     Count(u32),
+    Max(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ impl<'a> Item<'a> {
             Item::Value(v) => v,
             Item::Function(Func::CountWild(c)) => Value::Integer(c),
             Item::Function(Func::Count(c)) => Value::Integer(c),
+            Item::Function(Func::Max(v)) => Value::Integer(v),
         }
     }
 }
@@ -44,28 +46,35 @@ fn apply<'a>(
     row: &(dyn Row + '_),
     index: usize,
 ) -> Result<Item<'a>> {
-    let func = match (old_row, f) {
-        (None, Function::Count(FunctionParam::Wildcard)) => Func::CountWild(1),
-        (Some(old), Function::Count(FunctionParam::Wildcard)) => {
-            let Item::Function(Func::CountWild(v)) = old[index] else {
-                bail!("expected function `count(*)`");
-            };
-            Func::CountWild(v + 1)
-        }
-        (_, Function::Count(FunctionParam::Column(column))) => {
+    let func = match f {
+        Function::Count(FunctionParam::Wildcard) => match old_row.map(|arr| arr.get(index)) {
+            None => Func::CountWild(1),
+            Some(Some(Item::Function(Func::CountWild(v)))) => Func::CountWild(v + 1),
+            _ => bail!("expected function `count(*)`"),
+        },
+        Function::Count(FunctionParam::Column(column)) => {
             let inc = match row.get(column)? {
                 Value::Null => 0,
                 _ => 1,
             };
 
-            match old_row {
+            match old_row.map(|arr| arr.get(index)) {
                 None => Func::Count(inc),
-                Some(old) => {
-                    let Item::Function(Func::Count(v)) = old[index] else {
-                        bail!("expected function `count`");
-                    };
-                    Func::Count(v + inc)
-                }
+                Some(Some(Item::Function(Func::Count(v)))) => Func::Count(v + inc),
+                _ => bail!("expected function `count`"),
+            }
+        }
+        Function::Max(column) => {
+            let value = match row.get(column)? {
+                Value::Null => 0,
+                Value::Integer(v) => v,
+                _ => bail!("type not supported by `max`"),
+            };
+
+            match old_row.map(|arr| arr.get(index)) {
+                None => Func::Max(value),
+                Some(Some(Item::Function(Func::Max(a)))) => Func::Max(value.max(*a)),
+                _ => bail!("expected function `max`"),
             }
         }
     };
@@ -73,11 +82,17 @@ fn apply<'a>(
     Ok(Item::Function(func))
 }
 
-fn row_position<'a>(data: &'a [Vec<Item<'a>>], new: &'a [Option<Item<'a>>]) -> Option<usize> {
+fn row_position<'a>(
+    data: &'a [Vec<Item<'a>>],
+    new: &'a [Option<Item<'a>>],
+    groupby: &[Option<Column>],
+) -> Option<usize> {
     data.iter().position(|row| {
         for (i, value) in row.iter().enumerate() {
             match (&new[i], value) {
-                (Some(Item::Value(a)), Item::Value(b)) if a != b => return false,
+                (Some(Item::Value(a)), Item::Value(b)) if a != b && groupby[i].is_some() => {
+                    return false
+                }
                 _ => {}
             }
         }
@@ -108,28 +123,30 @@ impl<'a> Materialized<'a> {
                 .collect::<Result<Vec<_>>>()
         })?;
 
+        let groupby = schema
+            .iter()
+            .map(|sr| groupby.iter().find(|col| **col == sr.column).cloned())
+            .collect::<Vec<_>>();
+
+        let is_empty = groupby.iter().all(|x| x.is_none());
+
         while let Some(row) = table.next() {
             let mut new_row = vec![None; schema.len()];
             let mut previous = None;
 
-            for column in &groupby {
-                let value = row.get(column)?;
+            for (index, column) in groupby.iter().enumerate() {
+                if let Some(column) = column {
+                    let value = row.get(column)?;
 
-                let value = match value {
-                    Value::Null => Value::Null,
-                    Value::Integer(i) => Value::Integer(i),
-                    Value::Float(f) => Value::Float(f),
-                    Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
-                    Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-                };
+                    let value = match value {
+                        Value::Null => Value::Null,
+                        Value::Integer(i) => Value::Integer(i),
+                        Value::Float(f) => Value::Float(f),
+                        Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
+                        Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
+                    };
 
-                if let Some(index) = schema
-                    .iter()
-                    .position(|sr| sr.column.name() == column.name())
-                {
                     new_row[index] = Some(Item::Value(value));
-                } else {
-                    bail!("missing column {:?} in input", column.name());
                 }
             }
 
@@ -138,14 +155,14 @@ impl<'a> Materialized<'a> {
                     let column = &columns[i];
                     match column {
                         Column::Function(f) => {
-                            previous = row_position(&data, &new_row);
+                            previous = row_position(&data, &new_row, &groupby);
                             let old_row = previous.map(|index| data[index].as_ref());
 
                             let new = apply(f, &old_row, &row, i)?;
 
                             new_row[i] = Some(new);
                         }
-                        c if !groupby.is_empty() => {
+                        c if !is_empty => {
                             bail!("column {:?} must be inside group by clause", c.name())
                         }
                         _ => {
@@ -220,12 +237,14 @@ struct MaterializedRow<'a> {
 
 impl<'a> Row<'a> for MaterializedRow<'a> {
     fn get(&self, column: &Column) -> Result<Value<'a>> {
-        let pos = self.schema.iter().position(|row| match column {
-            Column::String(name) => row.column.name() == name,
-            Column::Dotted { table, column } => {
-                row.column.name() == column && self.table.alias() == table
+        let pos = self.schema.iter().position(|row| {
+            if let Column::Dotted { table, .. } = column {
+                if self.table.alias() != table {
+                    return false;
+                }
             }
-            Column::Function(_) => row.column == *column,
+
+            row.column == *column
         });
 
         match pos {
@@ -292,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized() -> Result<()> {
+    fn materialized_view() -> Result<()> {
         let db = Sqlite::read("other.db")?;
 
         let query = "select name from apples";
@@ -338,6 +357,48 @@ mod tests {
         };
 
         assert!(select.execute(&db).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn function_count() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+
+        let query = "select count(*) from apples";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        let mut table = select.execute(&db)?;
+        let mut count = 0;
+
+        while table.next().is_some() {
+            count += 1;
+        }
+
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn function_max() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+
+        let query = "select max(id) from apples";
+        let Command::Select(select) = Command::parse(query)? else {
+            bail!("command must be `select`")
+        };
+
+        let mut table = select.execute(&db)?;
+        let mut count = 0;
+
+        while let Some(row) = table.next() {
+            assert_eq!(row.get(&"max(id)".into())?, Value::Integer(5));
+            count += 1;
+        }
+
+        assert_eq!(count, 1);
         Ok(())
     }
 }

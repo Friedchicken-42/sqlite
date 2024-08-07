@@ -5,7 +5,7 @@ mod schema;
 mod view;
 
 use anyhow::{bail, Result};
-use command::{Command, CreateIndex, CreateTable, InputColumn};
+use command::{Command, CreateIndex, CreateTable};
 use display::{display, DisplayMode};
 use schema::{Schema, SchemaRow};
 use std::{
@@ -181,12 +181,14 @@ pub enum FunctionParam {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Function {
     Count(FunctionParam),
+    Max(Box<Column>),
 }
 
 impl Function {
     fn name(&self) -> &str {
         match self {
             Function::Count(_) => "count",
+            Function::Max(_) => "max",
         }
     }
 
@@ -194,29 +196,57 @@ impl Function {
         match self {
             Function::Count(FunctionParam::Wildcard) => "count(*)".to_string(),
             Function::Count(FunctionParam::Column(inner)) => format!("count({})", inner.full()),
+            Function::Max(inner) => format!("max({})", inner.full()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Column {
     String(String),
     Dotted { table: String, column: String },
     Function(Function),
 }
 
+impl PartialEq for Column {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Function(f1), Self::Function(f2)) => f1 == f2,
+            (Self::Function(_), _) | (_, Self::Function(_)) => false,
+            (Self::String(s), _) => s == other.name(),
+            (_, Self::String(s)) => s == self.name(),
+            (
+                Self::Dotted {
+                    table: t1,
+                    column: c1,
+                },
+                Self::Dotted {
+                    table: t2,
+                    column: c2,
+                },
+            ) => t1 == t2 && c1 == c2,
+        }
+    }
+}
+
 impl From<&str> for Column {
     fn from(value: &str) -> Self {
         if value.contains("(") {
             let (function, inner) = value.split_once("(").unwrap();
-
-            let inner = match &inner[..inner.len() - 1] {
-                "*" => FunctionParam::Wildcard,
-                param => FunctionParam::Column(Box::new(param.into())),
-            };
+            let inner = &inner[..inner.len() - 1];
 
             match function {
-                "count" => Self::Function(Function::Count(inner)),
+                "count" => {
+                    let inner = match inner {
+                        "*" => FunctionParam::Wildcard,
+                        param => FunctionParam::Column(Box::new(param.into())),
+                    };
+                    Self::Function(Function::Count(inner))
+                }
+                "max" => {
+                    let inner = Box::new(inner.into());
+                    Self::Function(Function::Max(inner))
+                }
                 _ => panic!(),
             }
         } else if value.contains(".") {

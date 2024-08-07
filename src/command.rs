@@ -403,7 +403,16 @@ impl<'a> Select<'a> {
     }
 
     pub fn execute(self, db: &'a Sqlite) -> Result<Box<dyn Table + '_>> {
-        let materielized = self.groupby.is_some();
+        fn is_function(column: &InputColumn) -> bool {
+            let column = match column {
+                InputColumn::Alias(c, _) => c,
+                InputColumn::Simple(c) => c,
+                InputColumn::Wildcard => return false,
+            };
+            matches!(column, SimpleColumn::Function { .. })
+        }
+
+        let materielized = self.groupby.is_some() || self.select.columns.iter().any(is_function);
         let btreepage =
             self.select.columns == vec![InputColumn::Wildcard] && self.from.tables.len() == 1;
 

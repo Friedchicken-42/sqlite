@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use crate::{
     command::{FromTable, Select, WhereClause},
     schema::build_schema,
-    Column, Function, Row, Schema, Sqlite, Table, TableState, Value,
+    Column, Row, Schema, Sqlite, Table, TableState, Value,
 };
 
 #[derive(Debug)]
@@ -17,14 +17,15 @@ pub struct ViewRow<'a> {
 }
 
 impl<'a> Row<'a> for ViewRow<'a> {
-    // a.id as other from apples as a
     fn get(&self, column: &Column) -> Result<Value<'a>> {
-        let pos = self.schema.iter().position(|row| match column {
-            Column::String(name) => row.column.name() == name,
-            Column::Dotted { table, column } => {
-                row.column.name() == column && self.input.iter().any(|tbl| tbl.alias() == table)
+        let pos = self.schema.iter().position(|row| {
+            if let Column::Dotted { table, .. } = column {
+                if !self.input.iter().any(|tbl| tbl.alias() == table) {
+                    return false;
+                }
             }
-            _ => false,
+
+            row.column == *column
         });
 
         let Some(index) = pos else {
