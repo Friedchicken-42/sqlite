@@ -8,27 +8,60 @@ use crate::{Row, Schema, Table, Value};
 pub enum DisplayMode {
     List,
     Table,
+    Box,
 }
 
 struct DisplayOptions {
     column_sizes: Option<Vec<usize>>,
-    separators: [char; 3],
+    separators: [char; 11],
     full_column: bool,
 }
 
-fn display_spacer(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
-    write!(f, "{}", opts.separators[2])?;
+impl DisplayOptions {
+    fn r#box(self) -> Self {
+        Self {
+            separators: ['│', '─', '┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘'],
+            ..self
+        }
+    }
+}
 
+impl Default for DisplayOptions {
+    fn default() -> Self {
+        Self {
+            column_sizes: None,
+            separators: ['|', '-', '+', '+', '+', '+', '+', '+', '+', '+', '+'],
+            full_column: true,
+        }
+    }
+}
+
+fn display_spacer_start(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
+    display_spacer(f, opts, 2)
+}
+fn display_spacer_middle(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
+    display_spacer(f, opts, 5)
+}
+fn display_spacer_end(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
+    display_spacer(f, opts, 8)
+}
+
+fn display_spacer(f: &mut impl Write, opts: &DisplayOptions, offset: usize) -> Result<()> {
     if let Some(ref sizes) = opts.column_sizes {
-        for size in sizes {
+        for (i, size) in sizes.iter().enumerate() {
+            if i == 0 {
+                write!(f, "{}", opts.separators[offset])?;
+            } else {
+                write!(f, "{}", opts.separators[offset + 1])?;
+            }
+
             for _ in 0..*size + 2 {
                 write!(f, "{}", opts.separators[1])?;
             }
-            write!(f, "{}", opts.separators[2])?;
         }
     }
 
-    writeln!(f)?;
+    writeln!(f, "{}", opts.separators[offset + 2])?;
 
     Ok(())
 }
@@ -152,16 +185,17 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
         ..opts
     };
 
-    display_spacer(f, &opts)?;
+    display_spacer_start(f, &opts)?;
 
     display_schema(f, schema, &opts)?;
 
-    display_spacer(f, &opts)?;
+    display_spacer_middle(f, &opts)?;
 
     for row in backup.iter() {
         for (i, value) in row.iter().enumerate() {
             display_value(f, value, i, &opts)?;
         }
+
         writeln!(f)?;
     }
 
@@ -169,21 +203,18 @@ fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions
         display_row(f, row, &opts)?;
     }
 
-    display_spacer(f, &opts)?;
+    display_spacer_end(f, &opts)?;
 
     Ok(())
 }
 
 pub fn display(f: &mut impl Write, table: impl Table, mode: DisplayMode) -> Result<()> {
-    let options = DisplayOptions {
-        column_sizes: None,
-        separators: ['|', '-', '+'],
-        full_column: true,
-    };
+    let options = DisplayOptions::default();
 
     match mode {
         DisplayMode::List => display_list(f, table, options)?,
         DisplayMode::Table => display_table(f, table, options)?,
+        DisplayMode::Box => display_table(f, table, options.r#box())?,
     };
 
     f.flush()?;

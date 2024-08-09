@@ -130,11 +130,15 @@ fn build_schema_simple_column(
                     };
                     (Function::Count(inner), Type::Integer)
                 }
-                "max" => {
+                name @ ("max" | "min") => {
                     let inner = build_schema_column(param, tables, input)?;
                     let (sr, _) = &inner[0];
                     let inner = Box::new(sr.column.clone());
-                    (Function::Max(inner), Type::Integer)
+                    match name {
+                        "max" => (Function::Max(inner), Type::Integer),
+                        "min" => (Function::Min(inner), Type::Integer),
+                        _ => unreachable!(),
+                    }
                 }
                 f => bail!("missing function {f:?}"),
             };

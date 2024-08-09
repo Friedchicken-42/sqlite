@@ -182,6 +182,7 @@ pub enum FunctionParam {
 pub enum Function {
     Count(FunctionParam),
     Max(Box<Column>),
+    Min(Box<Column>),
 }
 
 impl Function {
@@ -189,6 +190,7 @@ impl Function {
         match self {
             Function::Count(_) => "count",
             Function::Max(_) => "max",
+            Function::Min(_) => "min",
         }
     }
 
@@ -197,6 +199,7 @@ impl Function {
             Function::Count(FunctionParam::Wildcard) => "count(*)".to_string(),
             Function::Count(FunctionParam::Column(inner)) => format!("count({})", inner.full()),
             Function::Max(inner) => format!("max({})", inner.full()),
+            Function::Min(inner) => format!("min({})", inner.full()),
         }
     }
 }
@@ -246,6 +249,10 @@ impl From<&str> for Column {
                 "max" => {
                     let inner = Box::new(inner.into());
                     Self::Function(Function::Max(inner))
+                }
+                "min" => {
+                    let inner = Box::new(inner.into());
+                    Self::Function(Function::Min(inner))
                 }
                 _ => panic!(),
             }

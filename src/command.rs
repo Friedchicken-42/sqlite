@@ -559,7 +559,7 @@ impl<'a> Command<'a> {
                 use std::io::Cursor;
                 let mut f = Cursor::new(vec![]);
                 let view = select.execute(db)?;
-                db.display(&mut f, view, DisplayMode::Table)?;
+                db.display(&mut f, view, DisplayMode::Box)?;
                 println!("{}", std::str::from_utf8(f.get_ref())?);
                 Ok(())
             }

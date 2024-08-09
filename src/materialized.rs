@@ -21,6 +21,7 @@ enum Func {
     CountWild(u32),
     Count(u32),
     Max(u32),
+    Min(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ impl<'a> Item<'a> {
             Item::Function(Func::CountWild(c)) => Value::Integer(c),
             Item::Function(Func::Count(c)) => Value::Integer(c),
             Item::Function(Func::Max(v)) => Value::Integer(v),
+            Item::Function(Func::Min(v)) => Value::Integer(v),
         }
     }
 }
@@ -64,17 +66,26 @@ fn apply<'a>(
                 _ => bail!("expected function `count`"),
             }
         }
-        Function::Max(column) => {
+        Function::Max(column) | Function::Min(column) => {
             let value = match row.get(column)? {
                 Value::Null => 0,
                 Value::Integer(v) => v,
                 _ => bail!("type not supported by `max`"),
             };
 
-            match old_row.map(|arr| arr.get(index)) {
-                None => Func::Max(value),
-                Some(Some(Item::Function(Func::Max(a)))) => Func::Max(value.max(*a)),
-                _ => bail!("expected function `max`"),
+            let previous = old_row.map(|arr| arr.get(index));
+            match (f, previous) {
+                (Function::Max(_), None) => Func::Max(value),
+                (Function::Min(_), None) => Func::Min(value),
+                (Function::Max(_), Some(Some(Item::Function(Func::Max(a))))) => {
+                    Func::Max(value.max(*a))
+                }
+                (Function::Min(_), Some(Some(Item::Function(Func::Min(a))))) => {
+                    Func::Min(value.min(*a))
+                }
+                (Function::Max(_), _) => bail!("expected function `max`"),
+                (Function::Min(_), _) => bail!("expected function `min`"),
+                _ => unreachable!(),
             }
         }
     };
@@ -382,10 +393,10 @@ mod tests {
     }
 
     #[test]
-    fn function_max() -> Result<()> {
+    fn function_minmax() -> Result<()> {
         let db = Sqlite::read("other.db")?;
 
-        let query = "select max(id) from apples";
+        let query = "select max(id), min(id) from apples";
         let Command::Select(select) = Command::parse(query)? else {
             bail!("command must be `select`")
         };
@@ -395,6 +406,7 @@ mod tests {
 
         while let Some(row) = table.next() {
             assert_eq!(row.get(&"max(id)".into())?, Value::Integer(5));
+            assert_eq!(row.get(&"min(id)".into())?, Value::Integer(1));
             count += 1;
         }
 
