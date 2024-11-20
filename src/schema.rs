@@ -46,7 +46,10 @@ fn build_schema_column(
                             },
                             r#type: row.r#type,
                         },
-                        row.column.clone(),
+                        Column::Dotted {
+                            table: from.alias().to_string(),
+                            column: row.column.name().to_string(),
+                        },
                     )
                 })
             })

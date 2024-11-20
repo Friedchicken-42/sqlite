@@ -116,7 +116,7 @@ impl<'a> View<'a> {
     }
 }
 
-impl<'a> Table for View<'a> {
+impl Table for View<'_> {
     fn current(&self) -> Option<Box<dyn Row<'_> + '_>> {
         if self.state == TableState::End {
             return None;
