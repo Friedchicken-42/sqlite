@@ -30,7 +30,7 @@ impl Query {
 pub struct SelectStatement {
     pub select_clause: Vec<Select>,
     pub from_clause: From,
-    pub where_clause: Option<Where>,
+    pub where_clause: Option<WhereStatement>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,7 +62,7 @@ pub enum From {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Where {
+pub enum WhereStatement {
     Comparison(Comparison),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -130,16 +130,18 @@ fn comparison_parser<'src>()
     )
 }
 
-fn where_parser<'src>() -> impl Parser<'src, &'src str, Where, extra::Err<Rich<'src, char>>> + Clone
-{
-    comparison_parser().map(|c| Where::Comparison(c)).pratt((
-        infix(left(2), just("and").padded(), |l, _, r, _| {
-            Where::And(Box::new(l), Box::new(r))
-        }),
-        infix(left(1), just("or").padded(), |l, _, r, _| {
-            Where::Or(Box::new(l), Box::new(r))
-        }),
-    ))
+fn where_parser<'src>()
+-> impl Parser<'src, &'src str, WhereStatement, extra::Err<Rich<'src, char>>> + Clone {
+    comparison_parser()
+        .map(|c| WhereStatement::Comparison(c))
+        .pratt((
+            infix(left(2), just("and").padded(), |l, _, r, _| {
+                WhereStatement::And(Box::new(l), Box::new(r))
+            }),
+            infix(left(1), just("or").padded(), |l, _, r, _| {
+                WhereStatement::Or(Box::new(l), Box::new(r))
+            }),
+        ))
 }
 
 fn selectstmt_parser<'src>()
@@ -217,7 +219,7 @@ fn selectstmt_parser<'src>()
             .then(from)
             .then(just("where").padded().ignore_then(where_parser()).or_not())
             .map(
-                |((columns, from), r#where): ((Vec<Select>, From), Option<Where>)| {
+                |((columns, from), r#where): ((Vec<Select>, From), Option<WhereStatement>)| {
                     SelectStatement {
                         select_clause: columns,
                         from_clause: from,
@@ -230,7 +232,6 @@ fn selectstmt_parser<'src>()
 
 #[derive(Debug, PartialEq)]
 pub struct CreateTableStatement {
-    pub table: String,
     pub schema: Schema,
 }
 
@@ -259,16 +260,16 @@ fn createtablestmt_parser<'src>()
         .then(columns.delimited_by(just("("), just(")")))
         .map(
             |(table, columns): (&str, Vec<(&str, Type)>)| CreateTableStatement {
-                table: table.to_string(),
-                schema: Schema::new(
-                    columns
+                schema: Schema {
+                    names: vec![table.to_string()],
+                    columns: columns
                         .into_iter()
                         .map(|(a, b)| SchemaRow {
                             column: a.into(),
                             r#type: b,
                         })
                         .collect::<_>(),
-                ),
+                },
             },
         )
 }
@@ -383,8 +384,8 @@ mod tests {
 
     #[test]
     fn test_complex() {
-        fn comparison((table, name): (&str, &str), op: Operator, right: u64) -> Where {
-            Where::Comparison(Comparison {
+        fn comparison((table, name): (&str, &str), op: Operator, right: u64) -> WhereStatement {
+            WhereStatement::Comparison(Comparison {
                 left: Expression::Column {
                     name: name.into(),
                     table: Some(table.into()),
@@ -406,8 +407,8 @@ mod tests {
                     table: "users".into(),
                     alias: Some("u".into()),
                 },
-                where_clause: Some(Where::Or(
-                    Box::new(Where::And(
+                where_clause: Some(WhereStatement::Or(
+                    Box::new(WhereStatement::And(
                         Box::new(comparison(("u", "id"), Operator::Greater, 1)),
                         Box::new(comparison(("u", "id"), Operator::Less, 10)),
                     )),
@@ -422,21 +423,23 @@ mod tests {
         check(
             "create table A(id int primary key, x int, y int);",
             Query::CreateTable(CreateTableStatement {
-                table: "A".into(),
-                schema: Schema::new(vec![
-                    SchemaRow {
-                        column: "id".into(),
-                        r#type: Type::Integer,
-                    },
-                    SchemaRow {
-                        column: "x".into(),
-                        r#type: Type::Integer,
-                    },
-                    SchemaRow {
-                        column: "y".into(),
-                        r#type: Type::Integer,
-                    },
-                ]),
+                schema: Schema {
+                    names: vec!["A".into()],
+                    columns: vec![
+                        SchemaRow {
+                            column: "id".into(),
+                            r#type: Type::Integer,
+                        },
+                        SchemaRow {
+                            column: "x".into(),
+                            r#type: Type::Integer,
+                        },
+                        SchemaRow {
+                            column: "y".into(),
+                            r#type: Type::Integer,
+                        },
+                    ],
+                },
             }),
         );
     }

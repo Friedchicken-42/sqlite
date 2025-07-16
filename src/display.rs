@@ -76,7 +76,7 @@ fn display_spacer_bottom(opts: &DisplayOptions) {
 fn display_schema(schema: &Schema, opts: &DisplayOptions) {
     print!("{}", opts.separators[0]);
 
-    for (i, row) in schema.0.iter().enumerate() {
+    for (i, row) in schema.columns.iter().enumerate() {
         let width = match &opts.column_sizes {
             Some(arr) => arr[i],
             None => 0,
@@ -113,7 +113,7 @@ fn display_value(value: Value, index: usize, opts: &DisplayOptions) {
 }
 
 fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) {
-    for (i, sr) in schema.0.iter().enumerate() {
+    for (i, sr) in schema.columns.iter().enumerate() {
         let value = row.get(sr.column.clone()).unwrap();
         display_value(value, i, opts);
     }
@@ -131,7 +131,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
     let schema = table.schema().clone();
 
     let mut sizes = schema
-        .0
+        .columns
         .iter()
         .map(|sr| sr.column.name().len())
         .collect::<Vec<_>>();
@@ -147,7 +147,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
 
             let mut vec = vec![];
 
-            for sr in schema.0.iter() {
+            for sr in schema.columns.iter() {
                 let value = row.get(sr.column.clone()).unwrap();
                 let serialized = value.serialize();
                 vec.push(serialized);

@@ -1,12 +1,19 @@
 mod btreepage;
 pub mod display;
+mod join;
 pub mod parser;
 mod view;
+mod r#where;
 
+use crate::{
+    join::{Join, JoinRow, JoinRows},
+    r#where::{Where, WhereRows},
+};
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use btreepage::{BTreePage, BTreeRows, Cell, Page, Varint};
 use parser::{CreateTableStatement, From, Query, Select, SelectStatement};
 use std::{
+    cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -131,13 +138,41 @@ pub enum Type {
     Blob,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value<'src> {
     Null,
     Integer(u64),
     Float(f64),
     Text(&'src str),
     Blob(&'src [u8]),
+}
+
+impl Eq for Value<'_> {}
+
+impl PartialOrd for Value<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (Value::Integer(a), Value::Float(b)) => (*a as f64).total_cmp(b),
+            (Value::Float(a), Value::Integer(b)) => a.total_cmp(&(*b as f64)),
+            (Value::Integer(_) | Value::Float(_), _) => Ordering::Less,
+            (_, Value::Integer(_) | Value::Float(_)) => Ordering::Greater,
+            (Value::Text(_), _) => Ordering::Less,
+            (_, Value::Text(_)) => Ordering::Greater,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -236,17 +271,17 @@ impl Display for Value<'_> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Schema(Vec<SchemaRow>);
-
-impl Schema {
-    fn new(sr: Vec<SchemaRow>) -> Self {
-        Self(sr)
-    }
+pub struct Schema {
+    pub names: Vec<String>,
+    pub columns: Vec<SchemaRow>,
 }
 
 impl Default for Schema {
     fn default() -> Self {
-        Self::new(vec![])
+        Self {
+            names: vec![],
+            columns: vec![],
+        }
     }
 }
 
@@ -287,6 +322,19 @@ impl Column {
 pub enum Table<'db> {
     BTreePage(BTreePage<'db>),
     View(View<'db>),
+    Join(Join<'db>),
+    Where(Where<'db>),
+}
+
+impl Debug for Table<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Table::BTreePage(btreepage) => write!(f, "{btreepage:?}"),
+            Table::View(view) => write!(f, "{view:?}"),
+            Table::Join(join) => write!(f, "{join:?}"),
+            Table::Where(r#where) => write!(f, "{:?}", r#where),
+        }
+    }
 }
 
 impl<'db> Table<'db> {
@@ -294,6 +342,8 @@ impl<'db> Table<'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.rows(),
             Table::View(view) => view.rows(),
+            Table::Join(join) => join.rows(),
+            Table::Where(r#where) => r#where.rows(),
         }
     }
 
@@ -301,6 +351,7 @@ impl<'db> Table<'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.count(),
             Table::View(view) => view.count(),
+            _ => todo!(),
         }
     }
 
@@ -308,6 +359,8 @@ impl<'db> Table<'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.schema(),
             Table::View(view) => view.schema(),
+            Table::Join(join) => join.schema(),
+            Table::Where(r#where) => r#where.inner.schema(),
         }
     }
 }
@@ -325,20 +378,26 @@ pub trait Iterator {
 pub enum Rows<'rows, 'db> {
     BTreePage(BTreeRows<'rows, 'db>),
     View(ViewRows<'rows, 'db>),
+    Join(JoinRows<'rows, 'db>),
+    Where(WhereRows<'rows, 'db>),
 }
 
 impl Iterator for Rows<'_, '_> {
     fn current(&self) -> Option<Row<'_>> {
         match self {
             Rows::BTreePage(btreerows) => btreerows.current(),
-            Rows::View(viewrows) => viewrows.current(),
+            Rows::View(view) => view.current(),
+            Rows::Join(join) => join.current(),
+            Rows::Where(r#where) => r#where.current(),
         }
     }
 
     fn advance(&mut self) {
         match self {
             Rows::BTreePage(btreerows) => btreerows.advance(),
-            Rows::View(viewrows) => viewrows.advance(),
+            Rows::View(view) => view.advance(),
+            Rows::Join(join) => join.advance(),
+            Rows::Where(r#where) => r#where.advance(),
         }
     }
 }
@@ -346,13 +405,15 @@ impl Iterator for Rows<'_, '_> {
 pub enum Row<'page> {
     Cell(Cell<'page>),
     View(ViewRow<'page>),
+    Join(JoinRow<'page>),
 }
 
 impl<'page> Row<'page> {
-    fn get(&self, column: Column) -> Result<Value<'page>> {
+    pub fn get(&self, column: Column) -> Result<Value<'page>> {
         match self {
             Row::Cell(cell) => cell.get(column),
             Row::View(view) => view.get(column),
+            Row::Join(join) => join.get(column),
         }
     }
 }
@@ -395,30 +456,33 @@ impl Sqlite {
     }
 
     pub fn root(&self) -> Result<Table<'_>> {
-        let schema = Schema::new(vec![
-            SchemaRow {
-                column: "type".into(),
-                r#type: Type::Text,
-            },
-            SchemaRow {
-                column: "name".into(),
-                r#type: Type::Text,
-            },
-            SchemaRow {
-                column: "tbl_name".into(),
-                r#type: Type::Text,
-            },
-            SchemaRow {
-                column: "rootpage".into(),
-                r#type: Type::Integer,
-            },
-            SchemaRow {
-                column: "sql".into(),
-                r#type: Type::Text,
-            },
-        ]);
+        let schema = Schema {
+            names: vec!["root".into()],
+            columns: vec![
+                SchemaRow {
+                    column: "type".into(),
+                    r#type: Type::Text,
+                },
+                SchemaRow {
+                    column: "name".into(),
+                    r#type: Type::Text,
+                },
+                SchemaRow {
+                    column: "tbl_name".into(),
+                    r#type: Type::Text,
+                },
+                SchemaRow {
+                    column: "rootpage".into(),
+                    r#type: Type::Integer,
+                },
+                SchemaRow {
+                    column: "sql".into(),
+                    r#type: Type::Text,
+                },
+            ],
+        };
 
-        let btreepage = BTreePage::read(self, 1, schema, Some("root".into()))?;
+        let btreepage = BTreePage::read(self, 1, schema)?;
         Ok(Table::BTreePage(btreepage))
     }
 
@@ -558,11 +622,33 @@ impl Sqlite {
 
         match query {
             Query::CreateTable(CreateTableStatement { schema, .. }) => {
-                BTreePage::read(self, rootpage, schema, Some(name.to_string()))
-                    .map(Table::BTreePage)
+                BTreePage::read(self, rootpage, schema).map(Table::BTreePage)
             }
             Query::CreateIndex(create_index_statement) => todo!(),
             _ => Err(SqliteError::WrongCommand(query)),
+        }
+    }
+
+    fn from_builder(&self, from_clause: From) -> Result<Table<'_>> {
+        match from_clause {
+            From::Table { table, alias } => {
+                let table = self.table(&table)?;
+
+                match (alias, table) {
+                    (None, table) => Ok(table),
+                    (Some(alias), Table::BTreePage(mut btp)) => {
+                        btp.add_alias(alias);
+                        Ok(Table::BTreePage(btp))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            From::Subquery { query, alias } => todo!(),
+            From::Join { left, right, on } => {
+                let left = self.from_builder(*left)?;
+                let right = self.from_builder(*right)?;
+                Ok(Table::Join(Join::new(left, right)))
+            }
         }
     }
 
@@ -573,66 +659,28 @@ impl Sqlite {
             where_clause,
         } = select;
 
-        let table = match from_clause {
-            From::Table { table, alias } => {
-                let table = self.table(&table)?;
+        let table = self.from_builder(from_clause)?;
 
-                let Some(alias) = alias else {
-                    return Ok(table);
+        let table = match where_clause {
+            None => table,
+            Some(r#where) => {
+                let r#where = Where {
+                    inner: Box::new(table),
+                    r#where,
                 };
 
-                match table {
-                    Table::BTreePage(btreepage) => {
-                        let btreepage = btreepage.add_alias(alias);
-                        Table::BTreePage(btreepage)
-                    }
-                    _ => unreachable!(),
-                }
+                Table::Where(r#where)
             }
-            From::Subquery { query, alias } => todo!(),
-            From::Join { left, right, on } => todo!(),
         };
 
-        if select_clause == vec![Select::Wildcard] {
-            Ok(table)
+        let table = if select_clause == vec![Select::Wildcard] {
+            table
         } else {
             let view = View::new(select_clause, table);
-            Ok(Table::View(view))
-        }
+            Table::View(view)
+        };
 
-        // match select {
-        //     SelectStatement {
-        //         select_clause,
-        //         from_clause: From::Table { table, .. },
-        //         where_clause: None,
-        //     } if select_clause == vec![Select::Wildcard] => self.table(&table),
-        //     SelectStatement {
-        //         select_clause,
-        //         from_clause: From::Table { table, alias },
-        //         where_clause: None,
-        //     } => {
-        //         let inner = SelectStatement {
-        //             select_clause: vec![Select::Wildcard],
-        //             from_clause: From::Table {
-        //                 table: table.clone(),
-        //                 alias: None,
-        //             },
-        //             where_clause: None,
-        //         };
-
-        //         let mut names = vec![table];
-        //         names.extend(alias.into_iter());
-
-        //         let inner = Inner {
-        //             table: self.query_builder(inner)?,
-        //             names,
-        //         };
-
-        //         let view = View::new(select_clause, inner);
-        //         Ok(Table::View(view))
-        //     }
-        //     _ => todo!(),
-        // }
+        Ok(table)
     }
 
     pub fn execute(&self, query: Query) -> Result<Table<'_>> {

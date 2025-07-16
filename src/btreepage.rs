@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{Column, Iterator, Result, Row, Rows, Schema, Sqlite, SqliteError, Value};
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub struct Varint {
@@ -45,6 +46,7 @@ pub struct Serial {
     varint: Varint,
     size: usize,
 }
+
 impl Serial {
     fn read(data: &[u8]) -> Self {
         let varint = Varint::read(data);
@@ -66,7 +68,6 @@ pub struct Cell<'page> {
     data: &'page [u8],
     schema: &'page Schema,
     page_type: PageType,
-    names: &'page [String],
 }
 
 impl<'page> Cell<'page> {
@@ -77,13 +78,13 @@ impl<'page> Cell<'page> {
     pub fn get(&self, column: Column) -> Result<Value<'page>> {
         let name = match column {
             Column::Single(name) => name,
-            Column::Dotted { table, column } if self.names.contains(&table) => column,
+            Column::Dotted { table, column } if self.schema.names.contains(&table) => column,
             Column::Dotted { table, .. } => return Err(SqliteError::TableNotFound(table)),
         };
 
         let Some(index) = self
             .schema
-            .0
+            .columns
             .iter()
             .position(|sr| matches!(&sr.column, Column::Single(c) if *c == name))
         else {
@@ -178,18 +179,12 @@ impl Page {
         Ok(pointers)
     }
 
-    fn cell<'page>(
-        &'page self,
-        offset: usize,
-        schema: &'page Schema,
-        names: &'page [String],
-    ) -> Cell<'page> {
+    fn cell<'page>(&'page self, offset: usize, schema: &'page Schema) -> Cell<'page> {
         let data = &self.data[offset..];
         Cell {
             data,
             schema,
             page_type: self.r#type().unwrap(),
-            names,
         }
     }
 
@@ -288,16 +283,16 @@ pub struct BTreePage<'db> {
     storage: Storage<'db>,
     schema: Schema,
     rowid: usize,
-    names: Vec<String>,
+}
+
+impl Debug for BTreePage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "select * from {}", self.schema.names[0])
+    }
 }
 
 impl<'db> BTreePage<'db> {
-    pub fn read(
-        db: &'db Sqlite,
-        index: usize,
-        schema: Schema,
-        name: Option<String>,
-    ) -> Result<Self> {
+    pub fn read(db: &'db Sqlite, index: usize, schema: Schema) -> Result<Self> {
         Ok(Self {
             storage: Storage::File {
                 db,
@@ -306,11 +301,11 @@ impl<'db> BTreePage<'db> {
             },
             schema,
             rowid: 0,
-            names: match name {
-                Some(s) => vec![s],
-                None => vec![],
-            },
         })
+    }
+
+    pub fn add_alias(&mut self, alias: String) {
+        self.schema.names.push(alias);
     }
 
     pub fn rows(&mut self) -> Rows<'_, 'db> {
@@ -328,13 +323,6 @@ impl<'db> BTreePage<'db> {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
-    }
-
-    pub fn add_alias(self, alias: String) -> Self {
-        let mut names = self.names;
-        names.push(alias);
-
-        Self { names, ..self }
     }
 }
 
@@ -355,7 +343,7 @@ impl Iterator for BTreeRows<'_, '_> {
         };
 
         let offset = page.pointers().unwrap().nth(index).unwrap();
-        let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
+        let cell = page.cell(offset, &self.btree.schema);
 
         Some(Row::Cell(cell))
     }
@@ -397,7 +385,7 @@ impl BTreeRows<'_, '_> {
 
                         match page_type {
                             PageType::TableLeaf => {
-                                let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
+                                let cell = page.cell(offset, &self.btree.schema);
 
                                 if filter(&cell).is_eq() {
                                     return;
@@ -432,7 +420,7 @@ impl BTreeRows<'_, '_> {
                                 let mut pointers = page.pointers().unwrap();
                                 let offset = pointers.nth((*index - 1) / 2).unwrap();
 
-                                let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
+                                let cell = page.cell(offset, &self.btree.schema);
 
                                 if filter(&cell).is_eq() {
                                     return;
@@ -446,7 +434,7 @@ impl BTreeRows<'_, '_> {
                         drop(pointers);
 
                         // TODO: add function check
-                        let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
+                        let cell = page.cell(offset, &self.btree.schema);
                         let pointer = cell.page();
 
                         begin = true;
@@ -457,5 +445,41 @@ impl BTreeRows<'_, '_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Result, Table, parser::Query};
+
+    use super::*;
+
+    #[test]
+    fn btreepage() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let query = Query::parse("select * from apples")?;
+        let mut table = db.execute(query)?;
+
+        assert!(matches!(table, Table::BTreePage(_)));
+
+        let mut i = 0;
+        let mut rows = table.rows();
+        while let Some(row) = rows.next() {
+            i += 1;
+
+            let value = row.get("id".into())?;
+            assert_eq!(value, Value::Integer(i));
+
+            let value = row.get("apples.id".into())?;
+            assert_eq!(value, Value::Integer(i));
+
+            assert!(row.get("name".into()).is_ok());
+            assert!(row.get("color".into()).is_ok());
+            assert!(row.get("apple".into()).is_err());
+        }
+
+        assert_eq!(table.count(), i as usize);
+
+        Ok(())
     }
 }

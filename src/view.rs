@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use crate::{
     Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
     parser::Select,
@@ -9,6 +11,23 @@ pub struct View<'table> {
     inner_columns: Vec<Column>,
 }
 
+impl Debug for View<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rows = self
+            .schema
+            .columns
+            .iter()
+            .map(|sr| match &sr.column {
+                Column::Single(c) => c.to_string(),
+                Column::Dotted { table, column } => format!("{table}.{column}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        write!(f, "select {rows} from ({:?})", self.inner)
+    }
+}
+
 fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
     let schema = inner.schema();
 
@@ -16,36 +35,35 @@ fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Colu
         .iter()
         .map(|row| match row {
             Select::Wildcard => Ok(schema
-                .0
+                .columns
                 .iter()
                 .map(|sr| (sr.clone(), sr.column.clone()))
                 .collect::<Vec<_>>()),
-            // Selec::Column {
-            //     table: Some(table), ..
-            // } if !inner.names.contains(table) => Err(SqliteError::TableNotFound(table.to_string())),
             Select::Column { name, alias, table } => {
                 let sr = schema
-                    .0
+                    .columns
                     .iter()
                     .find(|sr| sr.column.name() == name)
                     .ok_or(SqliteError::ColumnNotFound(name.as_str().into()))?
                     .clone();
 
-                let sr = match alias {
-                    Some(alias) => SchemaRow {
-                        column: Column::Single(alias.to_string()),
-                        ..sr
-                    },
-                    None => sr,
-                };
-
-                // let column = Column::Single(name.to_string());
                 let column = match table {
                     Some(table) => Column::Dotted {
                         table: table.to_string(),
                         column: name.to_string(),
                     },
                     None => Column::Single(name.to_string()),
+                };
+
+                let sr = match alias {
+                    Some(alias) => SchemaRow {
+                        column: Column::Single(alias.to_string()),
+                        ..sr
+                    },
+                    None => SchemaRow {
+                        column: column.clone(),
+                        ..sr
+                    },
                 };
 
                 Ok(vec![(sr, column)])
@@ -61,7 +79,13 @@ fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Colu
             (s, n)
         });
 
-    Ok((Schema::new(srs.0), srs.1))
+    Ok((
+        Schema {
+            names: schema.names.clone(),
+            columns: srs.0,
+        },
+        srs.1,
+    ))
 }
 
 impl<'table> View<'table> {
@@ -121,15 +145,83 @@ pub struct ViewRow<'row> {
 
 impl<'row> ViewRow<'row> {
     pub fn get(&self, column: Column) -> Result<Value<'row>> {
-        let index = self
+        let columns = self
             .schema
-            .0
+            .columns
             .iter()
-            .position(|sr| sr.column.name() == column.name());
+            .enumerate()
+            .filter(|(_, sr)| match (&column, &sr.column) {
+                (Column::Single(name1), Column::Single(name2)) => name1 == name2,
+                (Column::Single(name1), Column::Dotted { column: name2, .. }) => name1 == name2,
+                (Column::Dotted { .. }, Column::Single(_)) => false,
+                (
+                    Column::Dotted {
+                        table: table1,
+                        column: name1,
+                    },
+                    Column::Dotted {
+                        table: table2,
+                        column: name2,
+                    },
+                ) => table1 == table2 && name1 == name2,
+            })
+            .collect::<Vec<_>>();
 
-        match index {
-            None => Err(SqliteError::ColumnNotFound(column)),
-            Some(i) => self.row.get(self.inner[i].clone()),
+        match &columns[..] {
+            [] => Err(SqliteError::ColumnNotFound(column)),
+            [(i, _)] => self.row.get(self.inner[*i].clone()),
+            _ => Err(SqliteError::WrongColumn(column)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Result, Sqlite, Table, parser::Query};
+
+    use super::*;
+
+    #[test]
+    fn view() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let query = Query::parse("select id from apples")?;
+        let mut table = db.execute(query)?;
+
+        assert!(matches!(&table, Table::View(_)));
+
+        let mut i = 0;
+        let mut rows = table.rows();
+        while let Some(row) = rows.next() {
+            i += 1;
+
+            let value = row.get("id".into())?;
+            assert_eq!(value, Value::Integer(i));
+
+            assert!(row.get("name".into()).is_err());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn view_alias() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let query = Query::parse("select id as row_id from apples")?;
+        let mut table = db.execute(query)?;
+
+        assert!(matches!(&table, Table::View(_)));
+
+        let mut i = 0;
+        let mut rows = table.rows();
+        while let Some(row) = rows.next() {
+            i += 1;
+
+            let value = row.get("row_id".into())?;
+            assert_eq!(value, Value::Integer(i));
+
+            assert!(row.get("id".into()).is_err());
+        }
+
+        Ok(())
     }
 }

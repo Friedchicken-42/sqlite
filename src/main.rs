@@ -16,9 +16,24 @@ fn database(args: &[String]) -> Result<()> {
         }
         ".tables" => db.show_tables()?,
         ".schema" => db.show_schema()?,
+        ".test" => {
+            use sqlite::Iterator;
+
+            let query = Query::parse("select * from apples")?;
+            let mut table = db.execute(query)?;
+            let mut rows = table.rows();
+
+            while let Some(row) = rows.next() {
+                println!("{:?}", row.get("id".into()));
+            }
+            while let Some(row) = rows.next() {
+                println!("{:?}", row.get("id".into()));
+            }
+        }
         input => {
             let query = Query::parse(input)?;
             let mut table = db.execute(query)?;
+            println!("{table:?}");
 
             let options = DisplayOptions::r#box();
             table.display(options);
