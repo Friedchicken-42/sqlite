@@ -1,33 +1,42 @@
-use anyhow::{bail, Result};
-use sqlite::{command::Command, Sqlite};
+use sqlite::{
+    Result, Sqlite,
+    display::{DisplayOptions, Printable},
+    parser::Query,
+};
 
-fn main() -> Result<()> {
-    // Parse arguments
-    let args = std::env::args().collect::<Vec<_>>();
-    match args.len() {
-        0 | 1 => bail!("Missing <database path> and <command>"),
-        2 => bail!("Missing <command>"),
-        _ => {}
-    }
-
+fn database(args: &[String]) -> Result<()> {
     let db = Sqlite::read(&args[1])?;
 
-    // Parse command and act accordingly
-    let command = &args[2];
-    match command.as_str() {
+    match args[2].as_str() {
         ".dbinfo" => {
             println!("database page size: {}", db.page_size());
 
-            let page = db.root()?;
+            let mut page = db.root()?;
             println!("number of tables: {}", page.count());
         }
         ".tables" => db.show_tables()?,
         ".schema" => db.show_schema()?,
-        command => {
-            let command = Command::parse(command)?;
-            db.execute(command)?;
+        input => {
+            let query = Query::parse(input)?;
+            let mut table = db.execute(query)?;
+
+            let options = DisplayOptions::r#box();
+            table.display(options);
         }
     }
 
     Ok(())
+}
+
+fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    match args.len() {
+        0 | 1 => panic!("Missing <database path> and <command>"),
+        2 => panic!("Missing <command>"),
+        _ => {}
+    }
+
+    if let Err(e) = database(&args) {
+        println!("{e:?}");
+    }
 }

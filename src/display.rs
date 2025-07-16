@@ -1,34 +1,21 @@
-use std::{borrow::Cow, io::Write};
+use crate::{Iterator, Row, Schema, Serialized, Table, Value};
 
-use anyhow::Result;
-
-use crate::{Row, Schema, Table, Value};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DisplayMode {
+enum DisplayMode {
     List,
     Table,
-    Box,
 }
 
-struct DisplayOptions {
+pub struct DisplayOptions {
+    mode: DisplayMode,
     column_sizes: Option<Vec<usize>>,
     separators: [char; 11],
     full_column: bool,
 }
 
-impl DisplayOptions {
-    fn r#box(self) -> Self {
-        Self {
-            separators: ['│', '─', '┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘'],
-            ..self
-        }
-    }
-}
-
 impl Default for DisplayOptions {
     fn default() -> Self {
         Self {
+            mode: DisplayMode::Table,
             column_sizes: None,
             separators: ['|', '-', '+', '+', '+', '+', '+', '+', '+', '+', '+'],
             full_column: true,
@@ -36,69 +23,79 @@ impl Default for DisplayOptions {
     }
 }
 
-fn display_spacer_start(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
-    display_spacer(f, opts, 2)
-}
-fn display_spacer_middle(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
-    display_spacer(f, opts, 5)
-}
-fn display_spacer_end(f: &mut impl Write, opts: &DisplayOptions) -> Result<()> {
-    display_spacer(f, opts, 8)
+impl DisplayOptions {
+    pub fn list() -> Self {
+        Self {
+            mode: DisplayMode::List,
+            ..Self::default()
+        }
+    }
+
+    pub fn table() -> Self {
+        Self::default()
+    }
+
+    pub fn r#box() -> Self {
+        Self {
+            separators: ['│', '─', '┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘'],
+            ..Self::default()
+        }
+    }
 }
 
-fn display_spacer(f: &mut impl Write, opts: &DisplayOptions, offset: usize) -> Result<()> {
+fn display_spacer(opts: &DisplayOptions, offset: usize) {
     if let Some(ref sizes) = opts.column_sizes {
         for (i, size) in sizes.iter().enumerate() {
             if i == 0 {
-                write!(f, "{}", opts.separators[offset])?;
+                print!("{}", opts.separators[offset]);
             } else {
-                write!(f, "{}", opts.separators[offset + 1])?;
+                print!("{}", opts.separators[offset + 1]);
             }
 
             for _ in 0..*size + 2 {
-                write!(f, "{}", opts.separators[1])?;
+                print!("{}", opts.separators[1]);
             }
         }
     }
 
-    writeln!(f, "{}", opts.separators[offset + 2])?;
-
-    Ok(())
+    println!("{}", opts.separators[offset + 2]);
 }
 
-fn display_schema(f: &mut impl Write, schema: &Schema, opts: &DisplayOptions) -> Result<()> {
-    write!(f, "{}", opts.separators[0])?;
+fn display_spacer_top(opts: &DisplayOptions) {
+    display_spacer(opts, 2);
+}
 
-    for (i, row) in schema.iter().enumerate() {
+fn display_spacer_middle(opts: &DisplayOptions) {
+    display_spacer(opts, 5);
+}
+
+fn display_spacer_bottom(opts: &DisplayOptions) {
+    display_spacer(opts, 8);
+}
+
+fn display_schema(schema: &Schema, opts: &DisplayOptions) {
+    print!("{}", opts.separators[0]);
+
+    for (i, row) in schema.0.iter().enumerate() {
         let width = match &opts.column_sizes {
             Some(arr) => arr[i],
             None => 0,
         };
 
-        let col = match opts.full_column {
-            true => &row.column.full(),
-            false => row.column.name(),
-        };
+        let col = row.column.name();
 
         match width {
-            0 => write!(f, "{}{}", col, opts.separators[0]),
-            _ => write!(f, " {:^width$} {}", col, opts.separators[0]),
-        }?;
+            0 => print!("{}{}", col, opts.separators[0]),
+            _ => print!(" {:^width$} {}", col, opts.separators[0]),
+        };
     }
 
-    writeln!(f)?;
-
-    Ok(())
+    println!();
 }
 
-fn display_value(
-    f: &mut impl Write,
-    value: &Value,
-    index: usize,
-    opts: &DisplayOptions,
-) -> Result<()> {
+fn display_value(value: Value, index: usize, opts: &DisplayOptions) {
     if index == 0 {
-        write!(f, "{}", opts.separators[0])?;
+        print!("{}", opts.separators[0]);
     }
 
     let width = match &opts.column_sizes {
@@ -109,115 +106,128 @@ fn display_value(
     let value = value.to_string();
 
     if width == 0 {
-        write!(f, "{value}{}", opts.separators[0])?;
+        print!("{value}{}", opts.separators[0]);
     } else {
-        write!(f, " {value:<width$} {}", opts.separators[0])?;
+        print!(" {value:<width$} {}", opts.separators[0]);
     }
-    Ok(())
 }
 
-fn display_row<'a>(f: &mut impl Write, row: impl Row<'a>, opts: &DisplayOptions) -> Result<()> {
-    for (i, value) in row.all()?.iter().enumerate() {
-        display_value(f, value, i, opts)?;
+fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) {
+    for (i, sr) in schema.0.iter().enumerate() {
+        let value = row.get(sr.column.clone()).unwrap();
+        display_value(value, i, opts);
     }
 
-    writeln!(f)?;
-
-    Ok(())
+    println!()
 }
 
-fn display_list(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
-    let schema = table.schema();
+fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
+    const __BACKUP: bool = true;
 
-    display_schema(f, schema, &opts)?;
-
-    while let Some(row) = table.next() {
-        display_row(f, row, &opts)?;
-    }
-    Ok(())
-}
-
-fn display_table(f: &mut impl Write, mut table: impl Table, opts: DisplayOptions) -> Result<()> {
     const BACKUP_SIZE: usize = 20;
-    let mut backup: Vec<Vec<Value>> = Vec::with_capacity(BACKUP_SIZE);
+    let mut backup: Vec<Vec<Serialized>> = Vec::with_capacity(BACKUP_SIZE);
+    let mut ended = false;
 
-    for _ in 0..BACKUP_SIZE {
-        let Some(row) = table.next() else {
-            break;
-        };
-
-        let all = row.all()?;
-        let mut vec = vec![];
-
-        for value in all {
-            let value = match value {
-                Value::Null => Value::Null,
-                Value::Integer(i) => Value::Integer(i),
-                Value::Float(f) => Value::Float(f),
-                Value::Text(t) => Value::Text(Cow::Owned(t.to_string())),
-                Value::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
-            };
-
-            vec.push(value.clone())
-        }
-
-        backup.push(vec);
-    }
-
-    let schema = table.schema();
+    let schema = table.schema().clone();
 
     let mut sizes = schema
+        .0
         .iter()
-        .map(|row| match opts.full_column {
-            true => row.column.full().len(),
-            false => row.column.name().len(),
-        })
+        .map(|sr| sr.column.name().len())
         .collect::<Vec<_>>();
 
-    for values in &backup {
-        for (i, value) in values.iter().enumerate() {
-            sizes[i] = sizes[i].max(value.to_string().len());
-        }
-    }
+    let mut rows = table.rows();
 
-    let opts = DisplayOptions {
-        column_sizes: Some(sizes),
-        ..opts
+    let opts = if __BACKUP {
+        for _ in 0..BACKUP_SIZE {
+            let Some(row) = rows.next() else {
+                ended = true;
+                break;
+            };
+
+            let mut vec = vec![];
+
+            for sr in schema.0.iter() {
+                let value = row.get(sr.column.clone()).unwrap();
+                let serialized = value.serialize();
+                vec.push(serialized);
+            }
+
+            backup.push(vec);
+        }
+
+        for values in &backup {
+            for (i, serialized) in values.iter().enumerate() {
+                let value = Value::read(&serialized.data, &serialized.varint).unwrap();
+                sizes[i] = sizes[i].max(value.to_string().len());
+            }
+        }
+
+        DisplayOptions {
+            column_sizes: Some(sizes),
+            ..opts
+        }
+    } else {
+        DisplayOptions {
+            column_sizes: Some(sizes),
+            ..opts
+        }
     };
 
-    display_spacer_start(f, &opts)?;
+    display_spacer_top(&opts);
+    display_schema(&table.schema(), &opts);
+    display_spacer_middle(&opts);
 
-    display_schema(f, schema, &opts)?;
+    let mut rows = table.rows();
 
-    display_spacer_middle(f, &opts)?;
-
-    for row in backup.iter() {
-        for (i, value) in row.iter().enumerate() {
-            display_value(f, value, i, &opts)?;
+    if __BACKUP {
+        for _ in 0..BACKUP_SIZE {
+            rows.next();
         }
 
-        writeln!(f)?;
+        for row in backup.into_iter() {
+            for (i, serialized) in row.iter().enumerate() {
+                let value = Value::read(&serialized.data, &serialized.varint).unwrap();
+                display_value(value, i, &opts);
+            }
+
+            println!();
+        }
+
+        if !ended {
+            while let Some(row) = rows.next() {
+                display_row(row, &schema, &opts);
+            }
+        }
+    } else {
+        while let Some(row) = rows.next() {
+            display_row(row, &schema, &opts);
+        }
     }
 
-    while let Some(row) = table.next() {
-        display_row(f, row, &opts)?;
-    }
-
-    display_spacer_end(f, &opts)?;
-
-    Ok(())
+    display_spacer_bottom(&opts);
 }
 
-pub fn display(f: &mut impl Write, table: impl Table, mode: DisplayMode) -> Result<()> {
-    let options = DisplayOptions::default();
+fn display_list(table: &mut Table<'_>, opts: DisplayOptions) {
+    let schema = table.schema().clone();
 
-    match mode {
-        DisplayMode::List => display_list(f, table, options)?,
-        DisplayMode::Table => display_table(f, table, options)?,
-        DisplayMode::Box => display_table(f, table, options.r#box())?,
-    };
+    display_schema(&schema, &opts);
 
-    f.flush()?;
+    let mut rows = table.rows();
+    while let Some(row) = rows.next() {
+        display_row(row, &schema, &opts);
+    }
+}
 
-    Ok(())
+pub trait Printable {
+    fn display(&mut self, options: DisplayOptions);
+}
+
+impl Printable for Table<'_> {
+    fn display(&mut self, options: DisplayOptions) {
+        match options.mode {
+            DisplayMode::List => display_list(self, options),
+            DisplayMode::Table => display_table(self, options),
+        }
+    }
 }
