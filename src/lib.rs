@@ -7,6 +7,7 @@ mod r#where;
 
 use crate::{
     join::{Join, JoinRow, JoinRows},
+    parser::WhereStatement,
     r#where::{Where, WhereRows},
 };
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -677,7 +678,19 @@ impl Sqlite {
             From::Join { left, right, on } => {
                 let left = self.from_builder(*left)?;
                 let right = self.from_builder(*right)?;
-                Ok(Table::Join(Join::new(left, right)))
+                let join = Table::Join(Join::new(left, right));
+
+                match on {
+                    None => Ok(join),
+                    Some(comparison) => {
+                        let r#where = Where {
+                            inner: Box::new(join),
+                            r#where: WhereStatement::Comparison(comparison),
+                        };
+
+                        Ok(Table::Where(r#where))
+                    }
+                }
             }
         }
     }
