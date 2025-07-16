@@ -175,7 +175,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
     };
 
     display_spacer_top(&opts);
-    display_schema(&table.schema(), &opts);
+    display_schema(table.schema(), &opts);
     display_spacer_middle(&opts);
 
     let mut rows = table.rows();

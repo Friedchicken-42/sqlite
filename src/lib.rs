@@ -1,18 +1,18 @@
-mod btreepage;
 pub mod display;
-mod join;
 pub mod parser;
-mod view;
-mod r#where;
+mod tables;
 
 use crate::{
-    join::{Join, JoinRow, JoinRows},
-    parser::WhereStatement,
-    r#where::{Where, WhereRows},
+    parser::{CreateTableStatement, From, Query, Select, SelectStatement, WhereStatement},
+    tables::{
+        btreepage::{BTreePage, BTreeRows, Cell, Page, Varint},
+        join::{Join, JoinRow, JoinRows},
+        limit::{Limit, LimitRows},
+        view::{View, ViewRow, ViewRows},
+        r#where::{Where, WhereRows},
+    },
 };
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use btreepage::{BTreePage, BTreeRows, Cell, Page, Varint};
-use parser::{CreateTableStatement, From, Query, Select, SelectStatement};
 use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
@@ -22,7 +22,6 @@ use std::{
     ops::Range,
 };
 use thiserror::Error;
-use view::{View, ViewRow, ViewRows};
 
 #[derive(Error)]
 pub enum SqliteError {
@@ -40,7 +39,7 @@ pub enum SqliteError {
         actual: Type,
     },
     TableNotFound(String),
-    WrongCommand(Query),
+    WrongCommand(Box<Query>),
     Parser {
         query: String,
         span: Range<usize>,
@@ -76,7 +75,7 @@ impl SqliteError {
                 .write(source, &mut buffer),
             SqliteError::WrongPageType(n) => Report::build(ReportKind::Error, 1..2)
                 .with_message(format!("Wrong page type: {n:02x}"))
-                .with_note(format!("Page type must be 0x02, 0x05, 0x0a or 0x0d"))
+                .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d")
                 .finish()
                 .write(source, &mut buffer),
             SqliteError::WrongValueType { expected, actual } => {
@@ -90,7 +89,7 @@ impl SqliteError {
                 .finish()
                 .write(source, &mut buffer),
             SqliteError::WrongCommand(_) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Wrong command provided"))
+                .with_message("Wrong command provided")
                 .with_note("todo")
                 .finish()
                 .write(source, &mut buffer),
@@ -188,19 +187,19 @@ impl<'src> Value<'src> {
             0 => Ok(Value::Null),
             n @ 1..=4 => {
                 let mut number = 0;
-                for i in 0..n {
-                    number = (number << 8) + data[i] as u64;
+                for value in data.iter().take(n) {
+                    number = (number << 8) + *value as u64;
                 }
                 Ok(Value::Integer(number))
             }
             8 => Ok(Value::Integer(0)),
             9 => Ok(Value::Integer(1)),
             // 10 | 11 => Err(SqliteError::UnhandledSerial(varint.value)),
-            n if n >= 12 && n % 2 == 0 => {
+            n if n >= 12 && n.is_multiple_of(2) => {
                 let length = (n - 12) / 2;
                 Ok(Value::Blob(&data[..length]))
             }
-            n if n >= 13 && n % 2 == 1 => {
+            n if n >= 13 && !n.is_multiple_of(2) => {
                 let length = (n - 13) / 2;
                 let string = str::from_utf8(&data[..length]).unwrap();
                 Ok(Value::Text(string))
@@ -271,19 +270,10 @@ impl Display for Value<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct Schema {
     pub names: Vec<String>,
     pub columns: Vec<SchemaRow>,
-}
-
-impl Default for Schema {
-    fn default() -> Self {
-        Self {
-            names: vec![],
-            columns: vec![],
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -311,11 +301,11 @@ impl std::convert::From<&str> for Column {
     }
 }
 
-impl ToString for Column {
-    fn to_string(&self) -> String {
+impl Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Column::Single(column) => column.clone(),
-            Column::Dotted { table, column } => format!("{table}.{column}"),
+            Column::Single(column) => write!(f, "{column}"),
+            Column::Dotted { table, column } => write!(f, "{table}.{column}"),
         }
     }
 }
@@ -334,6 +324,7 @@ pub enum Table<'db> {
     View(View<'db>),
     Join(Join<'db>),
     Where(Where<'db>),
+    Limit(Limit<'db>),
 }
 
 impl Debug for Table<'_> {
@@ -352,6 +343,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
             Table::Where(r#where) => r#where.rows(),
+            Table::Limit(limit) => limit.rows(),
         }
     }
 
@@ -369,6 +361,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
+            Table::Limit(limit) => limit.inner.schema(),
         }
     }
 
@@ -383,6 +376,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.write_indented(f, width, indent),
             Table::Join(join) => join.write_indented(f, width, indent),
             Table::Where(r#where) => r#where.write_indented(f, width, indent),
+            Table::Limit(limit) => limit.write_indented(f, width, indent),
         }
     }
 
@@ -392,6 +386,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.write_normal(f),
             Table::Join(join) => join.write_normal(f),
             Table::Where(r#where) => r#where.write_normal(f),
+            Table::Limit(limit) => limit.write_normal(f),
         }
     }
 }
@@ -411,6 +406,7 @@ pub enum Rows<'rows, 'db> {
     View(ViewRows<'rows, 'db>),
     Join(JoinRows<'rows, 'db>),
     Where(WhereRows<'rows, 'db>),
+    Limit(LimitRows<'rows, 'db>),
 }
 
 impl Iterator for Rows<'_, '_> {
@@ -420,6 +416,7 @@ impl Iterator for Rows<'_, '_> {
             Rows::View(view) => view.current(),
             Rows::Join(join) => join.current(),
             Rows::Where(r#where) => r#where.current(),
+            Rows::Limit(limit) => limit.current(),
         }
     }
 
@@ -429,6 +426,7 @@ impl Iterator for Rows<'_, '_> {
             Rows::View(view) => view.advance(),
             Rows::Join(join) => join.advance(),
             Rows::Where(r#where) => r#where.advance(),
+            Rows::Limit(limit) => limit.advance(),
         }
     }
 }
@@ -656,10 +654,11 @@ impl Sqlite {
                 BTreePage::read(self, rootpage, schema).map(Table::BTreePage)
             }
             Query::CreateIndex(create_index_statement) => todo!(),
-            _ => Err(SqliteError::WrongCommand(query)),
+            _ => Err(SqliteError::WrongCommand(Box::new(query))),
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn from_builder(&self, from_clause: From) -> Result<Table<'_>> {
         match from_clause {
             From::Table { table, alias } => {
@@ -683,10 +682,8 @@ impl Sqlite {
                 match on {
                     None => Ok(join),
                     Some(comparison) => {
-                        let r#where = Where {
-                            inner: Box::new(join),
-                            r#where: WhereStatement::Comparison(comparison),
-                        };
+                        let r#where = WhereStatement::Comparison(comparison);
+                        let r#where = Where::new(join, r#where);
 
                         Ok(Table::Where(r#where))
                     }
@@ -700,6 +697,7 @@ impl Sqlite {
             select_clause,
             from_clause,
             where_clause,
+            limit_clause,
         } = select;
 
         let table = self.from_builder(from_clause)?;
@@ -707,11 +705,7 @@ impl Sqlite {
         let table = match where_clause {
             None => table,
             Some(r#where) => {
-                let r#where = Where {
-                    inner: Box::new(table),
-                    r#where,
-                };
-
+                let r#where = Where::new(table, r#where);
                 Table::Where(r#where)
             }
         };
@@ -721,6 +715,14 @@ impl Sqlite {
         } else {
             let view = View::new(select_clause, table);
             Table::View(view)
+        };
+
+        let table = match limit_clause {
+            None => table,
+            Some(limit_stmt) => {
+                let limit = Limit::new(table, limit_stmt.limit);
+                Table::Limit(limit)
+            }
         };
 
         Ok(table)

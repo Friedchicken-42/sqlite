@@ -31,6 +31,7 @@ pub struct SelectStatement {
     pub select_clause: Vec<Select>,
     pub from_clause: From,
     pub where_clause: Option<WhereStatement>,
+    pub limit_clause: Option<Limit>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -92,6 +93,11 @@ pub enum Expression {
     Number(u64),
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Limit {
+    pub limit: usize,
+}
+
 fn comparison_parser<'src>()
 -> impl Parser<'src, &'src str, Comparison, extra::Err<Rich<'src, char>>> + Clone {
     let ident = text::ident().padded();
@@ -132,16 +138,14 @@ fn comparison_parser<'src>()
 
 fn where_parser<'src>()
 -> impl Parser<'src, &'src str, WhereStatement, extra::Err<Rich<'src, char>>> + Clone {
-    comparison_parser()
-        .map(|c| WhereStatement::Comparison(c))
-        .pratt((
-            infix(left(2), just("and").padded(), |l, _, r, _| {
-                WhereStatement::And(Box::new(l), Box::new(r))
-            }),
-            infix(left(1), just("or").padded(), |l, _, r, _| {
-                WhereStatement::Or(Box::new(l), Box::new(r))
-            }),
-        ))
+    comparison_parser().map(WhereStatement::Comparison).pratt((
+        infix(left(2), just("and").padded(), |l, _, r, _| {
+            WhereStatement::And(Box::new(l), Box::new(r))
+        }),
+        infix(left(1), just("or").padded(), |l, _, r, _| {
+            WhereStatement::Or(Box::new(l), Box::new(r))
+        }),
+    ))
 }
 
 fn selectstmt_parser<'src>()
@@ -212,18 +216,27 @@ fn selectstmt_parser<'src>()
 
         let from = join.or(table_subquery);
 
+        let limit = text::int(10).map(|n: &str| Limit {
+            limit: n.parse().unwrap(),
+        });
+
         just("select")
             .padded()
             .ignore_then(columns)
             .then_ignore(just("from").padded())
             .then(from)
             .then(just("where").padded().ignore_then(where_parser()).or_not())
+            .then(just("limit").padded().ignore_then(limit).or_not())
             .map(
-                |((columns, from), r#where): ((Vec<Select>, From), Option<WhereStatement>)| {
+                |(((columns, from), r#where), limit): (
+                    ((Vec<Select>, From), Option<WhereStatement>),
+                    Option<Limit>,
+                )| {
                     SelectStatement {
                         select_clause: columns,
                         from_clause: from,
                         where_clause: r#where,
+                        limit_clause: limit,
                     }
                 },
             )
@@ -378,6 +391,7 @@ mod tests {
                     alias: None,
                 },
                 where_clause: None,
+                limit_clause: None,
             }),
         );
     }
@@ -414,6 +428,7 @@ mod tests {
                     )),
                     Box::new(comparison(("u", "id"), Operator::NotEqual, 3)),
                 )),
+                limit_clause: None,
             }),
         );
     }

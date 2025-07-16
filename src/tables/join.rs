@@ -136,9 +136,7 @@ impl<'row> JoinRow<'row> {
         let values = self
             .row
             .iter()
-            .map(|r| r.get(column.clone()))
-            .filter(|r| r.is_ok())
-            .map(|r| r.unwrap())
+            .flat_map(|r| r.get(column.clone()))
             .collect::<Vec<_>>();
 
         match values.len() {

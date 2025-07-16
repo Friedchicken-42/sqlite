@@ -51,7 +51,7 @@ impl Comparison {
 
 pub struct Where<'db> {
     pub inner: Box<Table<'db>>,
-    pub r#where: WhereStatement,
+    r#where: WhereStatement,
 }
 
 fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,6 +104,13 @@ fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fm
 }
 
 impl<'table> Where<'table> {
+    pub fn new(inner: Table<'table>, r#where: WhereStatement) -> Self {
+        Self {
+            inner: Box::new(inner),
+            r#where,
+        }
+    }
+
     pub fn rows(&mut self) -> Rows<'_, 'table> {
         Rows::Where(WhereRows {
             rows: Box::new(self.inner.rows()),

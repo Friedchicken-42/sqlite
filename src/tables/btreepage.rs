@@ -55,8 +55,8 @@ impl Serial {
             5 => 6,
             6 | 7 => 8,
             8 | 9 => 0,
-            n if n >= 12 && n % 2 == 0 => (n - 12) / 2,
-            n if n >= 13 && n % 2 == 1 => (n - 13) / 2,
+            n if n >= 12 && n.is_multiple_of(2) => (n - 12) / 2,
+            n if n >= 13 && !n.is_multiple_of(2) => (n - 13) / 2,
             _ => panic!("not supported"),
         };
 
