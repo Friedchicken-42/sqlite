@@ -1,16 +1,9 @@
 use crate::{Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value};
-use std::fmt::Debug;
 
 pub struct Join<'table> {
     left: Box<Table<'table>>,
     right: Box<Table<'table>>,
     schema: Schema,
-}
-
-impl Debug for Join<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({:?}) join ({:?})", self.left, self.right)
-    }
 }
 
 impl<'table> Join<'table> {
@@ -58,6 +51,31 @@ impl<'table> Join<'table> {
         Rows::Join(JoinRows {
             rows: vec![self.left.rows(), self.right.rows()],
         })
+    }
+
+    pub fn write_indented(
+        &self,
+        f: &mut std::fmt::Formatter,
+        width: usize,
+        indent: usize,
+    ) -> std::fmt::Result {
+        let spacer = "  ".repeat(indent);
+
+        writeln!(f, "{:<width$} │ {}on ...", "join", spacer)?;
+        self.left.write_indented(f, width, indent + 1)?;
+        self.right.write_indented(f, width, indent + 1)?;
+
+        Ok(())
+    }
+
+    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "(")?;
+        self.left.write_normal(f)?;
+        write!(f, ") join (")?;
+        self.right.write_normal(f)?;
+        write!(f, ")")?;
+
+        Ok(())
     }
 }
 

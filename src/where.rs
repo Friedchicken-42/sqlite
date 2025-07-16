@@ -2,7 +2,6 @@ use crate::{
     Column, Iterator, Row, Rows, Table, Value,
     parser::{Comparison, Expression, Operator, WhereStatement},
 };
-use std::fmt::Debug;
 
 impl WhereStatement {
     fn matches(&self, row: &Row) -> bool {
@@ -55,61 +54,52 @@ pub struct Where<'db> {
     pub r#where: WhereStatement,
 }
 
-impl Debug for Where<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match expr {
-                Expression::Column { name, table: None } => write!(f, "{name}"),
-                Expression::Column {
-                    name,
-                    table: Some(table),
-                } => write!(f, "{table}.{name}"),
-                Expression::Literal(s) => write!(f, "{s:?}"),
-                Expression::Number(n) => write!(f, "{n}"),
-            }
+fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match expr {
+        Expression::Column { name, table: None } => write!(f, "{name}"),
+        Expression::Column {
+            name,
+            table: Some(table),
+        } => write!(f, "{table}.{name}"),
+        Expression::Literal(s) => write!(f, "{s:?}"),
+        Expression::Number(n) => write!(f, "{n}"),
+    }
+}
+
+fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match stmt {
+        WhereStatement::Comparison(comparison) => {
+            let Comparison { left, op, right } = comparison;
+            write_expr(left, f)?;
+
+            let op = match op {
+                Operator::Less => "<",
+                Operator::LessEqual => "<=",
+                Operator::Equal => "=",
+                Operator::NotEqual => "!=",
+                Operator::Greater => ">",
+                Operator::GreaterEqual => ">=",
+            };
+            write!(f, " {op} ")?;
+
+            write_expr(right, f)?;
+
+            Ok(())
         }
+        WhereStatement::And(a, b) => {
+            write_stmt(a, f)?;
+            write!(f, " and ")?;
+            write_stmt(b, f)?;
 
-        fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match stmt {
-                WhereStatement::Comparison(comparison) => {
-                    let Comparison { left, op, right } = comparison;
-                    write_expr(left, f)?;
-
-                    let op = match op {
-                        Operator::Less => "<",
-                        Operator::LessEqual => "<=",
-                        Operator::Equal => "=",
-                        Operator::NotEqual => "!=",
-                        Operator::Greater => ">",
-                        Operator::GreaterEqual => ">=",
-                    };
-                    write!(f, " {op} ")?;
-
-                    write_expr(right, f)?;
-
-                    Ok(())
-                }
-                WhereStatement::And(a, b) => {
-                    write_stmt(a, f)?;
-                    write!(f, " and ")?;
-                    write_stmt(b, f)?;
-
-                    Ok(())
-                }
-                WhereStatement::Or(a, b) => {
-                    write_stmt(a, f)?;
-                    write!(f, " or ")?;
-                    write_stmt(b, f)?;
-
-                    Ok(())
-                }
-            }
+            Ok(())
         }
+        WhereStatement::Or(a, b) => {
+            write_stmt(a, f)?;
+            write!(f, " or ")?;
+            write_stmt(b, f)?;
 
-        write!(f, "({:?}) where ", self.inner)?;
-        write_stmt(&self.r#where, f)?;
-
-        Ok(())
+            Ok(())
+        }
     }
 }
 
@@ -119,6 +109,30 @@ impl<'table> Where<'table> {
             rows: Box::new(self.inner.rows()),
             r#where: &self.r#where,
         })
+    }
+
+    pub fn write_indented(
+        &self,
+        f: &mut std::fmt::Formatter,
+        width: usize,
+        indent: usize,
+    ) -> std::fmt::Result {
+        let spacer = "  ".repeat(indent);
+
+        self.inner.write_indented(f, width, indent + 1)?;
+        write!(f, "{:<width$} │ {}", "where", spacer)?;
+        write_stmt(&self.r#where, f)?;
+        writeln!(f)?;
+
+        Ok(())
+    }
+
+    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.inner.write_normal(f)?;
+        write!(f, " where ")?;
+        write_stmt(&self.r#where, f)?;
+
+        Ok(())
     }
 }
 

@@ -310,6 +310,15 @@ impl std::convert::From<&str> for Column {
     }
 }
 
+impl ToString for Column {
+    fn to_string(&self) -> String {
+        match self {
+            Column::Single(column) => column.clone(),
+            Column::Dotted { table, column } => format!("{table}.{column}"),
+        }
+    }
+}
+
 impl Column {
     pub fn name(&self) -> &str {
         match self {
@@ -328,11 +337,9 @@ pub enum Table<'db> {
 
 impl Debug for Table<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Table::BTreePage(btreepage) => write!(f, "{btreepage:?}"),
-            Table::View(view) => write!(f, "{view:?}"),
-            Table::Join(join) => write!(f, "{join:?}"),
-            Table::Where(r#where) => write!(f, "{:?}", r#where),
+        match f.alternate() {
+            true => self.write_indented(f, 8, 0),
+            false => self.write_normal(f),
         }
     }
 }
@@ -361,6 +368,29 @@ impl<'db> Table<'db> {
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
+        }
+    }
+
+    fn write_indented(
+        &self,
+        f: &mut std::fmt::Formatter,
+        width: usize,
+        indent: usize,
+    ) -> std::fmt::Result {
+        match self {
+            Table::BTreePage(btreepage) => btreepage.write_indented(f, width, indent),
+            Table::View(view) => view.write_indented(f, width, indent),
+            Table::Join(join) => join.write_indented(f, width, indent),
+            Table::Where(r#where) => r#where.write_indented(f, width, indent),
+        }
+    }
+
+    fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Table::BTreePage(btreepage) => btreepage.write_normal(f),
+            Table::View(view) => view.write_normal(f),
+            Table::Join(join) => join.write_normal(f),
+            Table::Where(r#where) => r#where.write_normal(f),
         }
     }
 }

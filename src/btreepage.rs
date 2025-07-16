@@ -285,12 +285,6 @@ pub struct BTreePage<'db> {
     rowid: usize,
 }
 
-impl Debug for BTreePage<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "select * from {}", self.schema.names[0])
-    }
-}
-
 impl<'db> BTreePage<'db> {
     pub fn read(db: &'db Sqlite, index: usize, schema: Schema) -> Result<Self> {
         Ok(Self {
@@ -323,6 +317,23 @@ impl<'db> BTreePage<'db> {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub fn write_indented(
+        &self,
+        f: &mut std::fmt::Formatter,
+        width: usize,
+        indent: usize,
+    ) -> std::fmt::Result {
+        let names = self.schema.names.join(", ");
+        let indent = "  ".repeat(indent);
+
+        writeln!(f, "{:<width$} │ {}{}", "from", indent, names)
+    }
+    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let name = self.schema.names.iter().max_by_key(|s| s.len()).unwrap();
+
+        writeln!(f, "select * from {name}")
     }
 }
 

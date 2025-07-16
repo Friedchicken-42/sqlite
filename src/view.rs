@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 use crate::{
     Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
     parser::Select,
@@ -9,23 +7,6 @@ pub struct View<'table> {
     inner: Box<Table<'table>>,
     schema: Schema,
     inner_columns: Vec<Column>,
-}
-
-impl Debug for View<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let rows = self
-            .schema
-            .columns
-            .iter()
-            .map(|sr| match &sr.column {
-                Column::Single(c) => c.to_string(),
-                Column::Dotted { table, column } => format!("{table}.{column}"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        write!(f, "select {rows} from ({:?})", self.inner)
-    }
 }
 
 fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
@@ -113,6 +94,46 @@ impl<'table> View<'table> {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn fmt_rows(&self) -> Vec<String> {
+        self.schema
+            .columns
+            .iter()
+            .map(|sr| sr.column.to_string())
+            .collect::<Vec<_>>()
+    }
+
+    pub fn write_indented(
+        &self,
+        f: &mut std::fmt::Formatter,
+        width: usize,
+        indent: usize,
+    ) -> std::fmt::Result {
+        let spacer = "  ".repeat(indent);
+        let rows = self
+            .fmt_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, column)| {
+                let inner = self.inner_columns[i].to_string();
+                format!("{column} ({inner})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        writeln!(f, "{:<width$} │ {}{}", "select", spacer, rows)?;
+        self.inner.write_indented(f, width, indent + 1)
+    }
+
+    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let rows = self.fmt_rows().join(", ");
+
+        write!(f, "(select {rows} from ")?;
+        self.inner.write_normal(f)?;
+        write!(f, ")")?;
+
+        Ok(())
     }
 }
 
