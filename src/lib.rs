@@ -14,7 +14,7 @@ use std::{
     ops::Range,
 };
 use thiserror::Error;
-use view::{Inner, View, ViewRow, ViewRows};
+use view::{View, ViewRow, ViewRows};
 
 #[derive(Error)]
 pub enum SqliteError {
@@ -418,7 +418,7 @@ impl Sqlite {
             },
         ]);
 
-        let btreepage = BTreePage::read(self, 1, schema)?;
+        let btreepage = BTreePage::read(self, 1, schema, Some("root".into()))?;
         Ok(Table::BTreePage(btreepage))
     }
 
@@ -558,7 +558,8 @@ impl Sqlite {
 
         match query {
             Query::CreateTable(CreateTableStatement { schema, .. }) => {
-                BTreePage::read(self, rootpage, schema).map(Table::BTreePage)
+                BTreePage::read(self, rootpage, schema, Some(name.to_string()))
+                    .map(Table::BTreePage)
             }
             Query::CreateIndex(create_index_statement) => todo!(),
             _ => Err(SqliteError::WrongCommand(query)),
@@ -572,12 +573,21 @@ impl Sqlite {
             where_clause,
         } = select;
 
-        let (table, names) = match from_clause {
+        let table = match from_clause {
             From::Table { table, alias } => {
-                let mut names = vec![table.clone()];
-                names.extend(alias.into_iter());
+                let table = self.table(&table)?;
 
-                (self.table(&table)?, names)
+                let Some(alias) = alias else {
+                    return Ok(table);
+                };
+
+                match table {
+                    Table::BTreePage(btreepage) => {
+                        let btreepage = btreepage.add_alias(alias);
+                        Table::BTreePage(btreepage)
+                    }
+                    _ => unreachable!(),
+                }
             }
             From::Subquery { query, alias } => todo!(),
             From::Join { left, right, on } => todo!(),
@@ -586,8 +596,7 @@ impl Sqlite {
         if select_clause == vec![Select::Wildcard] {
             Ok(table)
         } else {
-            let inner = Inner { table, names };
-            let view = View::new(select_clause, inner);
+            let view = View::new(select_clause, table);
             Ok(Table::View(view))
         }
 

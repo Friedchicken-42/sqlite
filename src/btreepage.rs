@@ -66,6 +66,7 @@ pub struct Cell<'page> {
     data: &'page [u8],
     schema: &'page Schema,
     page_type: PageType,
+    names: &'page [String],
 }
 
 impl<'page> Cell<'page> {
@@ -74,8 +75,10 @@ impl<'page> Cell<'page> {
     }
 
     pub fn get(&self, column: Column) -> Result<Value<'page>> {
-        let Column::Single(name) = column else {
-            return Err(SqliteError::WrongColumn(column));
+        let name = match column {
+            Column::Single(name) => name,
+            Column::Dotted { table, column } if self.names.contains(&table) => column,
+            Column::Dotted { table, .. } => return Err(SqliteError::TableNotFound(table)),
         };
 
         let Some(index) = self
@@ -175,12 +178,18 @@ impl Page {
         Ok(pointers)
     }
 
-    fn cell<'page>(&'page self, offset: usize, schema: &'page Schema) -> Cell<'page> {
+    fn cell<'page>(
+        &'page self,
+        offset: usize,
+        schema: &'page Schema,
+        names: &'page [String],
+    ) -> Cell<'page> {
         let data = &self.data[offset..];
         Cell {
             data,
             schema,
             page_type: self.r#type().unwrap(),
+            names,
         }
     }
 
@@ -279,10 +288,16 @@ pub struct BTreePage<'db> {
     storage: Storage<'db>,
     schema: Schema,
     rowid: usize,
+    names: Vec<String>,
 }
 
 impl<'db> BTreePage<'db> {
-    pub fn read(db: &'db Sqlite, index: usize, schema: Schema) -> Result<Self> {
+    pub fn read(
+        db: &'db Sqlite,
+        index: usize,
+        schema: Schema,
+        name: Option<String>,
+    ) -> Result<Self> {
         Ok(Self {
             storage: Storage::File {
                 db,
@@ -291,6 +306,10 @@ impl<'db> BTreePage<'db> {
             },
             schema,
             rowid: 0,
+            names: match name {
+                Some(s) => vec![s],
+                None => vec![],
+            },
         })
     }
 
@@ -309,6 +328,13 @@ impl<'db> BTreePage<'db> {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub fn add_alias(self, alias: String) -> Self {
+        let mut names = self.names;
+        names.push(alias);
+
+        Self { names, ..self }
     }
 }
 
@@ -329,7 +355,7 @@ impl Iterator for BTreeRows<'_, '_> {
         };
 
         let offset = page.pointers().unwrap().nth(index).unwrap();
-        let cell = page.cell(offset, &self.btree.schema);
+        let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
 
         Some(Row::Cell(cell))
     }
@@ -371,7 +397,7 @@ impl BTreeRows<'_, '_> {
 
                         match page_type {
                             PageType::TableLeaf => {
-                                let cell = page.cell(offset, &self.btree.schema);
+                                let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
 
                                 if filter(&cell).is_eq() {
                                     return;
@@ -406,7 +432,7 @@ impl BTreeRows<'_, '_> {
                                 let mut pointers = page.pointers().unwrap();
                                 let offset = pointers.nth((*index - 1) / 2).unwrap();
 
-                                let cell = page.cell(offset, &self.btree.schema);
+                                let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
 
                                 if filter(&cell).is_eq() {
                                     return;
@@ -420,7 +446,7 @@ impl BTreeRows<'_, '_> {
                         drop(pointers);
 
                         // TODO: add function check
-                        let cell = page.cell(offset, &self.btree.schema);
+                        let cell = page.cell(offset, &self.btree.schema, &self.btree.names);
                         let pointer = cell.page();
 
                         begin = true;

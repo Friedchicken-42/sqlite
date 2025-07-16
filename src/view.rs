@@ -1,23 +1,16 @@
-use chumsky::container::Seq;
-
 use crate::{
     Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
     parser::Select,
 };
 
-pub struct Inner<'table> {
-    pub table: Table<'table>,
-    pub names: Vec<String>,
-}
-
 pub struct View<'table> {
-    inner: Box<Inner<'table>>,
+    inner: Box<Table<'table>>,
     schema: Schema,
     inner_columns: Vec<Column>,
 }
 
-fn create_schema(select: Vec<Select>, inner: &Inner) -> Result<(Schema, Vec<Column>)> {
-    let schema = inner.table.schema();
+fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
+    let schema = inner.schema();
 
     let srs = select
         .iter()
@@ -27,9 +20,9 @@ fn create_schema(select: Vec<Select>, inner: &Inner) -> Result<(Schema, Vec<Colu
                 .iter()
                 .map(|sr| (sr.clone(), sr.column.clone()))
                 .collect::<Vec<_>>()),
-            Select::Column {
-                table: Some(table), ..
-            } if !inner.names.contains(table) => Err(SqliteError::TableNotFound(table.to_string())),
+            // Selec::Column {
+            //     table: Some(table), ..
+            // } if !inner.names.contains(table) => Err(SqliteError::TableNotFound(table.to_string())),
             Select::Column { name, alias, table } => {
                 let sr = schema
                     .0
@@ -37,9 +30,6 @@ fn create_schema(select: Vec<Select>, inner: &Inner) -> Result<(Schema, Vec<Colu
                     .find(|sr| sr.column.name() == name)
                     .ok_or(SqliteError::ColumnNotFound(name.as_str().into()))?
                     .clone();
-
-                // select a.id as kek
-                // sr { kek, .. }, Dotted { a, id }
 
                 let sr = match alias {
                     Some(alias) => SchemaRow {
@@ -75,10 +65,8 @@ fn create_schema(select: Vec<Select>, inner: &Inner) -> Result<(Schema, Vec<Colu
 }
 
 impl<'table> View<'table> {
-    pub fn new(select: Vec<Select>, inner: Inner<'table>) -> Self {
+    pub fn new(select: Vec<Select>, inner: Table<'table>) -> Self {
         let (schema, inner_columns) = create_schema(select, &inner).unwrap();
-        println!("{schema:?}");
-        println!("{inner_columns:?}");
 
         Self {
             inner: Box::new(inner),
@@ -89,14 +77,14 @@ impl<'table> View<'table> {
 
     pub fn rows(&mut self) -> Rows<'_, 'table> {
         Rows::View(ViewRows {
-            rows: Box::new(self.inner.table.rows()),
+            rows: Box::new(self.inner.rows()),
             schema: &self.schema,
             inner: &self.inner_columns,
         })
     }
 
     pub fn count(&mut self) -> usize {
-        self.inner.table.count()
+        self.inner.count()
     }
 
     pub fn schema(&self) -> &Schema {
