@@ -3,7 +3,7 @@ use chumsky::{
     prelude::*,
 };
 
-use crate::{Schema, SchemaRow, SqliteError, Type};
+use crate::{Column, Schema, SchemaRow, SqliteError, Type};
 
 #[derive(Debug, PartialEq)]
 pub enum Query {
@@ -88,7 +88,7 @@ pub enum Operator {
 
 #[derive(Debug, PartialEq)]
 pub enum Expression {
-    Column { name: String, table: Option<String> },
+    Column(Column),
     Literal(String),
     Number(u64),
 }
@@ -110,17 +110,10 @@ fn comparison_parser<'src>()
             .padded()
             .map(|s: &str| Expression::Literal(s.to_string())))
         .or(ident
-            .then(just(".").ignore_then(ident).or_not().padded())
-            .map(|(first, second): (&str, Option<&str>)| match second {
-                None => Expression::Column {
-                    name: first.to_string(),
-                    table: None,
-                },
-                Some(n) => Expression::Column {
-                    name: n.to_string(),
-                    table: Some(first.to_string()),
-                },
-            }));
+            .then(just(".").ignore_then(ident).or_not())
+            .to_slice()
+            .padded()
+            .map(|string: &str| Expression::Column(string.trim().into())));
 
     let operator = choice((
         just("<>").to(Operator::NotEqual),
@@ -214,29 +207,34 @@ fn selectstmt_parser<'src>()
                 },
             );
 
-        let from = join.or(table_subquery);
+        let from = just("from").padded().ignore_then(join.or(table_subquery));
 
-        let limit = text::int(10).map(|n: &str| Limit {
-            limit: n.parse().unwrap(),
-        });
+        let r#where = just("where").padded().ignore_then(where_parser()).or_not();
+
+        let limit = just("limit")
+            .padded()
+            .ignore_then(text::int(10))
+            .map(|n: &str| Limit {
+                limit: n.parse().unwrap(),
+            })
+            .or_not();
 
         just("select")
             .padded()
             .ignore_then(columns)
-            .then_ignore(just("from").padded())
             .then(from)
-            .then(just("where").padded().ignore_then(where_parser()).or_not())
-            .then(just("limit").padded().ignore_then(limit).or_not())
+            .then(r#where)
+            .then(limit)
             .map(
-                |(((columns, from), r#where), limit): (
+                |(((select_clause, from_clause), where_clause), limit_clause): (
                     ((Vec<Select>, From), Option<WhereStatement>),
                     Option<Limit>,
                 )| {
                     SelectStatement {
-                        select_clause: columns,
-                        from_clause: from,
-                        where_clause: r#where,
-                        limit_clause: limit,
+                        select_clause,
+                        from_clause,
+                        where_clause,
+                        limit_clause,
                     }
                 },
             )
@@ -252,12 +250,19 @@ fn createtablestmt_parser<'src>()
 -> impl Parser<'src, &'src str, CreateTableStatement, extra::Err<Rich<'src, char>>> {
     let ident = text::ident().padded();
 
+    let string = ident
+        .repeated()
+        .to_slice()
+        .delimited_by(just('"'), just('"'))
+        .padded();
+
     let r#type = choice((
         just("integer").or(just("int")).to(Type::Integer),
         just("text").to(Type::Text),
     ));
 
-    let column = ident
+    let column = string
+        .or(ident)
         .padded()
         .then(r#type.padded())
         .then_ignore(ident.repeated());
@@ -267,9 +272,11 @@ fn createtablestmt_parser<'src>()
         .at_least(1)
         .collect::<Vec<_>>();
 
+    let table = string.or(ident);
+
     just("create table")
         .padded()
-        .ignore_then(ident)
+        .ignore_then(table)
         .then(columns.delimited_by(just("("), just(")")))
         .map(
             |(table, columns): (&str, Vec<(&str, Type)>)| CreateTableStatement {
@@ -369,7 +376,7 @@ mod tests {
         match parse(query) {
             Ok(parsed) => {
                 if parsed != expected {
-                    panic!("{parsed:#?}\n{expected:#?}");
+                    panic!("{query}\n=== Parsed ===\n{parsed:#?}\n=== Expected ===\n{expected:#?}");
                 }
             }
             Err(report) => display_report(query, report),
@@ -398,12 +405,9 @@ mod tests {
 
     #[test]
     fn test_complex() {
-        fn comparison((table, name): (&str, &str), op: Operator, right: u64) -> WhereStatement {
+        fn comparison(column: Column, op: Operator, right: u64) -> WhereStatement {
             WhereStatement::Comparison(Comparison {
-                left: Expression::Column {
-                    name: name.into(),
-                    table: Some(table.into()),
-                },
+                left: Expression::Column(column),
                 op,
                 right: Expression::Number(right),
             })
@@ -423,10 +427,10 @@ mod tests {
                 },
                 where_clause: Some(WhereStatement::Or(
                     Box::new(WhereStatement::And(
-                        Box::new(comparison(("u", "id"), Operator::Greater, 1)),
-                        Box::new(comparison(("u", "id"), Operator::Less, 10)),
+                        Box::new(comparison("u.id".into(), Operator::Greater, 1)),
+                        Box::new(comparison("u.id".into(), Operator::Less, 10)),
                     )),
-                    Box::new(comparison(("u", "id"), Operator::NotEqual, 3)),
+                    Box::new(comparison("u.id".into(), Operator::NotEqual, 3)),
                 )),
                 limit_clause: None,
             }),

@@ -1,5 +1,5 @@
 use crate::{
-    Column, Iterator, Row, Rows, Table, Value,
+    Iterator, Row, Rows, Table, Value,
     parser::{Comparison, Expression, Operator, WhereStatement},
 };
 
@@ -19,17 +19,7 @@ impl Comparison {
 
         fn to_value<'a>(expr: &'a Expression, row: &'a Row) -> Value<'a> {
             match expr {
-                Expression::Column { name, table } => {
-                    let column = match table {
-                        None => Column::Single(name.to_string()),
-                        Some(table) => Column::Dotted {
-                            table: table.to_string(),
-                            column: name.to_string(),
-                        },
-                    };
-
-                    row.get(column).unwrap()
-                }
+                Expression::Column(column) => row.get(column.clone()).unwrap(),
                 Expression::Literal(s) => Value::Text(s),
                 Expression::Number(n) => Value::Integer(*n),
             }
@@ -56,11 +46,7 @@ pub struct Where<'db> {
 
 fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match expr {
-        Expression::Column { name, table: None } => write!(f, "{name}"),
-        Expression::Column {
-            name,
-            table: Some(table),
-        } => write!(f, "{table}.{name}"),
+        Expression::Column(column) => write!(f, "{column}"),
         Expression::Literal(s) => write!(f, "{s:?}"),
         Expression::Number(n) => write!(f, "{n}"),
     }
