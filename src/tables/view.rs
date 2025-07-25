@@ -64,6 +64,7 @@ fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Colu
         Schema {
             names: schema.names.clone(),
             columns: srs.0,
+            primary: vec![],
         },
         srs.1,
     ))

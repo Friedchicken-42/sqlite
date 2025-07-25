@@ -1,6 +1,8 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
-use crate::{Column, Iterator, Result, Row, Rows, Schema, Sqlite, SqliteError, Value};
+use crate::{
+    Column, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type, Value,
+};
 use std::fmt::Debug;
 
 #[derive(Debug)]
@@ -136,6 +138,22 @@ pub struct Page {
 }
 
 impl Page {
+    fn new(header_file_size: Option<NonZeroUsize>, page_size: usize, page_type: PageType) -> Page {
+        let mut data = vec![0; page_size];
+
+        data[0] = match page_type {
+            PageType::TableLeaf => 0x0d,
+            PageType::IndexLeaf => 0x0a,
+            PageType::TableInterior => 0x05,
+            PageType::IndexInterior => 0x02,
+        };
+
+        Page {
+            data,
+            header_file_size,
+        }
+    }
+
     fn offset(&self) -> usize {
         match self.header_file_size {
             Some(n) => n.into(),
@@ -279,10 +297,46 @@ impl Storage<'_> {
     }
 }
 
+pub struct BTreePageBuilder {
+    header_page_size: Option<NonZeroUsize>,
+    page_size: usize,
+    is_index: bool,
+    schema: Schema,
+}
+
+impl BTreePageBuilder {
+    pub fn new(schema: Schema) -> Self {
+        Self {
+            header_page_size: None,
+            page_size: 200,
+            is_index: false,
+            schema,
+        }
+    }
+
+    pub fn build<'db>(self) -> Result<BTreePage<'db>> {
+        let page_type = match self.is_index {
+            false => PageType::TableLeaf,
+            true => PageType::IndexLeaf,
+        };
+
+        let page = Page::new(self.header_page_size, self.page_size, page_type);
+
+        Ok(BTreePage {
+            storage: Storage::Memory {
+                pages: vec![page],
+                stack: vec![0],
+            },
+            schema: self.schema,
+            rowid: Some(0),
+        })
+    }
+}
+
 pub struct BTreePage<'db> {
     storage: Storage<'db>,
     schema: Schema,
-    rowid: usize,
+    rowid: Option<usize>,
 }
 
 impl<'db> BTreePage<'db> {
@@ -294,7 +348,7 @@ impl<'db> BTreePage<'db> {
                 stack: vec![],
             },
             schema,
-            rowid: 0,
+            rowid: Some(0),
         })
     }
 
@@ -319,6 +373,29 @@ impl<'db> BTreePage<'db> {
         &self.schema
     }
 
+    pub fn serialize(&self, values: &[Value]) -> Vec<u8> {
+        for value in values {
+            let Serialized { varint, data } = value.serialize();
+        }
+
+        todo!()
+    }
+
+    pub fn insert(&mut self, values: &[Value]) -> Result<()> {
+        for (sr, value) in self.schema.columns.iter().zip(values.iter()) {
+            if value.r#type() != Type::Null && sr.r#type != value.r#type() {
+                return Err(SqliteError::WrongValueType {
+                    expected: sr.r#type,
+                    actual: value.r#type(),
+                });
+            }
+        }
+
+        let data = self.serialize(values);
+
+        Ok(())
+    }
+
     pub fn write_indented(
         &self,
         f: &mut std::fmt::Formatter,
@@ -330,6 +407,7 @@ impl<'db> BTreePage<'db> {
 
         writeln!(f, "{:<width$} │ {}{}", "from", indent, names)
     }
+
     pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let name = self.schema.names.iter().max_by_key(|s| s.len()).unwrap();
 
@@ -461,7 +539,7 @@ impl BTreeRows<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, Table, parser::Query};
+    use crate::{Result, SchemaRow, Table, Type, parser::Query};
 
     use super::*;
 
@@ -490,6 +568,45 @@ mod tests {
         }
 
         assert_eq!(table.count(), i as usize);
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert() -> Result<()> {
+        let schema = Schema {
+            names: vec![],
+            columns: vec![
+                SchemaRow {
+                    column: "a".into(),
+                    r#type: Type::Integer,
+                },
+                SchemaRow {
+                    column: "b".into(),
+                    r#type: Type::Integer,
+                },
+            ],
+            primary: vec![0],
+        };
+
+        let mut btree = BTreePage {
+            storage: Storage::Memory {
+                pages: vec![Page::new(None, 200, PageType::TableLeaf)],
+                stack: vec![0],
+            },
+            schema,
+            rowid: None,
+        };
+
+        // .index(vec![column])
+        // .rowid(false)
+        // .build()?;
+        // btree.insert(&[Value::Integer(10), Value::Integer(20)]);
+        // - insert
+        //   - if btree has `rowid` => walk until rowid match
+        //   - else                 => walk until primary key match (?)
+
+        btree.insert(&[Value::Integer(10), Value::Integer(20)]);
 
         Ok(())
     }

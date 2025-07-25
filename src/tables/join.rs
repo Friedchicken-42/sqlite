@@ -39,7 +39,11 @@ impl<'table> Join<'table> {
         Self {
             left: Box::new(left),
             right: Box::new(right),
-            schema: Schema { names, columns },
+            schema: Schema {
+                names,
+                columns,
+                primary: vec![],
+            },
         }
     }
 

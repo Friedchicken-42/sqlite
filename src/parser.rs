@@ -1,4 +1,5 @@
 use chumsky::{
+    container::Seq,
     pratt::{infix, left},
     prelude::*,
 };
@@ -244,11 +245,24 @@ fn selectstmt_parser<'src>()
 #[derive(Debug, PartialEq)]
 pub struct CreateTableStatement {
     pub schema: Schema,
+    pub extras: Vec<Extra>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum Key {
+    Primary,
+    AutoIncrement,
+    NotNull,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Extra {
+    WithoutRowid,
 }
 
 fn createtablestmt_parser<'src>()
 -> impl Parser<'src, &'src str, CreateTableStatement, extra::Err<Rich<'src, char>>> {
-    let ident = text::ident().padded();
+    let ident = text::ident().or(just("_")).padded();
 
     let string = ident
         .repeated()
@@ -261,11 +275,16 @@ fn createtablestmt_parser<'src>()
         just("text").to(Type::Text),
     ));
 
-    let column = string
-        .or(ident)
-        .padded()
-        .then(r#type.padded())
-        .then_ignore(ident.repeated());
+    let key = choice((
+        just("primary key").to(Key::Primary),
+        just("autoincrement").to(Key::AutoIncrement),
+        just("not null").to(Key::NotNull),
+    ))
+    .padded()
+    .repeated()
+    .collect::<Vec<_>>();
+
+    let column = string.or(ident).then(r#type.padded()).then(key);
 
     let columns = column
         .separated_by(just(","))
@@ -274,24 +293,62 @@ fn createtablestmt_parser<'src>()
 
     let table = string.or(ident);
 
+    let extra = choice((just("without rowid").to(Extra::WithoutRowid),))
+        .padded()
+        .repeated()
+        .collect::<Vec<_>>();
+
     just("create table")
         .padded()
         .ignore_then(table)
         .then(columns.delimited_by(just("("), just(")")))
+        .then(extra)
         .map(
-            |(table, columns): (&str, Vec<(&str, Type)>)| CreateTableStatement {
-                schema: Schema {
-                    names: vec![table.to_string()],
-                    columns: columns
-                        .into_iter()
-                        .map(|(a, b)| SchemaRow {
-                            column: a.into(),
-                            r#type: b,
-                        })
-                        .collect::<_>(),
-                },
+            |((table, columns), extras): ((&str, Vec<((&str, Type), Vec<Key>)>), Vec<Extra>)| {
+                let names = vec![table.to_string()];
+
+                let (pairs, keys): (Vec<(&str, Type)>, Vec<Vec<Key>>) = columns.into_iter().unzip();
+
+                let columns = pairs
+                    .into_iter()
+                    .map(|(c, t)| SchemaRow {
+                        column: c.into(),
+                        r#type: t,
+                    })
+                    .collect::<_>();
+
+                let primary = keys
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, k)| k.contains(&Key::Primary))
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                CreateTableStatement {
+                    schema: Schema {
+                        columns,
+                        names,
+                        primary,
+                    },
+                    extras,
+                }
             },
         )
+    // .map(
+    //     |(table, columns): (&str, Vec<(&str, Type)>)| CreateTableStatement {
+    //         schema: Schema {
+    //             names: vec![table.to_string()],
+    //             columns: columns
+    //                 .into_iter()
+    //                 .map(|(a, b)| SchemaRow {
+    //                     column: a.into(),
+    //                     r#type: b,
+    //                 })
+    //                 .collect::<_>(),
+    //             primary: vec![],
+    //         },
+    //     },
+    // )
 }
 
 #[derive(Debug, PartialEq)]
@@ -458,6 +515,7 @@ mod tests {
                             r#type: Type::Integer,
                         },
                     ],
+                    primary: vec![],
                 },
             }),
         );

@@ -129,7 +129,7 @@ impl Display for SqliteError {
 
 pub type Result<T> = std::result::Result<T, SqliteError>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
     Null,
     Integer,
@@ -274,6 +274,7 @@ impl Display for Value<'_> {
 pub struct Schema {
     pub names: Vec<String>,
     pub columns: Vec<SchemaRow>,
+    pub primary: Vec<usize>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -509,6 +510,7 @@ impl Sqlite {
                     r#type: Type::Text,
                 },
             ],
+            primary: vec![],
         };
 
         let btreepage = BTreePage::read(self, 1, schema)?;
@@ -650,7 +652,7 @@ impl Sqlite {
         let (rootpage, query) = self.find(name)?;
 
         match query {
-            Query::CreateTable(CreateTableStatement { schema, .. }) => {
+            Query::CreateTable(CreateTableStatement { schema, extras }) => {
                 BTreePage::read(self, rootpage, schema).map(Table::BTreePage)
             }
             Query::CreateIndex(create_index_statement) => todo!(),
@@ -731,7 +733,10 @@ impl Sqlite {
     pub fn execute(&self, query: Query) -> Result<Table<'_>> {
         match query {
             Query::Select(select_statement) => self.query_builder(select_statement),
-            Query::CreateTable(create_table_statement) => todo!(),
+            Query::CreateTable(create_table_statement) => {
+                println!("{:?}", create_table_statement);
+                todo!();
+            }
             Query::CreateIndex(create_index_statement) => todo!(),
         }
     }
