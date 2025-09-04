@@ -5,7 +5,7 @@ mod tables;
 use crate::{
     parser::{CreateTableStatement, From, Query, Select, SelectStatement, WhereStatement},
     tables::{
-        btreepage::{BTreePage, BTreeRows, Cell, Page, Varint},
+        btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
         view::{View, ViewRow, ViewRows},
@@ -738,6 +738,20 @@ impl Sqlite {
                 todo!();
             }
             Query::CreateIndex(create_index_statement) => todo!(),
+            Query::Explain(select_statement) => {
+                let table = self.query_builder(select_statement)?;
+                println!("{table:#?}");
+
+                // Returns empty table
+                let schema = Schema {
+                    names: vec![],
+                    columns: vec![],
+                    primary: vec![],
+                };
+                let btree = BTreePageBuilder::new(schema).build()?;
+
+                Ok(Table::BTreePage(btree))
+            }
         }
     }
 }

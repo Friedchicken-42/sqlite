@@ -29,7 +29,7 @@ impl<'table> Join<'table> {
 
                 let sr = SchemaRow {
                     column,
-                    r#type: sr.r#type.clone(),
+                    r#type: sr.r#type,
                 };
 
                 columns.push(sr);

@@ -11,6 +11,7 @@ pub enum Query {
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
+    Explain(SelectStatement),
 }
 
 impl Query {
@@ -334,21 +335,6 @@ fn createtablestmt_parser<'src>()
                 }
             },
         )
-    // .map(
-    //     |(table, columns): (&str, Vec<(&str, Type)>)| CreateTableStatement {
-    //         schema: Schema {
-    //             names: vec![table.to_string()],
-    //             columns: columns
-    //                 .into_iter()
-    //                 .map(|(a, b)| SchemaRow {
-    //                     column: a.into(),
-    //                     r#type: b,
-    //                 })
-    //                 .collect::<_>(),
-    //             primary: vec![],
-    //         },
-    //     },
-    // )
 }
 
 #[derive(Debug, PartialEq)]
@@ -382,11 +368,17 @@ fn createindexstmt_parser<'src>()
         )
 }
 
+fn explain_parser<'src>()
+-> impl Parser<'src, &'src str, SelectStatement, extra::Err<Rich<'src, char>>> {
+    just("explain").padded().ignore_then(selectstmt_parser())
+}
+
 fn parser<'src>() -> impl Parser<'src, &'src str, Query, extra::Err<Rich<'src, char>>> {
     selectstmt_parser()
         .map(Query::Select)
         .or(createtablestmt_parser().map(Query::CreateTable))
         .or(createindexstmt_parser().map(Query::CreateIndex))
+        .or(explain_parser().map(Query::Explain))
         .then_ignore(just(";").or_not())
 }
 
@@ -515,8 +507,9 @@ mod tests {
                             r#type: Type::Integer,
                         },
                     ],
-                    primary: vec![],
+                    primary: vec![0],
                 },
+                extras: vec![],
             }),
         );
     }

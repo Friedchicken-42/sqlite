@@ -33,7 +33,6 @@ fn database(args: &[String]) -> Result<()> {
         input => {
             let query = Query::parse(input)?;
             let mut table = db.execute(query)?;
-            println!("{table:#?}");
 
             let options = DisplayOptions::r#box();
             table.display(options);

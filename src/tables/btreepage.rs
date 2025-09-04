@@ -373,6 +373,7 @@ impl<'db> BTreePage<'db> {
         &self.schema
     }
 
+    /*
     pub fn serialize(&self, values: &[Value]) -> Vec<u8> {
         for value in values {
             let Serialized { varint, data } = value.serialize();
@@ -395,6 +396,7 @@ impl<'db> BTreePage<'db> {
 
         Ok(())
     }
+    */
 
     pub fn write_indented(
         &self,
@@ -572,6 +574,7 @@ mod tests {
         Ok(())
     }
 
+    /*
     #[test]
     fn insert() -> Result<()> {
         let schema = Schema {
@@ -606,8 +609,9 @@ mod tests {
         //   - if btree has `rowid` => walk until rowid match
         //   - else                 => walk until primary key match (?)
 
-        btree.insert(&[Value::Integer(10), Value::Integer(20)]);
+        // btree.insert(&[Value::Integer(10), Value::Integer(20)]);
 
         Ok(())
     }
+    */
 }

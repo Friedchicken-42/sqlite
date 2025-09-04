@@ -174,38 +174,50 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
         }
     };
 
-    display_spacer_top(&opts);
-    display_schema(table.schema(), &opts);
-    display_spacer_middle(&opts);
+    // let mut rows = table.rows();
+    backup.reverse();
+    let mut populated = false;
 
-    let mut rows = table.rows();
+    loop {
+        if let Some(row) = backup.pop() {
+            if !populated {
+                display_spacer_top(&opts);
+                display_schema(&schema, &opts);
+                display_spacer_middle(&opts);
+            }
 
-    if __BACKUP {
-        for _ in 0..BACKUP_SIZE {
-            rows.next();
-        }
+            populated = true;
 
-        for row in backup.into_iter() {
             for (i, serialized) in row.iter().enumerate() {
                 let value = Value::read(&serialized.data, &serialized.varint).unwrap();
                 display_value(value, i, &opts);
             }
 
             println!();
-        }
-
-        if !ended {
-            while let Some(row) = rows.next() {
-                display_row(row, &schema, &opts);
+        } else if ended {
+            if populated {
+                display_spacer_bottom(&opts);
             }
-        }
-    } else {
-        while let Some(row) = rows.next() {
+
+            break;
+        } else if let Some(row) = rows.next() {
+            if !populated {
+                display_spacer_top(&opts);
+                display_schema(&schema, &opts);
+                display_spacer_middle(&opts);
+            }
+
+            populated = true;
+
             display_row(row, &schema, &opts);
+        } else {
+            if populated {
+                display_spacer_bottom(&opts);
+            }
+
+            break;
         }
     }
-
-    display_spacer_bottom(&opts);
 }
 
 fn display_list(table: &mut Table<'_>, opts: DisplayOptions) {
