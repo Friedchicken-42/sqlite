@@ -174,7 +174,6 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
         }
     };
 
-    // let mut rows = table.rows();
     backup.reverse();
     let mut populated = false;
 

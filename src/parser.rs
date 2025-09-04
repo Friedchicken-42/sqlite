@@ -71,11 +71,32 @@ pub enum WhereStatement {
     Or(Box<Self>, Box<Self>),
 }
 
+impl WhereStatement {
+    pub fn index(&self) -> Vec<(Column, Expression)> {
+        match self {
+            WhereStatement::Comparison(comparison) => comparison.index(),
+            WhereStatement::And(left, right) => [left.index(), right.index()].concat(),
+            WhereStatement::Or(..) => vec![],
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct Comparison {
     pub left: Expression,
     pub op: Operator,
     pub right: Expression,
+}
+
+impl Comparison {
+    fn index(&self) -> Vec<(Column, Expression)> {
+        match (&self.left, &self.op) {
+            (Expression::Column(column), Operator::Equal) => {
+                vec![(column.clone(), self.right.clone())]
+            }
+            _ => vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,7 +109,7 @@ pub enum Operator {
     GreaterEqual,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Expression {
     Column(Column),
     Literal(String),
@@ -108,6 +129,8 @@ fn comparison_parser<'src>()
         .padded()
         .map(|s: &str| Expression::Number(s.parse().unwrap()))
         .or(ident
+            .repeated()
+            .to_slice()
             .delimited_by(just("\'"), just("\'"))
             .padded()
             .map(|s: &str| Expression::Literal(s.to_string())))
@@ -339,9 +362,9 @@ fn createtablestmt_parser<'src>()
 
 #[derive(Debug, PartialEq)]
 pub struct CreateIndexStatement {
-    name: String,
-    table: String,
-    columns: Vec<String>,
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<String>,
 }
 
 fn createindexstmt_parser<'src>()

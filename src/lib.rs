@@ -3,9 +3,13 @@ pub mod parser;
 mod tables;
 
 use crate::{
-    parser::{CreateTableStatement, From, Query, Select, SelectStatement, WhereStatement},
+    parser::{
+        CreateIndexStatement, CreateTableStatement, Expression, From, Query, Select,
+        SelectStatement, WhereStatement,
+    },
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
+        indexed::{Indexed, IndexedRows},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
         view::{View, ViewRow, ViewRows},
@@ -185,16 +189,16 @@ impl<'src> Value<'src> {
     pub fn read(data: &'src [u8], varint: &Varint) -> Result<Self> {
         match varint.value {
             0 => Ok(Value::Null),
-            n @ 1..=4 => {
+            n @ 1..=6 => {
+                let length = [1, 2, 3, 4, 6, 8];
                 let mut number = 0;
-                for value in data.iter().take(n) {
+                for value in data.iter().take(length[n - 1]) {
                     number = (number << 8) + *value as u64;
                 }
                 Ok(Value::Integer(number))
             }
             8 => Ok(Value::Integer(0)),
             9 => Ok(Value::Integer(1)),
-            // 10 | 11 => Err(SqliteError::UnhandledSerial(varint.value)),
             n if n >= 12 && n.is_multiple_of(2) => {
                 let length = (n - 12) / 2;
                 Ok(Value::Blob(&data[..length]))
@@ -228,7 +232,7 @@ impl<'src> Value<'src> {
             },
             // TODO: clean up this
             Value::Integer(n) => Serialized {
-                varint: Varint::new(8),
+                varint: Varint::new(6),
                 data: u64::to_be_bytes(*n).to_vec(),
             },
             Value::Float(_) => todo!(),
@@ -322,6 +326,7 @@ impl Column {
 
 pub enum Table<'db> {
     BTreePage(BTreePage<'db>),
+    Indexed(Indexed<'db>),
     View(View<'db>),
     Join(Join<'db>),
     Where(Where<'db>),
@@ -341,6 +346,7 @@ impl<'db> Table<'db> {
     pub fn rows(&mut self) -> Rows<'_, 'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.rows(),
+            Table::Indexed(indexed) => indexed.rows(),
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
             Table::Where(r#where) => r#where.rows(),
@@ -359,6 +365,7 @@ impl<'db> Table<'db> {
     pub fn schema(&self) -> &Schema {
         match self {
             Table::BTreePage(btreepage) => btreepage.schema(),
+            Table::Indexed(indexed) => indexed.table.schema(),
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
@@ -374,6 +381,7 @@ impl<'db> Table<'db> {
     ) -> std::fmt::Result {
         match self {
             Table::BTreePage(btreepage) => btreepage.write_indented(f, width, indent),
+            Table::Indexed(indexed) => indexed.write_indented(f, width, indent),
             Table::View(view) => view.write_indented(f, width, indent),
             Table::Join(join) => join.write_indented(f, width, indent),
             Table::Where(r#where) => r#where.write_indented(f, width, indent),
@@ -384,6 +392,7 @@ impl<'db> Table<'db> {
     fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Table::BTreePage(btreepage) => btreepage.write_normal(f),
+            Table::Indexed(indexed) => indexed.write_normal(f),
             Table::View(view) => view.write_normal(f),
             Table::Join(join) => join.write_normal(f),
             Table::Where(r#where) => r#where.write_normal(f),
@@ -404,6 +413,7 @@ pub trait Iterator {
 
 pub enum Rows<'rows, 'db> {
     BTreePage(BTreeRows<'rows, 'db>),
+    Indexed(IndexedRows<'rows, 'db>),
     View(ViewRows<'rows, 'db>),
     Join(JoinRows<'rows, 'db>),
     Where(WhereRows<'rows, 'db>),
@@ -414,6 +424,7 @@ impl Iterator for Rows<'_, '_> {
     fn current(&self) -> Option<Row<'_>> {
         match self {
             Rows::BTreePage(btreerows) => btreerows.current(),
+            Rows::Indexed(indexed) => indexed.current(),
             Rows::View(view) => view.current(),
             Rows::Join(join) => join.current(),
             Rows::Where(r#where) => r#where.current(),
@@ -424,6 +435,7 @@ impl Iterator for Rows<'_, '_> {
     fn advance(&mut self) {
         match self {
             Rows::BTreePage(btreerows) => btreerows.advance(),
+            Rows::Indexed(indexed) => indexed.advance(),
             Rows::View(view) => view.advance(),
             Rows::Join(join) => join.advance(),
             Rows::Where(r#where) => r#where.advance(),
@@ -601,7 +613,10 @@ impl Sqlite {
         })
     }
 
-    fn find(&self, name: &str) -> Result<(usize, Query)> {
+    fn find<P>(&self, predicate: P) -> Result<Option<(usize, Query)>>
+    where
+        P: Fn(&str, &Query) -> bool,
+    {
         let mut root = self.root()?;
         let mut rows = root.rows();
 
@@ -616,7 +631,7 @@ impl Sqlite {
                 }
             };
 
-            if name != tbl_name {
+            if tbl_name == "sqlite_sequence" {
                 continue;
             }
 
@@ -642,43 +657,170 @@ impl Sqlite {
 
             let query = Query::parse(&sql.to_lowercase())?;
 
-            return Ok((rootpage as usize, query));
+            if !predicate(tbl_name, &query) {
+                continue;
+            }
+
+            return Ok(Some((rootpage as usize, query)));
         }
 
-        Err(SqliteError::TableNotFound(name.to_string()))
+        Ok(None)
     }
 
-    pub fn table(&self, name: &str) -> Result<Table<'_>> {
-        let (rootpage, query) = self.find(name)?;
+    pub fn table(&self, name: &str) -> Result<BTreePage<'_>> {
+        let Some((rootpage, query)) = self.find(|tbl_name, _| tbl_name == name)? else {
+            return Err(SqliteError::TableNotFound(name.to_string()));
+        };
 
-        match query {
-            Query::CreateTable(CreateTableStatement { schema, extras }) => {
-                BTreePage::read(self, rootpage, schema).map(Table::BTreePage)
-            }
-            Query::CreateIndex(create_index_statement) => todo!(),
-            _ => Err(SqliteError::WrongCommand(Box::new(query))),
+        if let Query::CreateTable(CreateTableStatement { schema, .. }) = query {
+            BTreePage::read(self, rootpage, schema)
+        } else {
+            Err(SqliteError::WrongCommand(Box::new(query)))
         }
+    }
+
+    fn index(
+        &self,
+        table_name: &str,
+        pairs: &[(Column, Expression)],
+    ) -> Result<Option<BTreePage<'_>>> {
+        let mut root = self.root()?;
+        let mut rows = root.rows();
+
+        let mut best: Option<(usize, u64, CreateIndexStatement)> = None;
+
+        while let Some(row) = rows.next() {
+            let tbl_name = match row.get("name".into())? {
+                Value::Text(s) => s,
+                other => {
+                    return Err(SqliteError::WrongValueType {
+                        expected: Type::Text,
+                        actual: other.r#type(),
+                    });
+                }
+            };
+
+            if tbl_name == "sqlite_sequence" {
+                continue;
+            }
+
+            let sql = match row.get("sql".into())? {
+                Value::Text(s) => s,
+                other => {
+                    return Err(SqliteError::WrongValueType {
+                        expected: Type::Text,
+                        actual: other.r#type(),
+                    });
+                }
+            };
+
+            let rootpage = match row.get("rootpage".into())? {
+                Value::Integer(r) => r,
+                other => {
+                    return Err(SqliteError::WrongValueType {
+                        expected: Type::Text,
+                        actual: other.r#type(),
+                    });
+                }
+            };
+
+            let query = Query::parse(&sql.to_lowercase())?;
+            let Query::CreateIndex(index) = query else {
+                continue;
+            };
+
+            if index.table != table_name {
+                continue;
+            }
+
+            let mut count = 0;
+            for col in index.columns.iter() {
+                for (c, _) in pairs {
+                    if col == c.name() {
+                        count += 1;
+                    }
+                }
+            }
+
+            best = match best {
+                None if count == 0 => None,
+                Some((c, ..)) if c >= count => best,
+                _ => Some((count, rootpage, index)),
+            };
+        }
+
+        let Some((_, rootpage, index)) = best else {
+            return Ok(None);
+        };
+
+        let table = self.table(table_name)?;
+
+        let mut schema = vec![];
+        let mut primary = vec![];
+
+        for (idx, name) in index.columns.iter().enumerate() {
+            let out = table
+                .schema()
+                .columns
+                .iter()
+                .find(|sr| sr.column.name() == name);
+
+            if let Some(sr) = out {
+                schema.push(sr.clone());
+                primary.push(idx);
+            } else {
+                return Err(SqliteError::ColumnNotFound(name.as_str().into()));
+            }
+        }
+
+        schema.push(SchemaRow {
+            column: "index".into(),
+            r#type: Type::Integer, // TODO: check integer or blob
+        });
+
+        let schema = Schema {
+            names: vec![index.name],
+            columns: schema,
+            primary,
+        };
+
+        let btreepage = BTreePage::read(self, rootpage as usize, schema)?;
+        Ok(Some(btreepage))
     }
 
     #[allow(clippy::wrong_self_convention)]
-    fn from_builder(&self, from_clause: From) -> Result<Table<'_>> {
+    fn from_builder(
+        &self,
+        from_clause: From,
+        where_clause: Option<&WhereStatement>,
+    ) -> Result<Table<'_>> {
         match from_clause {
             From::Table { table, alias } => {
-                let table = self.table(&table)?;
+                let mut btreepage = self.table(&table)?;
 
-                match (alias, table) {
-                    (None, table) => Ok(table),
-                    (Some(alias), Table::BTreePage(mut btp)) => {
-                        btp.add_alias(alias);
-                        Ok(Table::BTreePage(btp))
-                    }
-                    _ => unreachable!(),
+                if let Some(alias) = alias {
+                    btreepage.add_alias(alias);
                 }
+
+                if let Some(r#where) = where_clause {
+                    let pairs = r#where.index();
+                    if let Some(index) = self.index(&table, &pairs)? {
+                        let indexed = Indexed {
+                            table: btreepage,
+                            index,
+                            pairs,
+                        };
+
+                        return Ok(Table::Indexed(indexed));
+                    }
+                }
+
+                Ok(Table::BTreePage(btreepage))
             }
             From::Subquery { query, alias } => todo!(),
             From::Join { left, right, on } => {
-                let left = self.from_builder(*left)?;
-                let right = self.from_builder(*right)?;
+                let left = self.from_builder(*left, None)?;
+                let right = self.from_builder(*right, None)?;
                 let join = Table::Join(Join::new(left, right));
 
                 match on {
@@ -702,30 +844,22 @@ impl Sqlite {
             limit_clause,
         } = select;
 
-        let table = self.from_builder(from_clause)?;
+        let mut table = self.from_builder(from_clause, where_clause.as_ref())?;
 
-        let table = match where_clause {
-            None => table,
-            Some(r#where) => {
-                let r#where = Where::new(table, r#where);
-                Table::Where(r#where)
-            }
-        };
+        if let Some(r#where) = where_clause {
+            let r#where = Where::new(table, r#where);
+            table = Table::Where(r#where);
+        }
 
-        let table = if select_clause == vec![Select::Wildcard] {
-            table
-        } else {
+        if select_clause != vec![Select::Wildcard] {
             let view = View::new(select_clause, table);
-            Table::View(view)
-        };
+            table = Table::View(view);
+        }
 
-        let table = match limit_clause {
-            None => table,
-            Some(limit_stmt) => {
-                let limit = Limit::new(table, limit_stmt.limit);
-                Table::Limit(limit)
-            }
-        };
+        if let Some(limit_stmt) = limit_clause {
+            let limit = Limit::new(table, limit_stmt.limit);
+            table = Table::Limit(limit);
+        }
 
         Ok(table)
     }

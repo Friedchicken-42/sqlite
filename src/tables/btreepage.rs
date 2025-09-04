@@ -77,6 +77,22 @@ impl<'page> Cell<'page> {
         u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize
     }
 
+    pub fn rowid(&self) -> Result<usize> {
+        match self.page_type {
+            PageType::TableLeaf => {
+                let Varint { length, .. } = Varint::read(self.data);
+                let Varint { value, .. } = Varint::read(&self.data[length..]);
+                Ok(value)
+            }
+            PageType::TableInterior => {
+                let Varint { value, .. } = Varint::read(&self.data[4..]);
+                Ok(value)
+            }
+            PageType::IndexLeaf => Err(SqliteError::WrongPageType(0x0a)),
+            PageType::IndexInterior => Err(SqliteError::WrongPageType(0x02)),
+        }
+    }
+
     pub fn get(&self, column: Column) -> Result<Value<'page>> {
         let name = match column {
             Column::Single(name) => name,
@@ -211,7 +227,7 @@ impl Page {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum PageType {
     TableLeaf,
     IndexLeaf,
@@ -418,8 +434,8 @@ impl<'db> BTreePage<'db> {
 }
 
 pub struct BTreeRows<'rows, 'db> {
-    btree: &'rows mut BTreePage<'db>,
-    indexes: Vec<usize>,
+    pub btree: &'rows mut BTreePage<'db>,
+    pub indexes: Vec<usize>,
 }
 
 impl Iterator for BTreeRows<'_, '_> {
@@ -445,7 +461,7 @@ impl Iterator for BTreeRows<'_, '_> {
 }
 
 impl BTreeRows<'_, '_> {
-    fn loop_until<F: Fn(&Cell) -> Ordering>(&mut self, filter: F) {
+    pub fn loop_until<F: Fn(&Cell) -> Ordering>(&mut self, filter: F) {
         let mut begin = self.indexes.is_empty();
 
         if begin {
@@ -470,9 +486,11 @@ impl BTreeRows<'_, '_> {
                         // Reached the end of this page, pop it
                         self.indexes.pop();
                         self.btree.storage.pop();
+                        begin = false;
                     } else {
                         let mut pointers = page.pointers().unwrap();
                         let offset = pointers.nth(*index).unwrap();
+                        drop(pointers);
 
                         match page_type {
                             PageType::TableLeaf => {
@@ -482,7 +500,18 @@ impl BTreeRows<'_, '_> {
                                     return;
                                 }
                             }
-                            PageType::IndexLeaf => return,
+                            PageType::IndexLeaf => {
+                                let cell = page.cell(offset, &self.btree.schema);
+                                match filter(&cell) {
+                                    Ordering::Less => {}
+                                    Ordering::Equal => return,
+                                    Ordering::Greater => {
+                                        self.btree.storage.clear();
+                                        self.indexes = vec![];
+                                        return;
+                                    }
+                                }
+                            }
                             _ => unreachable!(),
                         }
 
@@ -513,7 +542,7 @@ impl BTreeRows<'_, '_> {
 
                                 let cell = page.cell(offset, &self.btree.schema);
 
-                                if filter(&cell).is_eq() {
+                                if filter(&cell).is_ge() {
                                     return;
                                 }
                             }
@@ -524,14 +553,17 @@ impl BTreeRows<'_, '_> {
                         let offset = pointers.nth(*index / 2).unwrap();
                         drop(pointers);
 
-                        // TODO: add function check
                         let cell = page.cell(offset, &self.btree.schema);
-                        let pointer = cell.page();
+                        if filter(&cell).is_ge() {
+                            let pointer = cell.page();
 
-                        begin = true;
+                            begin = true;
 
-                        self.indexes.push(0);
-                        self.btree.storage.push(pointer);
+                            self.indexes.push(0);
+                            self.btree.storage.push(pointer);
+                        } else {
+                            begin = false;
+                        }
                     }
                 }
             }
