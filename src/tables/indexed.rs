@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, marker::PhantomData};
+use std::cmp::Ordering;
 
 use crate::{
     Column, Iterator, Row, Rows, Value,

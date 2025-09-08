@@ -1,8 +1,6 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
-use crate::{
-    Column, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type, Value,
-};
+use crate::{Column, Iterator, Result, Row, Rows, Schema, Sqlite, SqliteError, Value};
 use std::fmt::Debug;
 
 #[derive(Debug)]
@@ -12,9 +10,11 @@ pub struct Varint {
 }
 
 impl Varint {
-    pub fn new(n: usize) -> Self {
-        let data = usize::to_le_bytes(n);
-        Self::read(&data)
+    pub fn new(value: usize) -> Self {
+        Self {
+            value,
+            length: value.div_ceil(0x80),
+        }
     }
 
     pub fn read(data: &[u8]) -> Self {

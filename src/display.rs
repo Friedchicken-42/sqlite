@@ -124,7 +124,7 @@ fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) {
 fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
     const __BACKUP: bool = true;
 
-    const BACKUP_SIZE: usize = 20;
+    const BACKUP_SIZE: usize = 15;
     let mut backup: Vec<Vec<Serialized>> = Vec::with_capacity(BACKUP_SIZE);
     let mut ended = false;
 
@@ -150,6 +150,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
             for sr in schema.columns.iter() {
                 let value = row.get(sr.column.clone()).unwrap();
                 let serialized = value.serialize();
+
                 vec.push(serialized);
             }
 
@@ -159,6 +160,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
         for values in &backup {
             for (i, serialized) in values.iter().enumerate() {
                 let value = Value::read(&serialized.data, &serialized.varint).unwrap();
+
                 sizes[i] = sizes[i].max(value.to_string().len());
             }
         }
