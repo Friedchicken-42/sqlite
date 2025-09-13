@@ -1,9 +1,13 @@
-use crate::{Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value};
+use crate::{
+    Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
+    parser::Expression,
+};
 
 pub struct Join<'table> {
     left: Box<Table<'table>>,
     right: Box<Table<'table>>,
     schema: Schema,
+    left_column: Option<Column>,
 }
 
 impl<'table> Join<'table> {
@@ -44,6 +48,14 @@ impl<'table> Join<'table> {
                 columns,
                 primary: vec![],
             },
+            left_column: None,
+        }
+    }
+
+    pub fn indexed(left: Table<'table>, right: Table<'table>, column: Column) -> Self {
+        Self {
+            left_column: Some(column),
+            ..Self::new(left, right)
         }
     }
 
@@ -53,7 +65,9 @@ impl<'table> Join<'table> {
 
     pub fn rows(&mut self) -> Rows<'_, 'table> {
         Rows::Join(JoinRows {
-            rows: vec![self.left.rows(), self.right.rows()],
+            left: Box::new(self.left.rows()),
+            right: Box::new(self.right.rows()),
+            left_column: self.left_column.as_ref(),
         })
     }
 
@@ -65,7 +79,13 @@ impl<'table> Join<'table> {
     ) -> std::fmt::Result {
         let spacer = "  ".repeat(indent);
 
-        writeln!(f, "{:<width$} │ {}on ...", "join", spacer)?;
+        write!(f, "{:<width$} |{}", "join", spacer)?;
+        if let Some(left_column) = &self.left_column {
+            writeln!(f, "on {}", left_column.name())?;
+        } else {
+            writeln!(f, "full")?;
+        }
+
         self.left.write_indented(f, width, indent + 1)?;
         self.right.write_indented(f, width, indent + 1)?;
 
@@ -84,76 +104,91 @@ impl<'table> Join<'table> {
 }
 
 pub struct JoinRows<'rows, 'table> {
-    rows: Vec<Rows<'rows, 'table>>,
+    left: Box<Rows<'rows, 'table>>,
+    right: Box<Rows<'rows, 'table>>,
+    left_column: Option<&'rows Column>,
 }
 
 impl Iterator for JoinRows<'_, '_> {
     fn current(&self) -> Option<crate::Row<'_>> {
-        let row = self
-            .rows
-            .iter()
-            .map(|r| r.current())
-            .collect::<Option<Vec<_>>>()?;
-
-        Some(Row::Join(JoinRow { row }))
+        if let Some(left) = self.left.current()
+            && let Some(right) = self.right.current()
+        {
+            Some(Row::Join(JoinRow {
+                left: Box::new(left),
+                right: Box::new(right),
+            }))
+        } else {
+            None
+        }
     }
 
     fn advance(&mut self) {
-        loop {
-            let begin = self.rows.iter().all(|r| r.current().is_none());
+        if self.left.current().is_none() && self.right.current().is_none() {
+            self.left.advance();
 
-            if begin {
-                self.rows.iter_mut().for_each(|r| r.advance());
-            } else {
-                for row in self.rows.iter_mut().rev() {
-                    row.advance();
+            self.setup_right();
+            self.right.advance();
+        } else {
+            self.right.advance();
 
-                    if row.current().is_some() {
-                        break;
-                    }
-                }
+            if self.right.current().is_none() {
+                self.left.advance();
 
-                if self.rows.iter().all(|r| r.current().is_none()) {
+                if self.left.current().is_none() {
                     return;
                 }
 
-                for row in self.rows.iter_mut().rev() {
-                    if row.current().is_none() {
-                        row.advance();
-                    }
-                }
-            }
-
-            if self.current().is_some() {
-                return;
+                self.setup_right();
+                self.right.advance();
             }
         }
     }
 }
 
+impl JoinRows<'_, '_> {
+    fn setup_right(&mut self) {
+        let Rows::Indexed(indexed) = &mut *self.right else {
+            return;
+        };
+
+        indexed.expressions.clear();
+
+        let left = self.left.current().unwrap();
+        let column = self.left_column.unwrap();
+        let value = left.get(column.clone()).unwrap();
+
+        let expr = match value {
+            Value::Integer(n) => Expression::Number(n),
+            Value::Text(t) => Expression::Literal(t.to_string()),
+            _ => panic!("not supported as an expression"),
+        };
+
+        indexed.expressions.push(expr);
+    }
+}
+
 pub struct JoinRow<'row> {
-    row: Vec<Row<'row>>,
+    left: Box<Row<'row>>,
+    right: Box<Row<'row>>,
 }
 
 impl<'row> JoinRow<'row> {
     pub fn get(&self, column: Column) -> Result<Value<'row>> {
-        let values = self
-            .row
-            .iter()
-            .flat_map(|r| r.get(column.clone()))
-            .collect::<Vec<_>>();
-
-        match values.len() {
-            0 => Err(SqliteError::ColumnNotFound(column)),
-            1 => Ok(values[0].clone()),
-            _ => Err(SqliteError::WrongColumn(column)),
+        match (
+            self.left.get(column.clone()),
+            self.right.get(column.clone()),
+        ) {
+            (Err(_), Err(_)) => Err(SqliteError::ColumnNotFound(column)),
+            (Ok(_), Ok(_)) => Err(SqliteError::WrongColumn(column)),
+            (Ok(v), Err(_)) | (Err(_), Ok(v)) => Ok(v),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, Sqlite, Table, parser::Query};
+    use crate::{Result, Sqlite, Table, parser::Query, tables::r#where::Where};
 
     use super::*;
 
@@ -175,6 +210,28 @@ mod tests {
             assert_eq!(value, Value::Integer(i % 6 + 1));
             i += 1;
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn join_indexed() -> Result<()> {
+        let db = Sqlite::read("other.db")?;
+        let query = Query::parse("select * from apples as a join apples as b on a.name = b.name")?;
+        let mut table = db.execute(query)?;
+
+        assert!(matches!(&table, Table::Where(_)));
+
+        let mut i = 0;
+        let mut rows = table.rows();
+        while let Some(row) = rows.next() {
+            let a = row.get("a.name".into())?;
+            let b = row.get("b.name".into())?;
+            assert_eq!(a, b);
+            i += 1;
+        }
+
+        assert_eq!(i, 7);
 
         Ok(())
     }

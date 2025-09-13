@@ -9,7 +9,8 @@ use crate::{
 pub struct Indexed<'table> {
     pub table: BTreePage<'table>,
     pub index: BTreePage<'table>,
-    pub pairs: Vec<(Column, Expression)>,
+    pub columns: Vec<Column>,
+    pub expressions: Vec<Expression>,
 }
 
 impl<'table> Indexed<'table> {
@@ -27,7 +28,8 @@ impl<'table> Indexed<'table> {
         Rows::Indexed(IndexedRows {
             table,
             index,
-            pairs: &self.pairs,
+            columns: &mut self.columns,
+            expressions: &mut self.expressions,
         })
     }
 
@@ -41,9 +43,9 @@ impl<'table> Indexed<'table> {
         let table = self.table.schema().names.join(", ");
         let index = self.index.schema().names.join(", ");
         let columns = self
-            .pairs
+            .columns
             .iter()
-            .map(|(c, _)| c.name())
+            .map(|c| c.name())
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -65,7 +67,8 @@ impl<'table> Indexed<'table> {
 pub struct IndexedRows<'rows, 'table> {
     table: BTreeRows<'rows, 'table>,
     index: BTreeRows<'rows, 'table>,
-    pairs: &'rows [(Column, Expression)],
+    pub columns: &'rows Vec<Column>,
+    pub expressions: &'rows mut Vec<Expression>,
 }
 
 impl Iterator for IndexedRows<'_, '_> {
@@ -75,14 +78,17 @@ impl Iterator for IndexedRows<'_, '_> {
 
     fn advance(&mut self) {
         self.index.loop_until(|cell| {
-            for (column, expr) in self.pairs.iter() {
-                let value = match expr {
-                    Expression::Column(_) => todo!(),
-                    Expression::Literal(s) => Value::Text(s.as_str()),
-                    Expression::Number(n) => Value::Integer(*n),
+            for (i, column) in self.columns.iter().enumerate() {
+                // TODO: if Dotted { table } check table in table.name
+                let column: Column = column.name().into();
+
+                let value = match self.expressions.get(i) {
+                    Some(Expression::Literal(s)) => Value::Text(s.as_str()),
+                    Some(Expression::Number(n)) => Value::Integer(*n),
+                    _ => continue,
                 };
 
-                let Ok(v) = cell.get(column.clone()) else {
+                let Ok(v) = cell.get(column) else {
                     continue;
                 };
 

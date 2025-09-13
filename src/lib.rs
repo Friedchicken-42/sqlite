@@ -679,11 +679,7 @@ impl Sqlite {
         }
     }
 
-    fn index(
-        &self,
-        table_name: &str,
-        pairs: &[(Column, Expression)],
-    ) -> Result<Option<BTreePage<'_>>> {
+    fn index(&self, table_name: &str, columns: &[Column]) -> Result<Option<BTreePage<'_>>> {
         let mut root = self.root()?;
         let mut rows = root.rows();
 
@@ -735,7 +731,7 @@ impl Sqlite {
 
             let mut count = 0;
             for col in index.columns.iter() {
-                for (c, _) in pairs {
+                for c in columns {
                     if col == c.name() {
                         count += 1;
                     }
@@ -803,12 +799,15 @@ impl Sqlite {
                 }
 
                 if let Some(r#where) = where_clause {
-                    let pairs = r#where.index();
-                    if let Some(index) = self.index(&table, &pairs)? {
+                    let (columns, expressions): (Vec<Column>, Vec<Expression>) =
+                        r#where.index().into_iter().unzip();
+
+                    if let Some(index) = self.index(&table, &columns)? {
                         let indexed = Indexed {
                             table: btreepage,
                             index,
-                            pairs,
+                            columns,
+                            expressions,
                         };
 
                         return Ok(Table::Indexed(indexed));
@@ -820,17 +819,40 @@ impl Sqlite {
             From::Subquery { query, alias } => todo!(),
             From::Join { left, right, on } => {
                 let left = self.from_builder(*left, None)?;
-                let right = self.from_builder(*right, None)?;
-                let join = Table::Join(Join::new(left, right));
+
+                let join = if let From::Table { table, alias } = &*right
+                    && let Some(on) = &on
+                    && let Expression::Column(column) = &on.right
+                    && let Expression::Column(left_col) = &on.left
+                    && let Some(index) = self.index(table, &[column.clone()])?
+                {
+                    let mut table = self.table(table)?;
+                    if let Some(alias) = alias {
+                        table.add_alias(alias.into());
+                    }
+
+                    let indexed = Indexed {
+                        table,
+                        index,
+                        columns: vec![column.clone()],
+                        expressions: vec![],
+                    };
+
+                    let right = Table::Indexed(indexed);
+                    Table::Join(Join::indexed(left, right, left_col.clone()))
+                } else {
+                    let right = self.from_builder(*right, None)?;
+                    Table::Join(Join::new(left, right))
+                };
 
                 match on {
-                    None => Ok(join),
                     Some(comparison) => {
                         let r#where = WhereStatement::Comparison(comparison);
                         let r#where = Where::new(join, r#where);
 
                         Ok(Table::Where(r#where))
                     }
+                    None => Ok(join),
                 }
             }
         }
