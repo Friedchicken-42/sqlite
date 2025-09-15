@@ -12,10 +12,25 @@ pub struct Join<'table> {
 
 impl<'table> Join<'table> {
     pub fn new(left: Table<'table>, right: Table<'table>) -> Self {
+        let (names, columns) = Self::create_schema(&left, &right);
+
+        Self {
+            left: Box::new(left),
+            right: Box::new(right),
+            schema: Schema {
+                names,
+                columns,
+                primary: vec![],
+            },
+            left_column: None,
+        }
+    }
+
+    fn create_schema(left: &Table<'table>, right: &Table<'table>) -> (Vec<String>, Vec<SchemaRow>) {
         let mut names = vec![];
         let mut columns = vec![];
 
-        for table in [&left, &right] {
+        for table in [left, right] {
             let schema = table.schema();
             let tbl_names = &schema.names;
             let tbl_name = tbl_names.iter().max_by_key(|s| s.len()).unwrap();
@@ -28,7 +43,7 @@ impl<'table> Join<'table> {
                         table: tbl_name.clone(),
                         column: column.clone(),
                     },
-                    dotted => dotted.clone(),
+                    dotted => (*dotted).clone(),
                 };
 
                 let sr = SchemaRow {
@@ -40,16 +55,7 @@ impl<'table> Join<'table> {
             }
         }
 
-        Self {
-            left: Box::new(left),
-            right: Box::new(right),
-            schema: Schema {
-                names,
-                columns,
-                primary: vec![],
-            },
-            left_column: None,
-        }
+        (names, columns)
     }
 
     pub fn indexed(left: Table<'table>, right: Table<'table>, column: Column) -> Self {
@@ -126,22 +132,22 @@ impl Iterator for JoinRows<'_, '_> {
     fn advance(&mut self) {
         if self.left.current().is_none() && self.right.current().is_none() {
             self.left.advance();
+            self.setup_right();
+            self.right.advance();
+            return;
+        }
+
+        self.right.advance();
+
+        if self.right.current().is_none() {
+            self.left.advance();
+
+            if self.left.current().is_none() {
+                return;
+            }
 
             self.setup_right();
             self.right.advance();
-        } else {
-            self.right.advance();
-
-            if self.right.current().is_none() {
-                self.left.advance();
-
-                if self.left.current().is_none() {
-                    return;
-                }
-
-                self.setup_right();
-                self.right.advance();
-            }
         }
     }
 }

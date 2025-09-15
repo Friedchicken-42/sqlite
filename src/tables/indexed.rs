@@ -79,8 +79,15 @@ impl Iterator for IndexedRows<'_, '_> {
     fn advance(&mut self) {
         self.index.loop_until(|cell| {
             for (i, column) in self.columns.iter().enumerate() {
-                // TODO: if Dotted { table } check table in table.name
-                let column: Column = column.name().into();
+                let column = match column {
+                    Column::Dotted { table, column }
+                        if self.table.btree.schema().names.contains(table) =>
+                    {
+                        &Column::Single(column.to_string())
+                    }
+                    Column::Dotted { .. } => continue,
+                    single => single,
+                };
 
                 let value = match self.expressions.get(i) {
                     Some(Expression::Literal(s)) => Value::Text(s.as_str()),
@@ -88,7 +95,7 @@ impl Iterator for IndexedRows<'_, '_> {
                     _ => continue,
                 };
 
-                let Ok(v) = cell.get(column) else {
+                let Ok(v) = cell.get(column.clone()) else {
                     continue;
                 };
 

@@ -53,7 +53,6 @@ fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Colu
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        // TODO: there must be a better way
         .fold((vec![], vec![]), |(mut s, mut n), (a, b)| {
             s.push(a);
             n.push(b);

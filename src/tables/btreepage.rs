@@ -573,7 +573,7 @@ impl BTreeRows<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, SchemaRow, Table, Type, parser::Query};
+    use crate::{Result, Table, parser::Query};
 
     use super::*;
 

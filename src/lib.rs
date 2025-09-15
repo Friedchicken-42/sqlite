@@ -56,63 +56,52 @@ impl SqliteError {
         let mut buffer = vec![];
         let source = Source::from("");
 
-        match self {
-            SqliteError::FileNotFound(f) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("File \"{f}\" not found"))
-                .finish()
-                .write(source, &mut buffer),
+        let report = match self {
+            SqliteError::FileNotFound(file) => Report::build(ReportKind::Error, 1..2)
+                .with_message(format!("File \"{file}\" not found")),
             SqliteError::WrongColumn(column) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Unexpected column: \"{column:?}\""))
-                .finish()
-                .write(source, &mut buffer),
+                .with_message(format!("Unexpected column: \"{column:?}\"")),
             SqliteError::ColumnNotFound(column) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Column \"{column:?}\" not found"))
-                .finish()
-                .write(source, &mut buffer),
+                .with_message(format!("Column \"{column:?}\" not found")),
             SqliteError::UnhandledSerial(n) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Unhandled erial value: {n}"))
-                .finish()
-                .write(source, &mut buffer),
+                .with_message(format!("Unhandled serial value: {n}")),
             SqliteError::PageRead { index, offset } => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Failed to read page {index} at offset {offset}"))
-                .finish()
-                .write(source, &mut buffer),
+                .with_message(format!("Failed to read page {index} at offset {offset}")),
             SqliteError::WrongPageType(n) => Report::build(ReportKind::Error, 1..2)
                 .with_message(format!("Wrong page type: {n:02x}"))
-                .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d")
-                .finish()
-                .write(source, &mut buffer),
+                .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
             SqliteError::WrongValueType { expected, actual } => {
                 Report::build(ReportKind::Error, 1..2)
                     .with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
-                    .finish()
-                    .write(source, &mut buffer)
             }
             SqliteError::TableNotFound(table) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Table {table:?} not found"))
-                .finish()
-                .write(source, &mut buffer),
+                .with_message(format!("Table {table:?} not found")),
             SqliteError::WrongCommand(_) => Report::build(ReportKind::Error, 1..2)
                 .with_message("Wrong command provided")
-                .with_note("todo")
-                .finish()
-                .write(source, &mut buffer),
+                .with_note("This error indicates an unsupported or malformed SQL command"),
             SqliteError::Parser {
                 query,
                 span,
                 message,
-            } => Report::build(ReportKind::Error, ("query", span.clone()))
-                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Char))
-                .with_message(message)
-                .with_label(
-                    Label::new(("query", span.clone()))
-                        .with_message(message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .write(("query", Source::from(query)), &mut buffer),
-        }
-        .map_err(|_| std::fmt::Error)?;
+            } => {
+                return Report::build(ReportKind::Error, ("query", span.clone()))
+                    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Char))
+                    .with_message(message)
+                    .with_label(
+                        Label::new(("query", span.clone()))
+                            .with_message(message)
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .write(("query", Source::from(query)), &mut buffer)
+                    .map_err(|_| std::fmt::Error);
+            }
+        };
+
+        report
+            .finish()
+            .write(source, &mut buffer)
+            .map_err(|_| std::fmt::Error)?;
 
         let str = std::str::from_utf8(&buffer).map_err(|_| std::fmt::Error)?;
         f.write_str(str)
@@ -230,12 +219,14 @@ impl<'src> Value<'src> {
                 varint: Varint::new(4),
                 data: u32::to_be_bytes(*n as u32).to_vec(),
             },
-            // TODO: clean up this
             Value::Integer(n) => Serialized {
                 varint: Varint::new(6),
                 data: u64::to_be_bytes(*n).to_vec(),
             },
-            Value::Float(_) => todo!(),
+            Value::Float(_) => {
+                // TODO: Implement serialization for Float values
+                panic!("Float serialization not yet implemented");
+            }
             Value::Text(string) => {
                 let data: Vec<u8> = string.bytes().collect();
                 let varint = Varint::new(data.len() * 2 + 13);
@@ -534,16 +525,7 @@ impl Sqlite {
         let mut rows = root.rows();
 
         while let Some(row) = rows.next() {
-            let name = match row.get("name".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
+            let name = self.extract_text_value(&row, "name".into())?;
             if name != "sqlite_sequence" {
                 print!("{name} ");
             }
@@ -559,32 +541,14 @@ impl Sqlite {
         let mut rows = table.rows();
 
         while let Some(table) = rows.next() {
-            let name = match table.get("name".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
+            let name = self.extract_text_value(&table, "name".into())?;
             if name == "sqlite_sequence" || name.starts_with("sqlite_autoindex") {
                 continue;
             }
 
             println!("schema {name:?}");
 
-            let sql = match table.get("sql".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
+            let sql = self.extract_text_value(&table, "sql".into())?;
             println!("{sql}");
         }
 
@@ -613,6 +577,26 @@ impl Sqlite {
         })
     }
 
+    fn extract_text_value<'a>(&self, row: &Row<'a>, column: Column) -> Result<&'a str> {
+        match row.get(column)? {
+            Value::Text(s) => Ok(s),
+            other => Err(SqliteError::WrongValueType {
+                expected: Type::Text,
+                actual: other.r#type(),
+            }),
+        }
+    }
+
+    fn extract_integer_value(&self, row: &Row, column: Column) -> Result<u64> {
+        match row.get(column)? {
+            Value::Integer(n) => Ok(n),
+            other => Err(SqliteError::WrongValueType {
+                expected: Type::Integer,
+                actual: other.r#type(),
+            }),
+        }
+    }
+
     fn find<P>(&self, predicate: P) -> Result<Option<(usize, Query)>>
     where
         P: Fn(&str, &Query) -> bool,
@@ -621,39 +605,14 @@ impl Sqlite {
         let mut rows = root.rows();
 
         while let Some(row) = rows.next() {
-            let tbl_name = match row.get("name".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
+            let tbl_name = self.extract_text_value(&row, "name".into())?;
             if tbl_name == "sqlite_sequence" {
                 continue;
             }
 
-            let rootpage = match row.get("rootpage".into())? {
-                Value::Integer(r) => r,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
+            let rootpage = self.extract_integer_value(&row, "rootpage".into())?;
 
-            let sql = match row.get("sql".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
+            let sql = self.extract_text_value(&row, "sql".into())?;
 
             let query = Query::parse(&sql.to_lowercase())?;
 
@@ -686,39 +645,13 @@ impl Sqlite {
         let mut best: Option<(usize, u64, CreateIndexStatement)> = None;
 
         while let Some(row) = rows.next() {
-            let tbl_name = match row.get("name".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
+            let tbl_name = self.extract_text_value(&row, "name".into())?;
             if tbl_name == "sqlite_sequence" {
                 continue;
             }
 
-            let sql = match row.get("sql".into())? {
-                Value::Text(s) => s,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
-
-            let rootpage = match row.get("rootpage".into())? {
-                Value::Integer(r) => r,
-                other => {
-                    return Err(SqliteError::WrongValueType {
-                        expected: Type::Text,
-                        actual: other.r#type(),
-                    });
-                }
-            };
+            let sql = self.extract_text_value(&row, "sql".into())?;
+            let rootpage = self.extract_integer_value(&row, "rootpage".into())?;
 
             let query = Query::parse(&sql.to_lowercase())?;
             let Query::CreateIndex(index) = query else {
@@ -771,7 +704,7 @@ impl Sqlite {
 
         schema.push(SchemaRow {
             column: "index".into(),
-            r#type: Type::Integer, // TODO: check integer or blob
+            r#type: Type::Integer, // TODO: Check if this should be Type::Blob based on SQLite spec
         });
 
         let schema = Schema {
@@ -816,7 +749,10 @@ impl Sqlite {
 
                 Ok(Table::BTreePage(btreepage))
             }
-            From::Subquery { query, alias } => todo!(),
+            From::Subquery { query: _, alias: _ } => {
+                // TODO: Implement subquery support
+                panic!("Subquery support not yet implemented");
+            }
             From::Join { left, right, on } => {
                 let left = self.from_builder(*left, None)?;
 
@@ -891,9 +827,11 @@ impl Sqlite {
             Query::Select(select_statement) => self.query_builder(select_statement),
             Query::CreateTable(create_table_statement) => {
                 println!("{:?}", create_table_statement);
-                todo!();
+                panic!("CreateTable statement execution not yet implemented");
             }
-            Query::CreateIndex(create_index_statement) => todo!(),
+            Query::CreateIndex(_create_index_statement) => {
+                panic!("CreateIndex statement execution not yet implemented");
+            }
             Query::Explain(select_statement) => {
                 let table = self.query_builder(select_statement)?;
                 println!("{table:#?}");
