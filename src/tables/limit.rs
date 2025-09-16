@@ -2,7 +2,7 @@ use crate::{Iterator, Row, Rows, Table};
 
 pub struct Limit<'table> {
     pub inner: Box<Table<'table>>,
-    limit: usize,
+    pub limit: usize,
 }
 
 impl<'table> Limit<'table> {
@@ -35,14 +35,6 @@ impl<'table> Limit<'table> {
 
         self.inner.write_indented(f, width, indent + 1)?;
         writeln!(f, "{:<width$} │ {}{}", "limit", spacer, self.limit)?;
-
-        Ok(())
-    }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "(")?;
-        self.inner.write_normal(f)?;
-        write!(f, ") limit {}", self.limit)?;
 
         Ok(())
     }

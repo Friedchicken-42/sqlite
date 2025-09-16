@@ -9,11 +9,12 @@ use crate::{
     },
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
+        groupby::GroupBy,
         indexed::{Indexed, IndexedRows},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
         view::{View, ViewRow, ViewRows},
-        r#where::{Where, WhereRows},
+        r#where::{Where, WhereRows, write_stmt},
     },
 };
 use ariadne::{Color, Label, Report, ReportKind, Source};
@@ -84,7 +85,7 @@ impl SqliteError {
                 span,
                 message,
             } => {
-                return Report::build(ReportKind::Error, ("query", span.clone()))
+                Report::build(ReportKind::Error, ("query", span.clone()))
                     .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Char))
                     .with_message(message)
                     .with_label(
@@ -94,7 +95,12 @@ impl SqliteError {
                     )
                     .finish()
                     .write(("query", Source::from(query)), &mut buffer)
-                    .map_err(|_| std::fmt::Error);
+                    .map_err(|_| std::fmt::Error)?;
+
+                let str = std::str::from_utf8(&buffer).map_err(|_| std::fmt::Error)?;
+                f.write_str(str)?;
+
+                return Ok(());
             }
         };
 
@@ -321,6 +327,7 @@ pub enum Table<'db> {
     View(View<'db>),
     Join(Join<'db>),
     Where(Where<'db>),
+    Groupby(GroupBy<'db>),
     Limit(Limit<'db>),
 }
 
@@ -341,6 +348,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
             Table::Where(r#where) => r#where.rows(),
+            Table::Groupby(groupby) => groupby.rows(),
             Table::Limit(limit) => limit.rows(),
         }
     }
@@ -348,8 +356,15 @@ impl<'db> Table<'db> {
     pub fn count(&mut self) -> usize {
         match self {
             Table::BTreePage(btreepage) => btreepage.count(),
-            Table::View(view) => view.count(),
-            _ => todo!(),
+            Table::View(view) => view.inner.count(),
+            table => {
+                let mut rows = table.rows();
+                let mut count = 0;
+                while rows.next().is_some() {
+                    count += 1;
+                }
+                count
+            }
         }
     }
 
@@ -360,6 +375,7 @@ impl<'db> Table<'db> {
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
+            Table::Groupby(groupby) => groupby.schema(),
             Table::Limit(limit) => limit.inner.schema(),
         }
     }
@@ -376,18 +392,56 @@ impl<'db> Table<'db> {
             Table::View(view) => view.write_indented(f, width, indent),
             Table::Join(join) => join.write_indented(f, width, indent),
             Table::Where(r#where) => r#where.write_indented(f, width, indent),
+            Table::Groupby(groupby) => groupby.write_indented(f, width, indent),
             Table::Limit(limit) => limit.write_indented(f, width, indent),
         }
     }
 
     fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let schema = self.schema();
+        let name = schema.names.iter().max_by_key(|s| s.len()).unwrap();
+
         match self {
-            Table::BTreePage(btreepage) => btreepage.write_normal(f),
-            Table::Indexed(indexed) => indexed.write_normal(f),
-            Table::View(view) => view.write_normal(f),
-            Table::Join(join) => join.write_normal(f),
-            Table::Where(r#where) => r#where.write_normal(f),
-            Table::Limit(limit) => limit.write_normal(f),
+            Table::BTreePage(_) => writeln!(f, "select * from {name}"),
+            Table::Indexed(indexed) => {
+                let table = indexed.table.schema().names.join(", ");
+                let index = indexed.index.schema().names.join(", ");
+
+                writeln!(f, "select * from {table} using index {index}")
+            }
+            Table::View(view) => {
+                let rows = view.fmt_rows().join(", ");
+
+                write!(f, "(select {rows} from ")?;
+                view.inner.write_normal(f)?;
+                write!(f, ")")?;
+                Ok(())
+            }
+            Table::Join(join) => {
+                write!(f, "(")?;
+                join.left.write_normal(f)?;
+                write!(f, ") join (")?;
+                join.right.write_normal(f)?;
+                write!(f, ")")?;
+                Ok(())
+            }
+            Table::Where(r#where) => {
+                r#where.inner.write_normal(f)?;
+                write!(f, " where ")?;
+                write_stmt(&r#where.r#where, f)?;
+                Ok(())
+            }
+            Table::Groupby(groupby) => {
+                // ...
+                write!(f, " group by ...")?;
+                Ok(())
+            }
+            Table::Limit(limit) => {
+                write!(f, "(")?;
+                limit.inner.write_normal(f)?;
+                write!(f, ") limit {}", limit.limit)?;
+                Ok(())
+            }
         }
     }
 }
@@ -799,6 +853,7 @@ impl Sqlite {
             select_clause,
             from_clause,
             where_clause,
+            groupby_clause,
             limit_clause,
         } = select;
 
@@ -809,7 +864,14 @@ impl Sqlite {
             table = Table::Where(r#where);
         }
 
-        if select_clause != vec![Select::Wildcard] {
+        if select_clause
+            .iter()
+            .any(|s| matches!(s, Select::Function { .. }))
+            || groupby_clause.is_some()
+        {
+            let groupby = GroupBy::new(select_clause, groupby_clause, table)?;
+            table = Table::Groupby(groupby);
+        } else if select_clause != vec![Select::Wildcard] {
             let view = View::new(select_clause, table);
             table = Table::View(view);
         }

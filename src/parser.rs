@@ -33,6 +33,7 @@ pub struct SelectStatement {
     pub select_clause: Vec<Select>,
     pub from_clause: From,
     pub where_clause: Option<WhereStatement>,
+    pub groupby_clause: Option<Groupby>,
     pub limit_clause: Option<Limit>,
 }
 
@@ -43,6 +44,10 @@ pub enum Select {
         name: String,
         table: Option<String>,
         alias: Option<String>,
+    },
+    Function {
+        name: String,
+        args: Vec<Select>,
     },
 }
 
@@ -69,6 +74,11 @@ pub enum WhereStatement {
     Comparison(Comparison),
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Groupby {
+    columns: Vec<Column>,
 }
 
 impl WhereStatement {
@@ -166,6 +176,21 @@ fn where_parser<'src>()
     ))
 }
 
+fn gropuby_parser<'src>()
+-> impl Parser<'src, &'src str, Groupby, extra::Err<Rich<'src, char>>> + Clone {
+    let ident = text::ident().padded();
+
+    ident
+        .then(just(".").ignore_then(ident).or_not())
+        .to_slice()
+        .padded()
+        .map(|column: &str| column.into())
+        .separated_by(just(","))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map(|columns: Vec<Column>| Groupby { columns })
+}
+
 fn selectstmt_parser<'src>()
 -> impl Parser<'src, &'src str, SelectStatement, extra::Err<Rich<'src, char>>> {
     recursive(|select_stmt| {
@@ -189,11 +214,28 @@ fn selectstmt_parser<'src>()
                 },
             );
 
+        let function = ident
+            .then(
+                wildcard
+                    .or(column)
+                    .separated_by(just(",").padded())
+                    .at_least(1)
+                    .collect::<Vec<_>>()
+                    .delimited_by(just("("), just(")")),
+            )
+            .map(|(name, args): (&str, Vec<Select>)| Select::Function {
+                name: name.to_string(),
+                args,
+            });
+
         let columns = wildcard
+            .or(function)
             .or(column)
             .separated_by(just(",").padded())
             .at_least(1)
             .collect::<Vec<_>>();
+
+        let select = just("select").padded().ignore_then(columns);
 
         let subquery = select_stmt
             .delimited_by(just("("), just(")"))
@@ -236,6 +278,11 @@ fn selectstmt_parser<'src>()
 
         let r#where = just("where").padded().ignore_then(where_parser()).or_not();
 
+        let groupby = just("group by")
+            .padded()
+            .ignore_then(gropuby_parser())
+            .or_not();
+
         let limit = just("limit")
             .padded()
             .ignore_then(text::int(10))
@@ -244,25 +291,28 @@ fn selectstmt_parser<'src>()
             })
             .or_not();
 
-        just("select")
-            .padded()
-            .ignore_then(columns)
+        select
             .then(from)
             .then(r#where)
+            .then(groupby)
             .then(limit)
             .map(
-                |(((select_clause, from_clause), where_clause), limit_clause): (
+            |((((select_clause, from_clause), where_clause), groupby_clause), limit_clause): (
+                (
                     ((Vec<Select>, From), Option<WhereStatement>),
-                    Option<Limit>,
-                )| {
-                    SelectStatement {
-                        select_clause,
-                        from_clause,
-                        where_clause,
-                        limit_clause,
-                    }
-                },
-            )
+                    Option<Groupby>,
+                ),
+                Option<Limit>,
+            )| {
+                SelectStatement {
+                    select_clause,
+                    from_clause,
+                    where_clause,
+                    groupby_clause,
+                    limit_clause,
+                }
+            },
+        )
     })
 }
 
@@ -470,6 +520,7 @@ mod tests {
                     alias: None,
                 },
                 where_clause: None,
+                groupby_clause: None,
                 limit_clause: None,
             }),
         );
@@ -504,6 +555,7 @@ mod tests {
                     )),
                     Box::new(comparison("u.id".into(), Operator::NotEqual, 3)),
                 )),
+                groupby_clause: None,
                 limit_clause: None,
             }),
         );

@@ -1,6 +1,8 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
-use crate::{Column, Iterator, Result, Row, Rows, Schema, Sqlite, SqliteError, Value};
+use crate::{
+    Column, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type, Value,
+};
 use std::fmt::Debug;
 
 #[derive(Debug)]
@@ -192,6 +194,15 @@ impl Page {
         u16::from_be_bytes([data[3], data[4]])
     }
 
+    fn increment_cells(&mut self) {
+        let cells = self.cells();
+        let offset = self.offset();
+        let data = &mut self.data[offset..];
+        let cells = u16::to_be_bytes(cells + 1);
+        data[3] = cells[0];
+        data[4] = cells[1];
+    }
+
     fn pointers_offset(&self) -> Result<usize> {
         let r#type = self.r#type()?;
 
@@ -252,6 +263,13 @@ impl Storage<'_> {
         match self {
             Storage::Memory { pages, .. } => &pages[0],
             Storage::File { stack, .. } => &stack[0],
+        }
+    }
+
+    fn first_mut(&mut self) -> &mut Page {
+        match self {
+            Storage::Memory { pages, .. } => &mut pages[0],
+            Storage::File { stack, .. } => &mut stack[0],
         }
     }
 
@@ -389,16 +407,9 @@ impl<'db> BTreePage<'db> {
         &self.schema
     }
 
-    /*
-    pub fn serialize(&self, values: &[Value]) -> Vec<u8> {
-        for value in values {
-            let Serialized { varint, data } = value.serialize();
-        }
-
-        todo!()
-    }
-
     pub fn insert(&mut self, values: &[Value]) -> Result<()> {
+        let mut rows = vec![];
+
         for (sr, value) in self.schema.columns.iter().zip(values.iter()) {
             if value.r#type() != Type::Null && sr.r#type != value.r#type() {
                 return Err(SqliteError::WrongValueType {
@@ -406,13 +417,51 @@ impl<'db> BTreePage<'db> {
                     actual: value.r#type(),
                 });
             }
+
+            rows.push(value.serialize());
         }
 
-        let data = self.serialize(values);
+        // FIXME: temp implementation for group by
+        let page = self.storage.last_mut();
+        let mut offset = page.pointers()?.last().unwrap_or(page.data.len());
+        offset -= 1;
+
+        rows.reverse();
+
+        let mut size = 0;
+
+        for Serialized { data, .. } in &rows {
+            for (i, d) in data.iter().rev().enumerate() {
+                page.data[offset - i] = *d;
+            }
+
+            offset -= data.len();
+            size += data.len();
+        }
+
+        for Serialized { varint, .. } in &rows {
+            page.data[offset] = varint.value as u8;
+            offset -= 1;
+        }
+
+        page.data[offset] = (rows.len() as u8) + 1;
+        offset -= 1;
+
+        page.data[offset] = 1;
+        offset -= 1;
+
+        page.data[offset] = size as u8;
+
+        // pointers
+        let cells = page.pointers()?.count();
+        let ptr = page.pointers_offset()?;
+        page.data[ptr + cells * 2 + 0] = (offset >> 8) as u8;
+        page.data[ptr + cells * 2 + 1] = (offset & 0xff) as u8;
+
+        self.storage.first_mut().increment_cells();
 
         Ok(())
     }
-    */
 
     pub fn write_indented(
         &self,
@@ -424,12 +473,6 @@ impl<'db> BTreePage<'db> {
         let indent = "  ".repeat(indent);
 
         writeln!(f, "{:<width$} │ {}{}", "from", indent, names)
-    }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let name = self.schema.names.iter().max_by_key(|s| s.len()).unwrap();
-
-        writeln!(f, "select * from {name}")
     }
 }
 
@@ -573,7 +616,7 @@ impl BTreeRows<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, Table, parser::Query};
+    use crate::{Result, SchemaRow, Table, Type, parser::Query};
 
     use super::*;
 
@@ -606,7 +649,6 @@ mod tests {
         Ok(())
     }
 
-    /*
     #[test]
     fn insert() -> Result<()> {
         let schema = Schema {
@@ -630,7 +672,7 @@ mod tests {
                 stack: vec![0],
             },
             schema,
-            rowid: None,
+            rowid: Some(0),
         };
 
         // .index(vec![column])
@@ -641,9 +683,22 @@ mod tests {
         //   - if btree has `rowid` => walk until rowid match
         //   - else                 => walk until primary key match (?)
 
-        // btree.insert(&[Value::Integer(10), Value::Integer(20)]);
+        btree.insert(&[Value::Integer(1), Value::Integer(10)])?;
+        btree.insert(&[Value::Integer(2), Value::Integer(20)])?;
+        btree.insert(&[Value::Integer(3), Value::Integer(30)])?;
+        btree.insert(&[Value::Integer(4), Value::Integer(40)])?;
+
+        let mut table = Table::BTreePage(btree);
+        let mut rows = table.rows();
+
+        let mut i = 1;
+        while let Some(row) = rows.next() {
+            assert_eq!(row.get("a".into())?, Value::Integer(i));
+            assert_eq!(row.get("b".into())?, Value::Integer(i * 10));
+
+            i += 1;
+        }
 
         Ok(())
     }
-    */
 }

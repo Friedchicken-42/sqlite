@@ -1,15 +1,15 @@
 use crate::{
-    Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
+    Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Type, Value,
     parser::Select,
 };
 
 pub struct View<'table> {
-    inner: Box<Table<'table>>,
+    pub inner: Box<Table<'table>>,
     schema: Schema,
     inner_columns: Vec<Column>,
 }
 
-fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
+pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
     let schema = inner.schema();
 
     let srs = select
@@ -48,6 +48,20 @@ fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Colu
                 };
 
                 Ok(vec![(sr, column)])
+            }
+            Select::Function { name, .. } => {
+                let r#type = match name.as_str() {
+                    "count" => Type::Integer,
+                    _ => return Err(SqliteError::WrongColumn(name.as_str().into())),
+                };
+
+                Ok(vec![(
+                    SchemaRow {
+                        column: Column::Single(name.into()),
+                        r#type,
+                    },
+                    Column::Single(name.into()),
+                )])
             }
         })
         .collect::<Result<Vec<_>>>()?
@@ -88,15 +102,11 @@ impl<'table> View<'table> {
         })
     }
 
-    pub fn count(&mut self) -> usize {
-        self.inner.count()
-    }
-
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    fn fmt_rows(&self) -> Vec<String> {
+    pub fn fmt_rows(&self) -> Vec<String> {
         self.schema
             .columns
             .iter()
@@ -124,16 +134,6 @@ impl<'table> View<'table> {
 
         writeln!(f, "{:<width$} │ {}{}", "select", spacer, rows)?;
         self.inner.write_indented(f, width, indent + 1)
-    }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let rows = self.fmt_rows().join(", ");
-
-        write!(f, "(select {rows} from ")?;
-        self.inner.write_normal(f)?;
-        write!(f, ")")?;
-
-        Ok(())
     }
 }
 

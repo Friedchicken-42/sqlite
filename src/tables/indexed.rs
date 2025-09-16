@@ -55,13 +55,6 @@ impl<'table> Indexed<'table> {
             "from", spacer, table, index, columns
         )
     }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let table = self.table.schema().names.join(", ");
-        let index = self.index.schema().names.join(", ");
-
-        writeln!(f, "select * from {table} using index {index}")
-    }
 }
 
 pub struct IndexedRows<'rows, 'table> {

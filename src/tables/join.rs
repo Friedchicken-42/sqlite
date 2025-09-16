@@ -4,8 +4,8 @@ use crate::{
 };
 
 pub struct Join<'table> {
-    left: Box<Table<'table>>,
-    right: Box<Table<'table>>,
+    pub left: Box<Table<'table>>,
+    pub right: Box<Table<'table>>,
     schema: Schema,
     left_column: Option<Column>,
 }
@@ -94,16 +94,6 @@ impl<'table> Join<'table> {
 
         self.left.write_indented(f, width, indent + 1)?;
         self.right.write_indented(f, width, indent + 1)?;
-
-        Ok(())
-    }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "(")?;
-        self.left.write_normal(f)?;
-        write!(f, ") join (")?;
-        self.right.write_normal(f)?;
-        write!(f, ")")?;
 
         Ok(())
     }

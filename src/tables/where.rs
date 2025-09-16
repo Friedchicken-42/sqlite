@@ -41,7 +41,7 @@ impl Comparison {
 
 pub struct Where<'db> {
     pub inner: Box<Table<'db>>,
-    r#where: WhereStatement,
+    pub r#where: WhereStatement,
 }
 
 fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,7 +52,7 @@ fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::R
     }
 }
 
-fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+pub fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match stmt {
         WhereStatement::Comparison(comparison) => {
             let Comparison { left, op, right } = comparison;
@@ -116,14 +116,6 @@ impl<'table> Where<'table> {
         write!(f, "{:<width$} │ {}", "where", spacer)?;
         write_stmt(&self.r#where, f)?;
         writeln!(f)?;
-
-        Ok(())
-    }
-
-    pub fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.inner.write_normal(f)?;
-        write!(f, " where ")?;
-        write_stmt(&self.r#where, f)?;
 
         Ok(())
     }
