@@ -1,79 +1,130 @@
+use std::ops::Range;
+
 use chumsky::{
+    Parser,
     container::Seq,
+    extra::ParserExtra,
+    input::MapExtra,
     pratt::{infix, left},
     prelude::*,
 };
 
-use crate::{Column, Schema, SchemaRow, SqliteError, Type};
+use crate::{Column, ErrorKind, Schema, SchemaRow, SqliteError, Type};
+
+trait SqlParser<'src, O> = Parser<'src, &'src str, Spanned<O>, extra::Err<Rich<'src, char>>>;
+
+#[derive(Debug)]
+pub struct Spanned<T> {
+    pub inner: Box<T>,
+    pub span: Range<usize>,
+}
+
+impl<T> Spanned<T> {
+    fn new<'src, 'b, I: Input<'src, Span = SimpleSpan<usize>>, E: ParserExtra<'src, I>>(
+        inner: T,
+        ext: &mut MapExtra<'src, '_, I, E>,
+    ) -> Spanned<T> {
+        Spanned {
+            inner: Box::new(inner),
+            span: ext.span().into_range(),
+        }
+    }
+
+    fn empty(inner: T) -> Spanned<T> {
+        Spanned {
+            inner: Box::new(inner),
+            span: 0..0,
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for Spanned<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl<T> std::ops::Deref for Spanned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Query {
-    Select(SelectStatement),
-    CreateTable(CreateTableStatement),
-    CreateIndex(CreateIndexStatement),
-    Explain(SelectStatement),
+    Select(Spanned<SelectStatement>),
+    CreateTable(Spanned<CreateTableStatement>),
+    CreateIndex(Spanned<CreateIndexStatement>),
+    Explain(Spanned<SelectStatement>),
 }
 
 impl Query {
-    pub fn parse(query: &str) -> crate::Result<Self> {
+    pub fn parse(query: &str) -> crate::Result<Spanned<Query>> {
         parser().parse(query).into_result().map_err(|errs| {
-            let err = &errs[0];
+            let error = &errs[0];
 
-            SqliteError::Parser {
-                query: query.to_string(),
-                span: err.span().into_range(),
-                message: err.to_string(),
-            }
+            SqliteError::new(
+                ErrorKind::Parser(error.to_string()),
+                error.span().into_range(),
+            )
         })
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct SelectStatement {
-    pub select_clause: Vec<Select>,
-    pub from_clause: From,
-    pub where_clause: Option<WhereStatement>,
-    pub groupby_clause: Option<Groupby>,
-    pub limit_clause: Option<Limit>,
+    pub select_clause: Spanned<Vec<Select>>,
+    pub from_clause: Spanned<From>,
+    pub where_clause: Option<Spanned<WhereStatement>>,
+    pub groupby_clause: Option<Spanned<Groupby>>,
+    pub limit_clause: Option<Spanned<Limit>>,
+}
+
+fn ident_parser<'src>() -> impl SqlParser<'src, String> + Clone {
+    text::unicode::ident()
+        .map(|s: &str| s.into())
+        .map_with(Spanned::new)
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Select {
     Wildcard,
     Column {
-        name: String,
-        table: Option<String>,
-        alias: Option<String>,
+        name: Spanned<String>,
+        table: Option<Spanned<String>>,
+        alias: Option<Spanned<String>>,
     },
     Function {
-        name: String,
-        args: Vec<Select>,
+        name: Spanned<String>,
+        args: Spanned<Vec<Select>>,
     },
 }
 
 #[derive(Debug, PartialEq)]
 pub enum From {
     Table {
-        table: String,
-        alias: Option<String>,
+        table: Spanned<String>,
+        alias: Option<Spanned<String>>,
     },
     Subquery {
-        query: Box<SelectStatement>,
-        alias: Option<String>,
+        query: Spanned<SelectStatement>,
+        alias: Option<Spanned<String>>,
     },
     Join {
-        left: Box<From>,
+        left: Spanned<From>,
         // join: Type
-        right: Box<From>,
-        on: Option<Comparison>,
+        right: Spanned<From>,
+        on: Option<Spanned<Comparison>>,
     },
 }
 
 #[derive(Debug, PartialEq)]
 pub enum WhereStatement {
-    Comparison(Comparison),
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
+    Comparison(Spanned<Comparison>),
+    And(Spanned<Self>, Spanned<Self>),
+    Or(Spanned<Self>, Spanned<Self>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -131,8 +182,7 @@ pub struct Limit {
     pub limit: usize,
 }
 
-fn comparison_parser<'src>()
--> impl Parser<'src, &'src str, Comparison, extra::Err<Rich<'src, char>>> + Clone {
+fn comparison_parser<'src>() -> impl SqlParser<'src, Comparison> + Clone {
     let ident = text::ident().padded();
 
     let expression = text::int(10)
@@ -159,25 +209,34 @@ fn comparison_parser<'src>()
         just("=").to(Operator::Equal),
     ));
 
-    expression.then(operator.padded()).then(expression).map(
-        |((left, op), right): ((Expression, Operator), Expression)| Comparison { left, op, right },
-    )
+    expression
+        .then(operator.padded())
+        .then(expression)
+        .map(
+            |((left, op), right): ((Expression, Operator), Expression)| Comparison {
+                left,
+                op,
+                right,
+            },
+        )
+        .map_with(Spanned::new)
 }
 
-fn where_parser<'src>()
--> impl Parser<'src, &'src str, WhereStatement, extra::Err<Rich<'src, char>>> + Clone {
-    comparison_parser().map(WhereStatement::Comparison).pratt((
-        infix(left(2), just("and").padded(), |l, _, r, _| {
-            WhereStatement::And(Box::new(l), Box::new(r))
-        }),
-        infix(left(1), just("or").padded(), |l, _, r, _| {
-            WhereStatement::Or(Box::new(l), Box::new(r))
-        }),
-    ))
+fn where_parser<'src>() -> impl SqlParser<'src, WhereStatement> + Clone {
+    comparison_parser()
+        .map(WhereStatement::Comparison)
+        .map_with(Spanned::new)
+        .pratt((
+            infix(left(2), just("and").padded(), |l, _, r, e| {
+                Spanned::new(WhereStatement::And(l, r), e)
+            }),
+            infix(left(1), just("or").padded(), |l, _, r, e| {
+                Spanned::new(WhereStatement::Or(l, r), e)
+            }),
+        ))
 }
 
-fn gropuby_parser<'src>()
--> impl Parser<'src, &'src str, Groupby, extra::Err<Rich<'src, char>>> + Clone {
+fn gropuby_parser<'src>() -> impl SqlParser<'src, Groupby> + Clone {
     let ident = text::ident().padded();
 
     ident
@@ -189,44 +248,46 @@ fn gropuby_parser<'src>()
         .at_least(1)
         .collect::<Vec<_>>()
         .map(|columns: Vec<Column>| Groupby { columns })
+        .map_with(Spanned::new)
 }
 
-fn selectstmt_parser<'src>()
--> impl Parser<'src, &'src str, SelectStatement, extra::Err<Rich<'src, char>>> {
+fn selectstmt_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
     recursive(|select_stmt| {
-        let ident = text::ident().padded();
-
         let wildcard = just("*").padded().map(|_| Select::Wildcard);
 
-        let column = ident
-            .then(just(".").ignore_then(ident).or_not())
-            .then(just("as").padded().ignore_then(ident).or_not())
+        let column = ident_parser()
+            .then(just(".").ignore_then(ident_parser()).or_not())
+            .then(just("as").padded().ignore_then(ident_parser()).or_not())
             .map(
-                |((first, second), alias): ((&str, Option<&str>), Option<&str>)| {
+                |((first, second), alias): (
+                    (Spanned<String>, Option<Spanned<String>>),
+                    Option<Spanned<String>>,
+                )| {
                     let (table, name) = match second {
-                        None => (None, first.to_string()),
-                        Some(t) => (Some(first.to_string()), t.to_string()),
+                        None => (None, first),
+                        Some(t) => (Some(first), t),
                     };
-
-                    let alias = alias.map(|s| s.to_string());
 
                     Select::Column { table, name, alias }
                 },
             );
 
-        let function = ident
+        let function = ident_parser()
             .then(
                 wildcard
-                    .or(column)
+                    .or(column.clone())
                     .separated_by(just(",").padded())
                     .at_least(1)
                     .collect::<Vec<_>>()
-                    .delimited_by(just("("), just(")")),
+                    .delimited_by(just("("), just(")"))
+                    .map_with(Spanned::new),
             )
-            .map(|(name, args): (&str, Vec<Select>)| Select::Function {
-                name: name.to_string(),
-                args,
-            });
+            .map(
+                |(name, args): (Spanned<String>, Spanned<Vec<Select>>)| Select::Function {
+                    name,
+                    args,
+                },
+            );
 
         let columns = wildcard
             .or(function)
@@ -235,24 +296,30 @@ fn selectstmt_parser<'src>()
             .at_least(1)
             .collect::<Vec<_>>();
 
-        let select = just("select").padded().ignore_then(columns);
+        let select = just("select")
+            .padded()
+            .ignore_then(columns)
+            .map_with(Spanned::new);
 
         let subquery = select_stmt
             .delimited_by(just("("), just(")"))
-            .then(just("as").ignore_then(ident).or_not())
+            .then(just("as").ignore_then(ident_parser()).or_not())
             .map(
-                |(query, alias): (SelectStatement, Option<&str>)| From::Subquery {
-                    query: Box::new(query),
-                    alias: alias.map(|s| s.to_string()),
+                |(query, alias): (Spanned<SelectStatement>, Option<Spanned<String>>)| {
+                    From::Subquery { query, alias }
                 },
-            );
+            )
+            .map_with(Spanned::new);
 
-        let table = ident
-            .then(just("as").padded().ignore_then(ident).or_not())
-            .map(|(table, alias): (&str, Option<&str>)| From::Table {
-                table: table.to_string(),
-                alias: alias.map(|s| s.to_string()),
-            });
+        let table = ident_parser()
+            .then(just("as").padded().ignore_then(ident_parser()).or_not())
+            .map(
+                |(table, alias): (Spanned<String>, Option<Spanned<String>>)| From::Table {
+                    table,
+                    alias,
+                },
+            )
+            .map_with(Spanned::new);
 
         let table_subquery = table.or(subquery);
 
@@ -267,12 +334,12 @@ fn selectstmt_parser<'src>()
                     .or_not(),
             )
             .map(
-                |((q1, q2), on): ((From, From), Option<Comparison>)| From::Join {
-                    left: Box::new(q1),
-                    right: Box::new(q2),
-                    on,
-                },
-            );
+                |((left, right), on): (
+                    (Spanned<From>, Spanned<From>),
+                    Option<Spanned<Comparison>>,
+                )| { From::Join { left, right, on } },
+            )
+            .map_with(Spanned::new);
 
         let from = just("from").padded().ignore_then(join.or(table_subquery));
 
@@ -289,6 +356,7 @@ fn selectstmt_parser<'src>()
             .map(|n: &str| Limit {
                 limit: n.parse().unwrap(),
             })
+            .map_with(Spanned::new)
             .or_not();
 
         select
@@ -299,10 +367,13 @@ fn selectstmt_parser<'src>()
             .map(
             |((((select_clause, from_clause), where_clause), groupby_clause), limit_clause): (
                 (
-                    ((Vec<Select>, From), Option<WhereStatement>),
-                    Option<Groupby>,
+                    (
+                        (Spanned<Vec<Select>>, Spanned<From>),
+                        Option<Spanned<WhereStatement>>,
+                    ),
+                    Option<Spanned<Groupby>>,
                 ),
-                Option<Limit>,
+                Option<Spanned<Limit>>,
             )| {
                 SelectStatement {
                     select_clause,
@@ -313,6 +384,7 @@ fn selectstmt_parser<'src>()
                 }
             },
         )
+        .map_with(Spanned::new)
     })
 }
 
@@ -334,8 +406,7 @@ pub enum Extra {
     WithoutRowid,
 }
 
-fn createtablestmt_parser<'src>()
--> impl Parser<'src, &'src str, CreateTableStatement, extra::Err<Rich<'src, char>>> {
+fn createtablestmt_parser<'src>() -> impl SqlParser<'src, CreateTableStatement> {
     let ident = text::ident().or(just("_")).padded();
 
     let string = ident
@@ -408,6 +479,7 @@ fn createtablestmt_parser<'src>()
                 }
             },
         )
+        .map_with(Spanned::new)
 }
 
 #[derive(Debug, PartialEq)]
@@ -417,8 +489,7 @@ pub struct CreateIndexStatement {
     pub columns: Vec<String>,
 }
 
-fn createindexstmt_parser<'src>()
--> impl Parser<'src, &'src str, CreateIndexStatement, extra::Err<Rich<'src, char>>> {
+fn createindexstmt_parser<'src>() -> impl SqlParser<'src, CreateIndexStatement> {
     let ident = text::ident().padded();
 
     let columns = ident
@@ -439,69 +510,53 @@ fn createindexstmt_parser<'src>()
                 columns: columns.into_iter().map(String::from).collect::<_>(),
             },
         )
+        .map_with(Spanned::new)
 }
 
-fn explain_parser<'src>()
--> impl Parser<'src, &'src str, SelectStatement, extra::Err<Rich<'src, char>>> {
+fn explain_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
     just("explain").padded().ignore_then(selectstmt_parser())
 }
 
-fn parser<'src>() -> impl Parser<'src, &'src str, Query, extra::Err<Rich<'src, char>>> {
-    selectstmt_parser()
-        .map(Query::Select)
-        .or(createtablestmt_parser().map(Query::CreateTable))
-        .or(createindexstmt_parser().map(Query::CreateIndex))
-        .or(explain_parser().map(Query::Explain))
-        .then_ignore(just(";").or_not())
+fn parser<'src>() -> impl SqlParser<'src, Query> {
+    choice((
+        selectstmt_parser().map(Query::Select),
+        createtablestmt_parser().map(Query::CreateTable),
+        createindexstmt_parser().map(Query::CreateIndex),
+        explain_parser().map(Query::Explain),
+    ))
+    .then_ignore(just(";").or_not())
+    .then_ignore(end())
+    .map_with(Spanned::new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ariadne::{Color, Label, Report, ReportKind, Source};
-    use std::ops::Range;
+    use ariadne::Source;
 
-    fn parse(query: &str) -> Result<Query, Report<'_, (&str, Range<usize>)>> {
-        match parser().parse(query).into_result() {
-            Err(errs) => {
-                let err = &errs[0];
+    // fn display_report(query: &str, report: Report<'_, (&str, Range<usize>)>) {
+    //     let mut buffer = Vec::new();
 
-                Err(
-                    Report::build(ReportKind::Error, ("query", err.span().into_range()))
-                        .with_config(
-                            ariadne::Config::new().with_index_type(ariadne::IndexType::Char),
-                        )
-                        .with_message(err.to_string())
-                        .with_label(
-                            Label::new(("query", err.span().into_range()))
-                                .with_message(err.to_string())
-                                .with_color(Color::Red),
-                        )
-                        .finish(),
-                )
-            }
-            Ok(parsed) => Ok(parsed),
-        }
-    }
+    //     report
+    //         .write(("query", Source::from(query)), &mut buffer)
+    //         .unwrap();
 
-    fn display_report(query: &str, report: Report<'_, (&str, Range<usize>)>) {
-        let mut buffer = Vec::new();
-
-        report
-            .write(("query", Source::from(query)), &mut buffer)
-            .unwrap();
-
-        panic!("{}", std::str::from_utf8(&buffer).unwrap());
-    }
+    //     panic!("{}", std::str::from_utf8(&buffer).unwrap());
+    // }
 
     fn check(query: &str, expected: Query) {
-        match parse(query) {
+        match Query::parse(query) {
             Ok(parsed) => {
-                if parsed != expected {
-                    panic!("{query}\n=== Parsed ===\n{parsed:#?}\n=== Expected ===\n{expected:#?}");
+                if *parsed != expected {
+                    panic!(
+                        "{}\n=== Parsed ===\n{:#?}\n=== Expected ===\n{:#?}",
+                        query, *parsed, expected
+                    );
                 }
             }
-            Err(report) => display_report(query, report),
+            Err(err) => {
+                err.write(("query", Source::from(query)), std::io::stdout());
+            }
         }
     }
 
@@ -509,55 +564,55 @@ mod tests {
     fn test_simple() {
         check(
             "select id from users;",
-            Query::Select(SelectStatement {
-                select_clause: vec![Select::Column {
-                    name: "id".into(),
+            Query::Select(Spanned::empty(SelectStatement {
+                select_clause: Spanned::empty(vec![Select::Column {
+                    name: Spanned::empty("id".into()),
                     table: None,
                     alias: None,
-                }],
-                from_clause: From::Table {
-                    table: "users".into(),
+                }]),
+                from_clause: Spanned::empty(From::Table {
+                    table: Spanned::empty("users".into()),
                     alias: None,
-                },
+                }),
                 where_clause: None,
                 groupby_clause: None,
                 limit_clause: None,
-            }),
+            })),
         );
     }
 
     #[test]
     fn test_complex() {
-        fn comparison(column: Column, op: Operator, right: u64) -> WhereStatement {
-            WhereStatement::Comparison(Comparison {
+        fn comparison(column: Column, op: Operator, right: u64) -> Spanned<WhereStatement> {
+            Spanned::empty(WhereStatement::Comparison(Spanned::empty(Comparison {
                 left: Expression::Column(column),
                 op,
                 right: Expression::Number(right),
-            })
+            })))
         }
 
         check(
             "select u.id from users as u where u.id > 1 and u.id < 10 or u.id <> 3;",
-            Query::Select(SelectStatement {
-                select_clause: vec![Select::Column {
-                    name: "id".into(),
-                    table: Some("u".into()),
+            Query::Select(Spanned::empty(SelectStatement {
+                select_clause: Spanned::empty(vec![Select::Column {
+                    name: Spanned::empty("id".into()),
+                    table: Some(Spanned::empty("u".into())),
                     alias: None,
-                }],
-                from_clause: From::Table {
-                    table: "users".into(),
-                    alias: Some("u".into()),
-                },
-                where_clause: Some(WhereStatement::Or(
-                    Box::new(WhereStatement::And(
-                        Box::new(comparison("u.id".into(), Operator::Greater, 1)),
-                        Box::new(comparison("u.id".into(), Operator::Less, 10)),
+                }]),
+                from_clause: Spanned::empty(From::Table {
+                    table: Spanned::empty("users".into()),
+                    alias: Some(Spanned::empty("u".into())),
+                }),
+                where_clause: Some(Spanned::empty(WhereStatement::Or(
+                    Spanned::empty(WhereStatement::And(
+                        comparison("u.id".into(), Operator::Greater, 1),
+                        comparison("u.id".into(), Operator::Less, 10),
                     )),
-                    Box::new(comparison("u.id".into(), Operator::NotEqual, 3)),
-                )),
+                    comparison("u.id".into(), Operator::NotEqual, 3),
+                ))),
                 groupby_clause: None,
                 limit_clause: None,
-            }),
+            })),
         );
     }
 
@@ -565,7 +620,7 @@ mod tests {
     fn test_create_table() {
         check(
             "create table A(id int primary key, x int, y int);",
-            Query::CreateTable(CreateTableStatement {
+            Query::CreateTable(Spanned::empty(CreateTableStatement {
                 schema: Schema {
                     names: vec!["A".into()],
                     columns: vec![
@@ -585,7 +640,7 @@ mod tests {
                     primary: vec![0],
                 },
                 extras: vec![],
-            }),
+            })),
         );
     }
 
@@ -593,11 +648,11 @@ mod tests {
     fn test_create_index() {
         check(
             "create index idx on A(x, y);",
-            Query::CreateIndex(CreateIndexStatement {
+            Query::CreateIndex(Spanned::empty(CreateIndexStatement {
                 name: "idx".into(),
                 table: "A".into(),
                 columns: vec!["x".into(), "y".into()],
-            }),
+            })),
         );
     }
 
@@ -623,8 +678,8 @@ mod tests {
         ];
 
         for query in queries {
-            if let Err(report) = parse(query) {
-                display_report(query, report);
+            if let Err(err) = Query::parse(query) {
+                err.write(("query", Source::from(query)), std::io::stdout());
             }
         }
     }

@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{
-    Column, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type, Value,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type,
+    Value,
 };
 use std::fmt::Debug;
 
@@ -90,8 +91,8 @@ impl<'page> Cell<'page> {
                 let Varint { value, .. } = Varint::read(&self.data[4..]);
                 Ok(value)
             }
-            PageType::IndexLeaf => Err(SqliteError::WrongPageType(0x0a)),
-            PageType::IndexInterior => Err(SqliteError::WrongPageType(0x02)),
+            PageType::IndexLeaf => Err(ErrorKind::WrongPageType(0x0a).into()),
+            PageType::IndexInterior => Err(ErrorKind::WrongPageType(0x02).into()),
         }
     }
 
@@ -99,7 +100,7 @@ impl<'page> Cell<'page> {
         let name = match column {
             Column::Single(name) => name,
             Column::Dotted { table, column } if self.schema.names.contains(&table) => column,
-            Column::Dotted { table, .. } => return Err(SqliteError::TableNotFound(table)),
+            Column::Dotted { table, .. } => return Err(ErrorKind::TableNotFound(table).into()),
         };
 
         let Some(index) = self
@@ -108,7 +109,7 @@ impl<'page> Cell<'page> {
             .iter()
             .position(|sr| matches!(&sr.column, Column::Single(c) if *c == name))
         else {
-            return Err(SqliteError::ColumnNotFound(Column::Single(name)));
+            return Err(ErrorKind::ColumnNotFound(Column::Single(name)).into());
         };
 
         let mut offset = if self.page_type == PageType::IndexInterior {
@@ -185,7 +186,7 @@ impl Page {
             0x0a => Ok(PageType::IndexLeaf),
             0x05 => Ok(PageType::TableInterior),
             0x02 => Ok(PageType::IndexInterior),
-            p => Err(SqliteError::WrongPageType(p)),
+            p => Err(ErrorKind::WrongPageType(p).into()),
         }
     }
 
@@ -412,10 +413,11 @@ impl<'db> BTreePage<'db> {
 
         for (sr, value) in self.schema.columns.iter().zip(values.iter()) {
             if value.r#type() != Type::Null && sr.r#type != value.r#type() {
-                return Err(SqliteError::WrongValueType {
+                return Err(ErrorKind::WrongValueType {
                     expected: sr.r#type,
                     actual: value.r#type(),
-                });
+                }
+                .into());
             }
 
             rows.push(value.serialize());

@@ -1,6 +1,7 @@
 use crate::{
-    Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Type, Value,
-    parser::Select,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Type,
+    Value,
+    parser::{Select, Spanned},
 };
 
 pub struct View<'table> {
@@ -24,8 +25,11 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
                 let sr = schema
                     .columns
                     .iter()
-                    .find(|sr| sr.column.name() == name)
-                    .ok_or(SqliteError::ColumnNotFound(name.as_str().into()))?
+                    .find(|sr| sr.column.name() == **name)
+                    .ok_or(SqliteError::new(
+                        ErrorKind::ColumnNotFound(name.as_str().into()),
+                        name.span.clone(),
+                    ))?
                     .clone();
 
                 let column = match table {
@@ -52,15 +56,20 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
             Select::Function { name, .. } => {
                 let r#type = match name.as_str() {
                     "count" => Type::Integer,
-                    _ => return Err(SqliteError::WrongColumn(name.as_str().into())),
+                    func => {
+                        return Err(SqliteError::new(
+                            ErrorKind::ColumnNotFound(func.into()),
+                            name.span.clone(),
+                        ));
+                    }
                 };
 
                 Ok(vec![(
                     SchemaRow {
-                        column: Column::Single(name.into()),
+                        column: Column::Single(name.as_str().into()),
                         r#type,
                     },
-                    Column::Single(name.into()),
+                    Column::Single(name.as_str().into()),
                 )])
             }
         })
@@ -84,14 +93,14 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
 }
 
 impl<'table> View<'table> {
-    pub fn new(select: Vec<Select>, inner: Table<'table>) -> Self {
-        let (schema, inner_columns) = create_schema(select, &inner).unwrap();
+    pub fn new(select: Spanned<Vec<Select>>, inner: Table<'table>) -> Result<Self> {
+        let (schema, inner_columns) = create_schema(*select.inner, &inner)?;
 
-        Self {
+        Ok(Self {
             inner: Box::new(inner),
             schema,
             inner_columns,
-        }
+        })
     }
 
     pub fn rows(&mut self) -> Rows<'_, 'table> {
@@ -189,9 +198,9 @@ impl<'row> ViewRow<'row> {
             .collect::<Vec<_>>();
 
         match &columns[..] {
-            [] => Err(SqliteError::ColumnNotFound(column)),
+            [] => Err(ErrorKind::ColumnNotFound(column).into()),
             [(i, _)] => self.row.get(self.inner[*i].clone()),
-            _ => Err(SqliteError::WrongColumn(column)),
+            _ => Err(ErrorKind::WrongColumn(column).into()),
         }
     }
 }

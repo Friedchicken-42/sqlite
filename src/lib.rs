@@ -1,11 +1,13 @@
+#![feature(trait_alias)]
+
 pub mod display;
 pub mod parser;
-mod tables;
+pub mod tables;
 
 use crate::{
     parser::{
         CreateIndexStatement, CreateTableStatement, Expression, From, Query, Select,
-        SelectStatement, WhereStatement,
+        SelectStatement, Spanned, WhereStatement,
     },
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
@@ -22,107 +24,88 @@ use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     num::NonZeroUsize,
     ops::Range,
 };
-use thiserror::Error;
 
-#[derive(Error)]
-pub enum SqliteError {
+#[derive(Debug)]
+pub enum ErrorKind {
     FileNotFound(String),
     WrongColumn(Column),
     ColumnNotFound(Column),
     UnhandledSerial(usize),
-    PageRead {
-        index: usize,
-        offset: usize,
-    },
+    PageRead { index: usize, offset: usize },
     WrongPageType(u8),
-    WrongValueType {
-        expected: Type,
-        actual: Type,
-    },
+    WrongValueType { expected: Type, actual: Type },
     TableNotFound(String),
-    WrongCommand(Box<Query>),
-    Parser {
-        query: String,
-        span: Range<usize>,
-        message: String,
-    },
+    WrongCommand(Spanned<Query>),
+    Parser(String),
+}
+
+#[derive(Debug)]
+pub struct SqliteError {
+    kind: ErrorKind,
+    span: Range<usize>,
 }
 
 impl SqliteError {
-    fn format(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut buffer = vec![];
-        let source = Source::from("");
+    pub fn new(kind: ErrorKind, span: Range<usize>) -> Self {
+        Self { kind, span }
+    }
 
-        let report = match self {
-            SqliteError::FileNotFound(file) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("File \"{file}\" not found")),
-            SqliteError::WrongColumn(column) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Unexpected column: \"{column:?}\"")),
-            SqliteError::ColumnNotFound(column) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Column \"{column:?}\" not found")),
-            SqliteError::UnhandledSerial(n) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Unhandled serial value: {n}")),
-            SqliteError::PageRead { index, offset } => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Failed to read page {index} at offset {offset}")),
-            SqliteError::WrongPageType(n) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Wrong page type: {n:02x}"))
-                .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
-            SqliteError::WrongValueType { expected, actual } => {
-                Report::build(ReportKind::Error, 1..2)
-                    .with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
+    pub fn write<'src, C: ariadne::Cache<&'src str>>(self, cache: C, writer: impl Write) {
+        println!("{self:?}");
+        let report = Report::build(ReportKind::Error, ("query", self.span.clone()));
+
+        let label = Label::new(("query", self.span)).with_color(Color::Red);
+
+        let label = match &self.kind {
+            ErrorKind::FileNotFound(file) => label.with_message(format!("File {file:?} not found")),
+            ErrorKind::WrongColumn(column) => {
+                label.with_message(format!("Unexpected column \"{column}\""))
             }
-            SqliteError::TableNotFound(table) => Report::build(ReportKind::Error, 1..2)
-                .with_message(format!("Table {table:?} not found")),
-            SqliteError::WrongCommand(_) => Report::build(ReportKind::Error, 1..2)
-                .with_message("Wrong command provided")
-                .with_note("This error indicates an unsupported or malformed SQL command"),
-            SqliteError::Parser {
-                query,
-                span,
-                message,
-            } => {
-                Report::build(ReportKind::Error, ("query", span.clone()))
-                    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Char))
-                    .with_message(message)
-                    .with_label(
-                        Label::new(("query", span.clone()))
-                            .with_message(message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .write(("query", Source::from(query)), &mut buffer)
-                    .map_err(|_| std::fmt::Error)?;
-
-                let str = std::str::from_utf8(&buffer).map_err(|_| std::fmt::Error)?;
-                f.write_str(str)?;
-
-                return Ok(());
+            ErrorKind::ColumnNotFound(column) => {
+                label.with_message(format!("Column \"{column}\" not found"))
+            }
+            ErrorKind::UnhandledSerial(n) => label.with_message(format!("Wrong serial: {n}")),
+            ErrorKind::PageRead { index, offset } => {
+                label.with_message(format!("Failed to read page {index} at offset {offset}"))
+            }
+            ErrorKind::WrongPageType(n) => {
+                // report
+                // .with_message(format!("Wrong page type: {n:02x}"))
+                // .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
+                label.with_message(format!("Wrong page type: {n:02x}"))
+            }
+            ErrorKind::WrongValueType { expected, actual } => {
+                label.with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
+            }
+            ErrorKind::TableNotFound(table) => {
+                label.with_message(format!("Table {table:?} not found"))
+            }
+            ErrorKind::WrongCommand(query) => {
+                label.with_message("Wrong command provided")
+                // .with_note("This error indicates an unsupported or malformed SQL command"),
+            }
+            ErrorKind::Parser(message) => {
+                // report.with_label(
+                // Label::new(("query", self.span))
+                //     .with_message(message)
+                //     .with_color(Color::Red),
+                label.with_message(message)
             }
         };
 
-        report
-            .finish()
-            .write(source, &mut buffer)
-            .map_err(|_| std::fmt::Error)?;
+        let report = report.with_label(label);
 
-        let str = std::str::from_utf8(&buffer).map_err(|_| std::fmt::Error)?;
-        f.write_str(str)
+        report.finish().write(cache, writer).unwrap();
     }
 }
 
-impl Debug for SqliteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.format(f)
-    }
-}
-
-impl Display for SqliteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.format(f)
+impl Into<SqliteError> for ErrorKind {
+    fn into(self) -> SqliteError {
+        SqliteError::new(self, 0..0)
     }
 }
 
@@ -203,7 +186,7 @@ impl<'src> Value<'src> {
                 let string = str::from_utf8(&data[..length]).unwrap();
                 Ok(Value::Text(string))
             }
-            n => Err(SqliteError::UnhandledSerial(n)),
+            n => Err(ErrorKind::UnhandledSerial(n).into()),
         }
     }
 
@@ -527,12 +510,13 @@ pub struct Sqlite {
 
 impl Sqlite {
     pub fn read(path: &str) -> Result<Self> {
-        let file = File::open(path).map_err(|_| SqliteError::FileNotFound(path.into()))?;
+        let file = File::open(path).map_err(|_| ErrorKind::FileNotFound(path.into()).into())?;
 
         let mut buf = vec![0; 100];
         (&file)
             .read_exact(&mut buf)
-            .map_err(|_| SqliteError::FileNotFound(path.into()))?;
+            .map_err(|_| ErrorKind::FileNotFound(path.into()).into())?;
+
         let header = Header::read(&buf);
 
         Ok(Self { file, header })
@@ -614,11 +598,11 @@ impl Sqlite {
 
         (&self.file)
             .seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| SqliteError::PageRead { index, offset })?;
+            .map_err(|_| ErrorKind::PageRead { index, offset }.into())?;
         let mut data = vec![0; self.header.page_size];
         (&self.file)
             .read_exact(&mut data)
-            .map_err(|_| SqliteError::PageRead { index, offset })?;
+            .map_err(|_| ErrorKind::PageRead { index, offset }.into())?;
 
         let header_file_size = match index - 1 {
             0 => NonZeroUsize::new(100),
@@ -634,24 +618,26 @@ impl Sqlite {
     fn extract_text_value<'a>(&self, row: &Row<'a>, column: Column) -> Result<&'a str> {
         match row.get(column)? {
             Value::Text(s) => Ok(s),
-            other => Err(SqliteError::WrongValueType {
+            other => Err(ErrorKind::WrongValueType {
                 expected: Type::Text,
                 actual: other.r#type(),
-            }),
+            }
+            .into()),
         }
     }
 
     fn extract_integer_value(&self, row: &Row, column: Column) -> Result<u64> {
         match row.get(column)? {
             Value::Integer(n) => Ok(n),
-            other => Err(SqliteError::WrongValueType {
+            other => Err(ErrorKind::WrongValueType {
                 expected: Type::Integer,
                 actual: other.r#type(),
-            }),
+            }
+            .into()),
         }
     }
 
-    fn find<P>(&self, predicate: P) -> Result<Option<(usize, Query)>>
+    fn find<P>(&self, predicate: P) -> Result<Option<(usize, Spanned<Query>)>>
     where
         P: Fn(&str, &Query) -> bool,
     {
@@ -682,13 +668,13 @@ impl Sqlite {
 
     pub fn table(&self, name: &str) -> Result<BTreePage<'_>> {
         let Some((rootpage, query)) = self.find(|tbl_name, _| tbl_name == name)? else {
-            return Err(SqliteError::TableNotFound(name.to_string()));
+            return Err(ErrorKind::TableNotFound(name.to_string()).into());
         };
 
-        if let Query::CreateTable(CreateTableStatement { schema, .. }) = query {
-            BTreePage::read(self, rootpage, schema)
+        if let Query::CreateTable(cts) = &*query {
+            BTreePage::read(self, rootpage, cts.schema.clone())
         } else {
-            Err(SqliteError::WrongCommand(Box::new(query)))
+            Err(ErrorKind::WrongCommand(query).into())
         }
     }
 
@@ -696,7 +682,7 @@ impl Sqlite {
         let mut root = self.root()?;
         let mut rows = root.rows();
 
-        let mut best: Option<(usize, u64, CreateIndexStatement)> = None;
+        let mut best: Option<(usize, u64, Spanned<CreateIndexStatement>)> = None;
 
         while let Some(row) = rows.next() {
             let tbl_name = self.extract_text_value(&row, "name".into())?;
@@ -708,7 +694,7 @@ impl Sqlite {
             let rootpage = self.extract_integer_value(&row, "rootpage".into())?;
 
             let query = Query::parse(&sql.to_lowercase())?;
-            let Query::CreateIndex(index) = query else {
+            let Query::CreateIndex(index) = *query.inner else {
                 continue;
             };
 
@@ -752,7 +738,7 @@ impl Sqlite {
                 schema.push(sr.clone());
                 primary.push(idx);
             } else {
-                return Err(SqliteError::ColumnNotFound(name.as_str().into()));
+                return Err(ErrorKind::ColumnNotFound(name.as_str().into()).into());
             }
         }
 
@@ -762,7 +748,7 @@ impl Sqlite {
         });
 
         let schema = Schema {
-            names: vec![index.name],
+            names: vec![index.name.clone()],
             columns: schema,
             primary,
         };
@@ -774,15 +760,18 @@ impl Sqlite {
     #[allow(clippy::wrong_self_convention)]
     fn from_builder(
         &self,
-        from_clause: From,
-        where_clause: Option<&WhereStatement>,
+        from_clause: Spanned<From>,
+        where_clause: Option<&Spanned<WhereStatement>>,
     ) -> Result<Table<'_>> {
-        match from_clause {
+        match *from_clause.inner {
             From::Table { table, alias } => {
-                let mut btreepage = self.table(&table)?;
+                let mut btreepage = self.table(&table).map_err(|e| SqliteError {
+                    span: table.span.clone(),
+                    ..e
+                })?;
 
                 if let Some(alias) = alias {
-                    btreepage.add_alias(alias);
+                    btreepage.add_alias(*alias.inner);
                 }
 
                 if let Some(r#where) = where_clause {
@@ -808,7 +797,7 @@ impl Sqlite {
                 panic!("Subquery support not yet implemented");
             }
             From::Join { left, right, on } => {
-                let left = self.from_builder(*left, None)?;
+                let left = self.from_builder(left, None)?;
 
                 let join = if let From::Table { table, alias } = &*right
                     && let Some(on) = &on
@@ -818,7 +807,7 @@ impl Sqlite {
                 {
                     let mut table = self.table(table)?;
                     if let Some(alias) = alias {
-                        table.add_alias(alias.into());
+                        table.add_alias(alias.inner.as_str().into());
                     }
 
                     let indexed = Indexed {
@@ -831,13 +820,17 @@ impl Sqlite {
                     let right = Table::Indexed(indexed);
                     Table::Join(Join::indexed(left, right, left_col.clone()))
                 } else {
-                    let right = self.from_builder(*right, None)?;
+                    let right = self.from_builder(right, None)?;
                     Table::Join(Join::new(left, right))
                 };
 
                 match on {
                     Some(comparison) => {
-                        let r#where = WhereStatement::Comparison(comparison);
+                        let span = comparison.span.clone();
+                        let r#where = Spanned {
+                            inner: Box::new(WhereStatement::Comparison(comparison)),
+                            span,
+                        };
                         let r#where = Where::new(join, r#where);
 
                         Ok(Table::Where(r#where))
@@ -848,14 +841,14 @@ impl Sqlite {
         }
     }
 
-    fn query_builder(&self, select: SelectStatement) -> Result<Table<'_>> {
+    fn query_builder(&self, select: Spanned<SelectStatement>) -> Result<Table<'_>> {
         let SelectStatement {
             select_clause,
             from_clause,
             where_clause,
             groupby_clause,
             limit_clause,
-        } = select;
+        } = *select.inner;
 
         let mut table = self.from_builder(from_clause, where_clause.as_ref())?;
 
@@ -864,15 +857,18 @@ impl Sqlite {
             table = Table::Where(r#where);
         }
 
-        if select_clause
-            .iter()
-            .any(|s| matches!(s, Select::Function { .. }))
-            || groupby_clause.is_some()
-        {
-            let groupby = GroupBy::new(select_clause, groupby_clause, table)?;
-            table = Table::Groupby(groupby);
-        } else if select_clause != vec![Select::Wildcard] {
-            let view = View::new(select_clause, table);
+        // if select_clause
+        //     .iter()
+        //     .any(|s| matches!(s, Select::Function { .. }))
+        //     || groupby_clause.is_some()
+        // {
+        // panic!("groupby work in progress");
+
+        // let groupby = GroupBy::new(select_clause, groupby_clause, table)?;
+        // table = Table::Groupby(groupby);
+        // } else if *select_clause != vec![Select::Wildcard] {
+        if *select_clause != vec![Select::Wildcard] {
+            let view = View::new(select_clause, table)?;
             table = Table::View(view);
         }
 
@@ -884,8 +880,8 @@ impl Sqlite {
         Ok(table)
     }
 
-    pub fn execute(&self, query: Query) -> Result<Table<'_>> {
-        match query {
+    pub fn execute(&self, query: Spanned<Query>) -> Result<Table<'_>> {
+        match *query.inner {
             Query::Select(select_statement) => self.query_builder(select_statement),
             Query::CreateTable(create_table_statement) => {
                 println!("{:?}", create_table_statement);

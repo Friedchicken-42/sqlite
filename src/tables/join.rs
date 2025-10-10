@@ -1,5 +1,5 @@
 use crate::{
-    Column, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
     parser::Expression,
 };
 
@@ -175,8 +175,8 @@ impl<'row> JoinRow<'row> {
             self.left.get(column.clone()),
             self.right.get(column.clone()),
         ) {
-            (Err(_), Err(_)) => Err(SqliteError::ColumnNotFound(column)),
-            (Ok(_), Ok(_)) => Err(SqliteError::WrongColumn(column)),
+            (Err(_), Err(_)) => Err(ErrorKind::ColumnNotFound(column).into()),
+            (Ok(_), Ok(_)) => Err(ErrorKind::WrongColumn(column).into()),
             (Ok(v), Err(_)) | (Err(_), Ok(v)) => Ok(v),
         }
     }
@@ -184,7 +184,7 @@ impl<'row> JoinRow<'row> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, Sqlite, Table, parser::Query, tables::r#where::Where};
+    use crate::{Result, Sqlite, Table, parser::Query};
 
     use super::*;
 

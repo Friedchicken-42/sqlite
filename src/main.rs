@@ -1,7 +1,8 @@
+use ariadne::Source;
 use sqlite::{
     Result, Sqlite,
     display::{DisplayOptions, Printable},
-    parser::Query,
+    parser::{Query, Spanned},
 };
 
 fn database(args: &[String]) -> Result<()> {
@@ -30,14 +31,23 @@ fn database(args: &[String]) -> Result<()> {
                 println!("{:?}", row.get("id".into()));
             }
         }
+        ".parse" => {
+            let q = Query::parse(&args[3])?;
+            println!("{q:#?}");
+        }
         input if input.starts_with("info") => {
             use sqlite::Iterator;
 
             let input = input.trim_start_matches("info ");
             let query = Query::parse(input)?;
 
-            if let Query::Select(s) = query {
-                let _ = db.execute(Query::Explain(s))?;
+            if let Query::Select(s) = *query.inner {
+                let span = s.span.clone();
+
+                let _ = db.execute(Spanned {
+                    inner: Box::new(Query::Explain(s)),
+                    span,
+                })?;
             }
 
             let query = Query::parse(input)?;
@@ -75,6 +85,7 @@ fn main() {
     }
 
     if let Err(e) = database(&args) {
-        println!("{e:?}");
+        let query = &args.last().unwrap();
+        e.write(("query", Source::from(query)), std::io::stdout());
     }
 }

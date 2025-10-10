@@ -1,6 +1,6 @@
 use crate::{
     Iterator, Row, Rows, Table, Value,
-    parser::{Comparison, Expression, Operator, WhereStatement},
+    parser::{Comparison, Expression, Operator, Spanned, WhereStatement},
 };
 
 impl WhereStatement {
@@ -41,7 +41,7 @@ impl Comparison {
 
 pub struct Where<'db> {
     pub inner: Box<Table<'db>>,
-    pub r#where: WhereStatement,
+    pub r#where: Spanned<WhereStatement>,
 }
 
 fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,7 +55,7 @@ fn write_expr(expr: &Expression, f: &mut std::fmt::Formatter<'_>) -> std::fmt::R
 pub fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match stmt {
         WhereStatement::Comparison(comparison) => {
-            let Comparison { left, op, right } = comparison;
+            let Comparison { left, op, right } = &**comparison;
             write_expr(left, f)?;
 
             let op = match op {
@@ -90,7 +90,7 @@ pub fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std
 }
 
 impl<'table> Where<'table> {
-    pub fn new(inner: Table<'table>, r#where: WhereStatement) -> Self {
+    pub fn new(inner: Table<'table>, r#where: Spanned<WhereStatement>) -> Self {
         Self {
             inner: Box::new(inner),
             r#where,
