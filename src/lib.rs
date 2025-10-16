@@ -19,7 +19,7 @@ use crate::{
         r#where::{Where, WhereRows, write_stmt},
     },
 };
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use ariadne::{Color, Label, Report, ReportKind};
 use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
@@ -263,7 +263,7 @@ pub struct Schema {
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct SchemaRow {
-    column: Column,
+    column: Spanned<Column>,
     r#type: Type,
 }
 
@@ -531,23 +531,23 @@ impl Sqlite {
             names: vec!["root".into()],
             columns: vec![
                 SchemaRow {
-                    column: "type".into(),
+                    column: Spanned::empty("type".into()),
                     r#type: Type::Text,
                 },
                 SchemaRow {
-                    column: "name".into(),
+                    column: Spanned::empty("name".into()),
                     r#type: Type::Text,
                 },
                 SchemaRow {
-                    column: "tbl_name".into(),
+                    column: Spanned::empty("tbl_name".into()),
                     r#type: Type::Text,
                 },
                 SchemaRow {
-                    column: "rootpage".into(),
+                    column: Spanned::empty("rootpage".into()),
                     r#type: Type::Integer,
                 },
                 SchemaRow {
-                    column: "sql".into(),
+                    column: Spanned::empty("sql".into()),
                     r#type: Type::Text,
                 },
             ],
@@ -743,7 +743,7 @@ impl Sqlite {
         }
 
         schema.push(SchemaRow {
-            column: "index".into(),
+            column: Spanned::empty("index".into()),
             r#type: Type::Integer, // TODO: Check if this should be Type::Blob based on SQLite spec
         });
 

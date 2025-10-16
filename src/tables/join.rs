@@ -1,6 +1,6 @@
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Value,
-    parser::Expression,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, Table, Value,
+    parser::{Expression, Spanned},
 };
 
 pub struct Join<'table> {
@@ -38,7 +38,7 @@ impl<'table> Join<'table> {
             names.extend(tbl_names.iter().cloned());
 
             for sr in &schema.columns {
-                let column = match &sr.column {
+                let column = match &*sr.column {
                     Column::Single(column) => Column::Dotted {
                         table: tbl_name.clone(),
                         column: column.clone(),
@@ -47,7 +47,7 @@ impl<'table> Join<'table> {
                 };
 
                 let sr = SchemaRow {
-                    column,
+                    column: Spanned::span(column, sr.column.span.clone()),
                     r#type: sr.r#type,
                 };
 

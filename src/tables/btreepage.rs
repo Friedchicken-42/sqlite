@@ -1,8 +1,7 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type,
-    Value,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Type, Value,
 };
 use std::fmt::Debug;
 
@@ -107,7 +106,7 @@ impl<'page> Cell<'page> {
             .schema
             .columns
             .iter()
-            .position(|sr| matches!(&sr.column, Column::Single(c) if *c == name))
+            .position(|sr| matches!(&*sr.column, Column::Single(c) if *c == name))
         else {
             return Err(ErrorKind::ColumnNotFound(Column::Single(name)).into());
         };
@@ -618,7 +617,10 @@ impl BTreeRows<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, SchemaRow, Table, Type, parser::Query};
+    use crate::{
+        Result, SchemaRow, Table, Type,
+        parser::{Query, Spanned},
+    };
 
     use super::*;
 
@@ -657,11 +659,11 @@ mod tests {
             names: vec![],
             columns: vec![
                 SchemaRow {
-                    column: "a".into(),
+                    column: Spanned::empty("a".into()),
                     r#type: Type::Integer,
                 },
                 SchemaRow {
-                    column: "b".into(),
+                    column: Spanned::empty("b".into()),
                     r#type: Type::Integer,
                 },
             ],

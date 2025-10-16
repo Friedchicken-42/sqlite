@@ -114,7 +114,7 @@ fn display_value(value: Value, index: usize, opts: &DisplayOptions) {
 
 fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) {
     for (i, sr) in schema.columns.iter().enumerate() {
-        let value = row.get(sr.column.clone()).unwrap();
+        let value = row.get((*sr.column).clone()).unwrap();
         display_value(value, i, opts);
     }
 
@@ -148,7 +148,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
             let mut vec = vec![];
 
             for sr in schema.columns.iter() {
-                let value = row.get(sr.column.clone()).unwrap();
+                let value = row.get((*sr.column).clone()).unwrap();
                 let serialized = value.serialize();
 
                 vec.push(serialized);

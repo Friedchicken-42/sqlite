@@ -7,10 +7,10 @@ use crate::{
 pub struct View<'table> {
     pub inner: Box<Table<'table>>,
     schema: Schema,
-    inner_columns: Vec<Column>,
+    inner_columns: Vec<Spanned<Column>>,
 }
 
-pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Column>)> {
+pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Spanned<Column>>)> {
     let schema = inner.schema();
 
     let srs = select
@@ -42,14 +42,20 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
 
                 let sr = match alias {
                     Some(alias) => SchemaRow {
-                        column: Column::Single(alias.to_string()),
+                        column: Spanned::span(
+                            Column::Single(alias.to_string()),
+                            sr.column.span.clone(),
+                        ),
+
                         ..sr
                     },
                     None => SchemaRow {
-                        column: column.clone(),
+                        column: Spanned::span(column.clone(), sr.column.span.clone()),
                         ..sr
                     },
                 };
+
+                let column = Spanned::span(column, sr.column.span.clone());
 
                 Ok(vec![(sr, column)])
             }
@@ -66,10 +72,10 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
 
                 Ok(vec![(
                     SchemaRow {
-                        column: Column::Single(name.as_str().into()),
+                        column: Spanned::empty(Column::Single(name.as_str().into())),
                         r#type,
                     },
-                    Column::Single(name.as_str().into()),
+                    Spanned::span(Column::Single(name.as_str().into()), name.span.clone()),
                 )])
             }
         })
@@ -149,7 +155,7 @@ impl<'table> View<'table> {
 pub struct ViewRows<'rows, 'table> {
     rows: Box<Rows<'rows, 'table>>,
     schema: &'rows Schema,
-    inner: &'rows [Column],
+    inner: &'rows [Spanned<Column>],
 }
 
 impl Iterator for ViewRows<'_, '_> {
@@ -170,7 +176,7 @@ impl Iterator for ViewRows<'_, '_> {
 pub struct ViewRow<'row> {
     row: Box<Row<'row>>,
     schema: &'row Schema,
-    inner: &'row [Column],
+    inner: &'row [Spanned<Column>],
 }
 
 impl<'row> ViewRow<'row> {
@@ -180,7 +186,7 @@ impl<'row> ViewRow<'row> {
             .columns
             .iter()
             .enumerate()
-            .filter(|(_, sr)| match (&column, &sr.column) {
+            .filter(|(_, sr)| match (&column, &*sr.column) {
                 (Column::Single(name1), Column::Single(name2)) => name1 == name2,
                 (Column::Single(name1), Column::Dotted { column: name2, .. }) => name1 == name2,
                 (Column::Dotted { .. }, Column::Single(_)) => false,
@@ -199,7 +205,7 @@ impl<'row> ViewRow<'row> {
 
         match &columns[..] {
             [] => Err(ErrorKind::ColumnNotFound(column).into()),
-            [(i, _)] => self.row.get(self.inner[*i].clone()),
+            [(i, _)] => self.row.get(*self.inner[*i].inner.clone()),
             _ => Err(ErrorKind::WrongColumn(column).into()),
         }
     }

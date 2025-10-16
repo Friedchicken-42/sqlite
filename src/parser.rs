@@ -13,7 +13,7 @@ use crate::{Column, ErrorKind, Schema, SchemaRow, SqliteError, Type};
 
 trait SqlParser<'src, O> = Parser<'src, &'src str, Spanned<O>, extra::Err<Rich<'src, char>>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Spanned<T> {
     pub inner: Box<T>,
     pub span: Range<usize>,
@@ -30,10 +30,16 @@ impl<T> Spanned<T> {
         }
     }
 
-    fn empty(inner: T) -> Spanned<T> {
+    pub fn empty(inner: T) -> Spanned<T> {
         Spanned {
             inner: Box::new(inner),
             span: 0..0,
+        }
+    }
+    pub fn span(inner: T, span: Range<usize>) -> Spanned<T> {
+        Spanned {
+            inner: Box::new(inner),
+            span,
         }
     }
 }
@@ -429,7 +435,11 @@ fn createtablestmt_parser<'src>() -> impl SqlParser<'src, CreateTableStatement> 
     .repeated()
     .collect::<Vec<_>>();
 
-    let column = string.or(ident).then(r#type.padded()).then(key);
+    let column = string
+        .or(ident)
+        .map_with(Spanned::new)
+        .then(r#type.padded())
+        .then(key);
 
     let columns = column
         .separated_by(just(","))
@@ -449,15 +459,19 @@ fn createtablestmt_parser<'src>() -> impl SqlParser<'src, CreateTableStatement> 
         .then(columns.delimited_by(just("("), just(")")))
         .then(extra)
         .map(
-            |((table, columns), extras): ((&str, Vec<((&str, Type), Vec<Key>)>), Vec<Extra>)| {
+            |((table, columns), extras): (
+                (&str, Vec<((Spanned<&str>, Type), Vec<Key>)>),
+                Vec<Extra>,
+            )| {
                 let names = vec![table.to_string()];
 
-                let (pairs, keys): (Vec<(&str, Type)>, Vec<Vec<Key>>) = columns.into_iter().unzip();
+                let (pairs, keys): (Vec<(Spanned<&str>, Type)>, Vec<Vec<Key>>) =
+                    columns.into_iter().unzip();
 
                 let columns = pairs
                     .into_iter()
                     .map(|(c, t)| SchemaRow {
-                        column: c.into(),
+                        column: Spanned::span((*c).into(), c.span),
                         r#type: t,
                     })
                     .collect::<_>();
@@ -625,15 +639,15 @@ mod tests {
                     names: vec!["A".into()],
                     columns: vec![
                         SchemaRow {
-                            column: "id".into(),
+                            column: Spanned::empty("id".into()),
                             r#type: Type::Integer,
                         },
                         SchemaRow {
-                            column: "x".into(),
+                            column: Spanned::empty("x".into()),
                             r#type: Type::Integer,
                         },
                         SchemaRow {
-                            column: "y".into(),
+                            column: Spanned::empty("y".into()),
                             r#type: Type::Integer,
                         },
                     ],
