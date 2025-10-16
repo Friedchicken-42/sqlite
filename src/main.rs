@@ -54,7 +54,7 @@ fn database(args: &[String]) -> Result<()> {
 
             let mut table = db.execute(query)?;
             let options = DisplayOptions::r#box();
-            table.display(options);
+            table.display(options)?;
 
             let mut rows = table.rows();
             let mut count = 0;
@@ -69,7 +69,7 @@ fn database(args: &[String]) -> Result<()> {
             let mut table = db.execute(query)?;
 
             let options = DisplayOptions::r#box();
-            table.display(options);
+            table.display(options)?;
         }
     }
 

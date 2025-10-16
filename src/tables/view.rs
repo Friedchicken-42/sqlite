@@ -70,12 +70,15 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
                     }
                 };
 
+                let column = Column::Single(name.as_str().into());
+                let span = name.span.clone();
+
                 Ok(vec![(
                     SchemaRow {
-                        column: Spanned::empty(Column::Single(name.as_str().into())),
+                        column: Spanned::span(column, span.clone()),
                         r#type,
                     },
-                    Spanned::span(Column::Single(name.as_str().into()), name.span.clone()),
+                    Spanned::span(Column::Single(name.as_str().into()), span.clone()),
                 )])
             }
         })

@@ -55,49 +55,45 @@ impl SqliteError {
     }
 
     pub fn write<'src, C: ariadne::Cache<&'src str>>(self, cache: C, writer: impl Write) {
-        println!("{self:?}");
         let report = Report::build(ReportKind::Error, ("query", self.span.clone()));
 
-        let label = Label::new(("query", self.span)).with_color(Color::Red);
-
-        let label = match &self.kind {
-            ErrorKind::FileNotFound(file) => label.with_message(format!("File {file:?} not found")),
-            ErrorKind::WrongColumn(column) => {
-                label.with_message(format!("Unexpected column \"{column}\""))
-            }
-            ErrorKind::ColumnNotFound(column) => {
-                label.with_message(format!("Column \"{column}\" not found"))
-            }
-            ErrorKind::UnhandledSerial(n) => label.with_message(format!("Wrong serial: {n}")),
-            ErrorKind::PageRead { index, offset } => {
-                label.with_message(format!("Failed to read page {index} at offset {offset}"))
-            }
-            ErrorKind::WrongPageType(n) => {
-                // report
-                // .with_message(format!("Wrong page type: {n:02x}"))
-                // .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
-                label.with_message(format!("Wrong page type: {n:02x}"))
-            }
-            ErrorKind::WrongValueType { expected, actual } => {
-                label.with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
-            }
-            ErrorKind::TableNotFound(table) => {
-                label.with_message(format!("Table {table:?} not found"))
-            }
-            ErrorKind::WrongCommand(query) => {
-                label.with_message("Wrong command provided")
-                // .with_note("This error indicates an unsupported or malformed SQL command"),
-            }
-            ErrorKind::Parser(message) => {
-                // report.with_label(
-                // Label::new(("query", self.span))
-                //     .with_message(message)
-                //     .with_color(Color::Red),
-                label.with_message(message)
-            }
+        // let label = Label::new(("query", self.span)).with_color(Color::Red);
+        let label = |msg: String| {
+            Label::new(("query", self.span))
+                .with_message(msg)
+                .with_color(Color::Red)
         };
 
-        let report = report.with_label(label);
+        let report = match &self.kind {
+            ErrorKind::FileNotFound(file) => {
+                report.with_message(format!("File {file:?} not found"))
+            }
+            ErrorKind::WrongColumn(column) => report
+                .with_message("Wrong column")
+                .with_label(label(format!("Unexpected column \"{column}\""))),
+            ErrorKind::ColumnNotFound(column) => report
+                .with_message("Not found")
+                .with_label(label(format!("Column \"{column}\" not found"))),
+            ErrorKind::UnhandledSerial(n) => report.with_message(format!("Wrong serial: {n}")),
+            ErrorKind::PageRead { index, offset } => {
+                report.with_message(format!("Failed to read page {index} at offset {offset}"))
+            }
+            ErrorKind::WrongPageType(n) => report
+                .with_message(format!("Wrong page type: {n:02x}"))
+                .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
+            ErrorKind::WrongValueType { expected, actual } => {
+                report.with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
+            }
+            ErrorKind::TableNotFound(table) => report
+                .with_message("Table not found")
+                .with_label(label(format!("Table {table:?} not found"))),
+            ErrorKind::WrongCommand(_) => report
+                .with_message("Wrong command provided")
+                .with_note("This error indicates an unsupported or malformed SQL command"),
+            ErrorKind::Parser(message) => report
+                .with_message("Parser error")
+                .with_label(label(message.clone())),
+        };
 
         report.finish().write(cache, writer).unwrap();
     }

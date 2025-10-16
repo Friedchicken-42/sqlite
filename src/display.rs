@@ -1,4 +1,4 @@
-use crate::{Iterator, Row, Schema, Serialized, Table, Value};
+use crate::{Iterator, Result, Row, Schema, Serialized, SqliteError, Table, Value};
 
 enum DisplayMode {
     List,
@@ -112,16 +112,21 @@ fn display_value(value: Value, index: usize, opts: &DisplayOptions) {
     }
 }
 
-fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) {
+fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) -> Result<()> {
     for (i, sr) in schema.columns.iter().enumerate() {
-        let value = row.get((*sr.column).clone()).unwrap();
+        let value = row.get((*sr.column).clone()).map_err(|e| SqliteError {
+            span: sr.column.span.clone(),
+            ..e
+        })?;
         display_value(value, i, opts);
     }
 
-    println!()
+    println!();
+
+    Ok(())
 }
 
-fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
+fn display_table(table: &mut Table<'_>, opts: DisplayOptions) -> Result<()> {
     const __BACKUP: bool = true;
 
     const BACKUP_SIZE: usize = 15;
@@ -148,7 +153,11 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
             let mut vec = vec![];
 
             for sr in schema.columns.iter() {
-                let value = row.get((*sr.column).clone()).unwrap();
+                let value = row.get((*sr.column).clone()).map_err(|e| SqliteError {
+                    span: sr.column.span.clone(),
+                    ..e
+                })?;
+
                 let serialized = value.serialize();
 
                 vec.push(serialized);
@@ -159,7 +168,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
 
         for values in &backup {
             for (i, serialized) in values.iter().enumerate() {
-                let value = Value::read(&serialized.data, &serialized.varint).unwrap();
+                let value = Value::read(&serialized.data, &serialized.varint)?;
 
                 sizes[i] = sizes[i].max(value.to_string().len());
             }
@@ -190,7 +199,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
             populated = true;
 
             for (i, serialized) in row.iter().enumerate() {
-                let value = Value::read(&serialized.data, &serialized.varint).unwrap();
+                let value = Value::read(&serialized.data, &serialized.varint)?;
                 display_value(value, i, &opts);
             }
 
@@ -210,7 +219,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
 
             populated = true;
 
-            display_row(row, &schema, &opts);
+            display_row(row, &schema, &opts)?;
         } else {
             if populated {
                 display_spacer_bottom(&opts);
@@ -219,25 +228,29 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) {
             break;
         }
     }
+
+    Ok(())
 }
 
-fn display_list(table: &mut Table<'_>, opts: DisplayOptions) {
+fn display_list(table: &mut Table<'_>, opts: DisplayOptions) -> Result<()> {
     let schema = table.schema().clone();
 
     display_schema(&schema, &opts);
 
     let mut rows = table.rows();
     while let Some(row) = rows.next() {
-        display_row(row, &schema, &opts);
+        display_row(row, &schema, &opts)?;
     }
+
+    Ok(())
 }
 
 pub trait Printable {
-    fn display(&mut self, options: DisplayOptions);
+    fn display(&mut self, options: DisplayOptions) -> Result<()>;
 }
 
 impl Printable for Table<'_> {
-    fn display(&mut self, options: DisplayOptions) {
+    fn display(&mut self, options: DisplayOptions) -> Result<()> {
         match options.mode {
             DisplayMode::List => display_list(self, options),
             DisplayMode::Table => display_table(self, options),

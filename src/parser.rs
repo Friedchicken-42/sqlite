@@ -36,11 +36,16 @@ impl<T> Spanned<T> {
             span: 0..0,
         }
     }
+
     pub fn span(inner: T, span: Range<usize>) -> Spanned<T> {
         Spanned {
             inner: Box::new(inner),
             span,
         }
+    }
+
+    pub fn with_span(self, span: Range<usize>) -> Spanned<T> {
+        Spanned { span, ..self }
     }
 }
 
@@ -547,16 +552,6 @@ fn parser<'src>() -> impl SqlParser<'src, Query> {
 mod tests {
     use super::*;
     use ariadne::Source;
-
-    // fn display_report(query: &str, report: Report<'_, (&str, Range<usize>)>) {
-    //     let mut buffer = Vec::new();
-
-    //     report
-    //         .write(("query", Source::from(query)), &mut buffer)
-    //         .unwrap();
-
-    //     panic!("{}", std::str::from_utf8(&buffer).unwrap());
-    // }
 
     fn check(query: &str, expected: Query) {
         match Query::parse(query) {
