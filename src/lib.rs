@@ -29,7 +29,7 @@ use std::{
     ops::Range,
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ErrorKind {
     FileNotFound(String),
     WrongColumn(Column),
@@ -37,6 +37,7 @@ pub enum ErrorKind {
     UnhandledSerial(usize),
     PageRead { index: usize, offset: usize },
     WrongPageType(u8),
+    PageFull,
     WrongValueType { expected: Type, actual: Type },
     TableNotFound(String),
     WrongCommand(Spanned<Query>),
@@ -81,6 +82,7 @@ impl SqliteError {
             ErrorKind::WrongPageType(n) => report
                 .with_message(format!("Wrong page type: {n:02x}"))
                 .with_note("Page type must be 0x02, 0x05, 0x0a or 0x0d"),
+            ErrorKind::PageFull => report.with_message("Data cannot fit in the current page"),
             ErrorKind::WrongValueType { expected, actual } => {
                 report.with_message(format!("Wrong type, expected {expected:?}, got {actual:?}"))
             }

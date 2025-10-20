@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Type, Value,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type,
+    Value,
 };
 use std::fmt::Debug;
 
@@ -42,6 +43,26 @@ impl Varint {
             value: number,
             length: length + 1,
         }
+    }
+
+    pub fn serialize(self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(9);
+        let mut n = self.value;
+
+        loop {
+            let byte = (n & 0x7f) as u8;
+            data.insert(0, byte | 0x80);
+
+            n >>= 7;
+
+            if n == 0 {
+                break;
+            }
+        }
+
+        *data.last_mut().unwrap() &= 0x7f;
+
+        data
     }
 }
 
@@ -194,13 +215,17 @@ impl Page {
         u16::from_be_bytes([data[3], data[4]])
     }
 
-    fn increment_cells(&mut self) {
-        let cells = self.cells();
+    fn set_cells(&mut self, cells: u16) {
         let offset = self.offset();
         let data = &mut self.data[offset..];
-        let cells = u16::to_be_bytes(cells + 1);
+        let cells = u16::to_be_bytes(cells);
         data[3] = cells[0];
         data[4] = cells[1];
+    }
+
+    fn increment_cells(&mut self) {
+        let cells = self.cells();
+        self.set_cells(cells + 1);
     }
 
     fn pointers_offset(&self) -> Result<usize> {
@@ -235,6 +260,169 @@ impl Page {
 
     fn right_pointer(&self) -> usize {
         u32::from_be_bytes([self.data[8], self.data[9], self.data[10], self.data[11]]) as usize
+    }
+
+    fn serialize(&self, values: &[Value]) -> Vec<u8> {
+        let mut serialized = vec![];
+        let mut serials = vec![];
+
+        for value in values {
+            let Serialized { varint, data } = value.serialize();
+            serialized.extend(data);
+            serials.extend(varint.serialize());
+        }
+
+        // FIXME: this length could be larger than 127
+        // aka could take more than 1 byte
+        let length = Varint::new(serials.len() + 1);
+        serials.insert(0, length.serialize()[0]);
+
+        [serials, serialized].concat()
+    }
+
+    fn insert(
+        &mut self,
+        pointer: u32,
+        payload: Vec<u8>,
+        rowid: usize,
+        schema: &Schema,
+    ) -> Result<()> {
+        let data = match self.r#type()? {
+            PageType::TableLeaf => [
+                Varint::new(payload.len()).serialize(),
+                Varint::new(rowid).serialize(),
+                payload,
+            ]
+            .concat(),
+            PageType::IndexLeaf => todo!(),
+            PageType::TableInterior => [
+                u32::to_be_bytes(pointer).to_vec(),
+                Varint::new(rowid).serialize(),
+            ]
+            .concat(),
+            PageType::IndexInterior => todo!(),
+        };
+
+        let page_size = self.data.len();
+
+        let pointers = self.pointers()?;
+        let end = pointers.min().unwrap_or(page_size);
+
+        if data.len() > end {
+            // Need overflow page or another page
+            todo!();
+        }
+
+        let start = end - data.len();
+
+        let mut pointers_offset = self.pointers_offset()? + 2 * self.cells() as usize;
+
+        if start < pointers_offset + 3 {
+            return Err(ErrorKind::PageFull.into());
+        }
+
+        let pointers = self.pointers()?.collect::<Vec<_>>();
+
+        if pointers.is_empty()
+            && matches!(self.r#type()?, PageType::TableInterior)
+            && self.right_pointer() == 0
+        {
+            self.data[8..12].copy_from_slice(&data[..4]);
+            return Ok(());
+        }
+
+        self.data[start..start + data.len()].copy_from_slice(&data);
+
+        let mut index = 0;
+
+        for offset in pointers.into_iter() {
+            let cell = self.cell(offset, schema);
+
+            match self.r#type()? {
+                PageType::TableLeaf if cell.rowid()? < rowid => {
+                    break;
+                }
+                PageType::IndexLeaf => todo!(),
+                PageType::TableInterior if cell.rowid()? < rowid => {
+                    break;
+                }
+                PageType::IndexInterior => todo!(),
+                _ => {}
+            }
+
+            index += 1;
+        }
+
+        for _ in 0..index {
+            pointers_offset -= 2;
+            self.data[pointers_offset + 2] = self.data[pointers_offset + 0];
+            self.data[pointers_offset + 3] = self.data[pointers_offset + 1];
+        }
+
+        self.data[pointers_offset + 0] = (start >> 8) as u8;
+        self.data[pointers_offset + 1] = (start & 0xff) as u8;
+
+        self.increment_cells();
+
+        Ok(())
+    }
+
+    fn append(&mut self, payload: Vec<u8>) -> Result<()> {
+        let page_size = self.data.len();
+
+        let pointers = self.pointers()?;
+        let end = pointers.min().unwrap_or(page_size);
+
+        // TODO: add check
+
+        let start = end - payload.len();
+        self.data[start..end].copy_from_slice(&payload);
+
+        let pointers_offset = self.pointers_offset()? + 2 * self.cells() as usize;
+        self.data[pointers_offset + 0] = (start >> 8) as u8;
+        self.data[pointers_offset + 1] = (start & 0xff) as u8;
+
+        self.increment_cells();
+
+        Ok(())
+    }
+
+    fn split(&self, schema: &Schema) -> Result<[(Page, usize); 2]> {
+        let mut a = Page::new(None, self.data.len(), self.r#type()?);
+        let mut b = Page::new(None, self.data.len(), self.r#type()?);
+
+        let mut rowid_a = 0;
+        let mut rowid_b = 0;
+
+        let count = self.pointers()?.count();
+
+        let pointers = self.pointers()?.collect::<Vec<_>>();
+
+        for (i, mut offset) in pointers.into_iter().enumerate() {
+            let current = if i < count / 2 { &mut a } else { &mut b };
+
+            let Varint {
+                value: payload_size,
+                length: size_len,
+            } = Varint::read(&self.data[offset..]);
+
+            let Varint {
+                value: rowid,
+                length: rowid_len,
+            } = Varint::read(&self.data[offset + size_len..]);
+
+            let payload = self.data[offset..offset + size_len + rowid_len + payload_size].to_vec();
+
+            current.append(payload)?;
+
+            if i < count / 2 {
+                rowid_a = rowid_a.max(rowid);
+            } else {
+                rowid_b = rowid_b.max(rowid);
+            }
+        }
+
+        Ok([(a, rowid_a), (b, rowid_b)])
     }
 }
 
@@ -329,6 +517,15 @@ impl Storage<'_> {
             }
         }
     }
+
+    fn append_page(&mut self, page: Page) {
+        match self {
+            Storage::Memory { pages, .. } => {
+                pages.push(page);
+            }
+            Storage::File { .. } => todo!(),
+        }
+    }
 }
 
 pub struct BTreePageBuilder {
@@ -397,19 +594,34 @@ impl<'db> BTreePage<'db> {
         })
     }
 
-    pub fn count(&mut self) -> usize {
-        self.storage.clear();
-        let first = self.storage.first();
-        first.cells() as usize
+    pub fn count(&self) -> usize {
+        // was this always broken?
+        // self.storage.clear();
+        // let first = self.storage.first();
+        // first.cells() as usize
+
+        match &self.storage {
+            Storage::Memory { pages, .. } => {
+                let mut count = 0;
+
+                for page in pages {
+                    let r#type = page.r#type().unwrap();
+                    if r#type == PageType::TableLeaf || r#type == PageType::IndexLeaf {
+                        count += page.cells() as usize;
+                    }
+                }
+
+                count
+            }
+            Storage::File { .. } => todo!(),
+        }
     }
 
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub fn insert(&mut self, values: &[Value]) -> Result<()> {
-        let mut rows = vec![];
-
+    fn check_schema(&self, values: &[Value]) -> Result<()> {
         for (sr, value) in self.schema.columns.iter().zip(values.iter()) {
             if value.r#type() != Type::Null && sr.r#type != value.r#type() {
                 return Err(ErrorKind::WrongValueType {
@@ -418,50 +630,64 @@ impl<'db> BTreePage<'db> {
                 }
                 .into());
             }
-
-            rows.push(value.serialize());
         }
-
-        // FIXME: temp implementation for group by
-        let page = self.storage.last_mut();
-        let mut offset = page.pointers()?.last().unwrap_or(page.data.len());
-        offset -= 1;
-
-        rows.reverse();
-
-        let mut size = 0;
-
-        for Serialized { data, .. } in &rows {
-            for (i, d) in data.iter().rev().enumerate() {
-                page.data[offset - i] = *d;
-            }
-
-            offset -= data.len();
-            size += data.len();
-        }
-
-        for Serialized { varint, .. } in &rows {
-            page.data[offset] = varint.value as u8;
-            offset -= 1;
-        }
-
-        page.data[offset] = (rows.len() as u8) + 1;
-        offset -= 1;
-
-        page.data[offset] = 1;
-        offset -= 1;
-
-        page.data[offset] = size as u8;
-
-        // pointers
-        let cells = page.pointers()?.count();
-        let ptr = page.pointers_offset()?;
-        page.data[ptr + cells * 2 + 0] = (offset >> 8) as u8;
-        page.data[ptr + cells * 2 + 1] = (offset & 0xff) as u8;
-
-        self.storage.first_mut().increment_cells();
 
         Ok(())
+    }
+
+    // TableLeaf     -> rowid + values => append
+    // IndexLeaf     -> values (sorted key -> others)
+    // TableInterior -> pointer + rowid => append
+    // IndexInterior -> pointer + values (sorted)
+    pub fn insert(&mut self, mut values: Vec<Value>) -> Result<()> {
+        match self.storage.first().r#type()? {
+            PageType::IndexLeaf | PageType::IndexInterior => {
+                for i in self.schema.primary.iter().rev() {
+                    let v = values.remove(*i);
+                    values.insert(0, v);
+                }
+            }
+            _ => {}
+        };
+
+        self.check_schema(&values)?;
+
+        let rowid = self.count();
+
+        let mut rows = BTreeRows {
+            btree: self,
+            indexes: vec![0],
+        };
+
+        rows.walk(&values, rowid);
+
+        let pages = match &self.storage {
+            Storage::Memory { pages, .. } => pages.len() as u32,
+            Storage::File { .. } => todo!(),
+        };
+
+        let page = self.storage.last_mut();
+
+        let payload = page.serialize(&values);
+
+        match page.insert(0, payload, rowid, &self.schema) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind == ErrorKind::PageFull => {
+                let [(a, rowid_a), (b, rowid_b)] = page.split(&self.schema)?;
+
+                let size = page.data.len();
+                *page = Page::new(None, size, PageType::TableInterior);
+
+                page.insert(pages + 1, vec![], rowid_b, &self.schema)?;
+                page.insert(pages + 0, vec![], rowid_a, &self.schema)?;
+
+                self.storage.append_page(a);
+                self.storage.append_page(b);
+
+                self.insert(values)
+            }
+            e => e,
+        }
     }
 
     pub fn write_indented(
@@ -565,7 +791,6 @@ impl BTreeRows<'_, '_> {
                     }
                 }
                 page_type @ (PageType::TableInterior | PageType::IndexInterior) => {
-                    #[allow(clippy::comparison_chain)]
                     if *index > (page.cells() * 2).into() {
                         // Already read the right_pointer
                         self.indexes.pop();
@@ -611,6 +836,50 @@ impl BTreeRows<'_, '_> {
                     }
                 }
             }
+        }
+    }
+
+    // This should be merged someway into `loop_until`
+    fn walk(&mut self, values: &[Value], rowid: usize) {
+        self.btree.storage.clear();
+
+        loop {
+            let page = self.btree.storage.last();
+
+            match page.r#type().unwrap() {
+                PageType::TableLeaf | PageType::IndexLeaf => return,
+                PageType::TableInterior | PageType::IndexInterior => {}
+            }
+
+            let mut pointer = None;
+
+            for (idx, offset) in page.pointers().unwrap().enumerate() {
+                let cell = page.cell(offset, &self.btree.schema);
+
+                match page.r#type().unwrap() {
+                    PageType::TableInterior => {
+                        if cell.rowid().unwrap() > rowid {
+                            pointer = Some(offset);
+                            *self.indexes.last_mut().unwrap() = idx;
+
+                            break;
+                        }
+                    }
+                    PageType::IndexInterior => todo!(),
+                    _ => unreachable!(),
+                }
+            }
+
+            let pointer = match pointer {
+                Some(ptr) => {
+                    let cell = page.cell(ptr, &self.btree.schema);
+                    cell.page()
+                }
+                None => page.right_pointer(),
+            };
+
+            self.indexes.push(0);
+            self.btree.storage.push(pointer);
         }
     }
 }
@@ -670,14 +939,32 @@ mod tests {
             primary: vec![0],
         };
 
-        let mut btree = BTreePage {
-            storage: Storage::Memory {
-                pages: vec![Page::new(None, 200, PageType::TableLeaf)],
-                stack: vec![0],
-            },
-            schema,
-            rowid: Some(0),
-        };
+        for i in 1..100 {
+            let mut btree = BTreePage {
+                storage: Storage::Memory {
+                    pages: vec![Page::new(None, 200, PageType::TableLeaf)],
+                    stack: vec![0],
+                },
+                schema: schema.clone(),
+                rowid: Some(0),
+            };
+
+            for j in 0..i {
+                btree.insert(vec![Value::Integer(j), Value::Integer(j * 10)])?;
+            }
+
+            let mut table = Table::BTreePage(btree);
+            let mut rows = table.rows();
+
+            let mut count = 0;
+            while let Some(row) = rows.next() {
+                assert_eq!(row.get("a".into())?, Value::Integer(count));
+                assert_eq!(row.get("b".into())?, Value::Integer(count * 10));
+                count += 1;
+            }
+
+            assert_eq!(count, i, "Missing rows");
+        }
 
         // .index(vec![column])
         // .rowid(false)
@@ -686,22 +973,6 @@ mod tests {
         // - insert
         //   - if btree has `rowid` => walk until rowid match
         //   - else                 => walk until primary key match (?)
-
-        btree.insert(&[Value::Integer(1), Value::Integer(10)])?;
-        btree.insert(&[Value::Integer(2), Value::Integer(20)])?;
-        btree.insert(&[Value::Integer(3), Value::Integer(30)])?;
-        btree.insert(&[Value::Integer(4), Value::Integer(40)])?;
-
-        let mut table = Table::BTreePage(btree);
-        let mut rows = table.rows();
-
-        let mut i = 1;
-        while let Some(row) = rows.next() {
-            assert_eq!(row.get("a".into())?, Value::Integer(i));
-            assert_eq!(row.get("b".into())?, Value::Integer(i * 10));
-
-            i += 1;
-        }
 
         Ok(())
     }
