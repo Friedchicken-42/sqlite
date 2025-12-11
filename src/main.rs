@@ -35,35 +35,6 @@ fn database(args: &[String]) -> Result<()> {
             let q = Query::parse(&args[3])?;
             println!("{q:#?}");
         }
-        input if input.starts_with("info") => {
-            use sqlite::Iterator;
-
-            let input = input.trim_start_matches("info ");
-            let query = Query::parse(input)?;
-
-            if let Query::Select(s) = *query.inner {
-                let span = s.span.clone();
-
-                let _ = db.execute(Spanned {
-                    inner: Box::new(Query::Explain(s)),
-                    span,
-                })?;
-            }
-
-            let query = Query::parse(input)?;
-
-            let mut table = db.execute(query)?;
-            let options = DisplayOptions::r#box();
-            table.display(options)?;
-
-            let mut rows = table.rows();
-            let mut count = 0;
-            while rows.next().is_some() {
-                count += 1;
-            }
-
-            println!("# rows: {count}");
-        }
         input => {
             let query = Query::parse(input)?;
             let mut table = db.execute(query)?;

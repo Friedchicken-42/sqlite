@@ -6,8 +6,8 @@ pub mod tables;
 
 use crate::{
     parser::{
-        CreateIndexStatement, CreateTableStatement, Expression, From, Query, Select,
-        SelectStatement, Spanned, WhereStatement,
+        CreateIndexStatement, Expression, From, Query, Select, SelectStatement, Spanned,
+        WhereStatement,
     },
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
@@ -32,8 +32,8 @@ use std::{
 #[derive(Debug, PartialEq)]
 pub enum ErrorKind {
     FileNotFound(String),
-    WrongColumn(Column),
-    ColumnNotFound(Column),
+    DuplicateColumn(Vec<Spanned<Column>>),
+    ColumnNotFound(Column), // TODO: could add spanned here
     UnhandledSerial(usize),
     PageRead { index: usize, offset: usize },
     WrongPageType(u8),
@@ -58,20 +58,31 @@ impl SqliteError {
     pub fn write<'src, C: ariadne::Cache<&'src str>>(self, cache: C, writer: impl Write) {
         let report = Report::build(ReportKind::Error, ("query", self.span.clone()));
 
-        // let label = Label::new(("query", self.span)).with_color(Color::Red);
         let label = |msg: String| {
             Label::new(("query", self.span))
                 .with_message(msg)
                 .with_color(Color::Red)
         };
 
-        let report = match &self.kind {
+        let report = match self.kind {
             ErrorKind::FileNotFound(file) => {
                 report.with_message(format!("File {file:?} not found"))
             }
-            ErrorKind::WrongColumn(column) => report
-                .with_message("Wrong column")
-                .with_label(label(format!("Unexpected column \"{column}\""))),
+            ErrorKind::DuplicateColumn(columns) => {
+                let report = report.with_message("Duplicate columns");
+
+                if columns.is_empty() {
+                    report.with_label(label("duplicated".into()))
+                } else {
+                    let labels = columns.into_iter().map(|col| {
+                        Label::new(("query", col.span))
+                            .with_message("here")
+                            .with_color(Color::Red)
+                    });
+
+                    report.with_labels(labels)
+                }
+            }
             ErrorKind::ColumnNotFound(column) => report
                 .with_message("Not found")
                 .with_label(label(format!("Column \"{column}\" not found"))),
@@ -255,6 +266,7 @@ impl Display for Value<'_> {
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct Schema {
     pub names: Vec<String>,
+    pub name: Option<usize>,
     pub columns: Vec<SchemaRow>,
     pub primary: Vec<usize>,
 }
@@ -527,6 +539,7 @@ impl Sqlite {
     pub fn root(&self) -> Result<Table<'_>> {
         let schema = Schema {
             names: vec!["root".into()],
+            name: Some(0),
             columns: vec![
                 SchemaRow {
                     column: Spanned::empty("type".into()),
@@ -747,6 +760,7 @@ impl Sqlite {
 
         let schema = Schema {
             names: vec![index.name.clone()],
+            name: Some(0),
             columns: schema,
             primary,
         };
@@ -799,8 +813,8 @@ impl Sqlite {
 
                 let join = if let From::Table { table, alias } = &*right
                     && let Some(on) = &on
-                    && let Expression::Column(column) = &on.right
-                    && let Expression::Column(left_col) = &on.left
+                    && let Expression::Column(column) = &*on.right
+                    && let Expression::Column(left_col) = &*on.left
                     && let Some(index) = self.index(table, &[column.clone()])?
                 {
                     let mut table = self.table(table)?;
@@ -865,7 +879,9 @@ impl Sqlite {
         // let groupby = GroupBy::new(select_clause, groupby_clause, table)?;
         // table = Table::Groupby(groupby);
         // } else if *select_clause != vec![Select::Wildcard] {
-        if *select_clause != vec![Select::Wildcard] {
+        if let Some(first) = select_clause.inner.first()
+            && *first.inner != Select::Wildcard
+        {
             let view = View::new(select_clause, table)?;
             table = Table::View(view);
         }
@@ -895,6 +911,7 @@ impl Sqlite {
                 // Returns empty table
                 let schema = Schema {
                     names: vec![],
+                    name: None,
                     columns: vec![],
                     primary: vec![],
                 };
@@ -902,6 +919,47 @@ impl Sqlite {
 
                 Ok(Table::BTreePage(btree))
             }
+            Query::Info(select_statement) => {
+                let _ = self.execute(Spanned {
+                    inner: Box::new(Query::Explain(select_statement.clone())),
+                    span: query.span.clone(),
+                })?;
+
+                let mut table = self.execute(Spanned {
+                    inner: Box::new(Query::Select(select_statement)),
+                    span: query.span,
+                })?;
+
+                let mut rows = table.rows();
+                let mut count = 0;
+                while rows.next().is_some() {
+                    count += 1;
+                }
+
+                println!("# rows: {count}");
+
+                Ok(table)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_spanned() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let query = Query::parse("select a.id from apples as a join apples as b")?;
+
+        let table = db.execute(query)?;
+        let s = table.schema();
+
+        assert_eq!(s.columns.len(), 1);
+        let col = &s.columns[0].column;
+        assert_eq!(col.span, 7..11);
+
+        Ok(())
     }
 }

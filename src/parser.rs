@@ -63,12 +63,13 @@ impl<T> std::ops::Deref for Spanned<T> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Query {
     Select(Spanned<SelectStatement>),
     CreateTable(Spanned<CreateTableStatement>),
     CreateIndex(Spanned<CreateIndexStatement>),
     Explain(Spanned<SelectStatement>),
+    Info(Spanned<SelectStatement>), // Could use Query
 }
 
 impl Query {
@@ -84,9 +85,9 @@ impl Query {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct SelectStatement {
-    pub select_clause: Spanned<Vec<Select>>,
+    pub select_clause: Spanned<Vec<Spanned<Select>>>,
     pub from_clause: Spanned<From>,
     pub where_clause: Option<Spanned<WhereStatement>>,
     pub groupby_clause: Option<Spanned<Groupby>>,
@@ -99,7 +100,7 @@ fn ident_parser<'src>() -> impl SqlParser<'src, String> + Clone {
         .map_with(Spanned::new)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Select {
     Wildcard,
     Column {
@@ -113,7 +114,7 @@ pub enum Select {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum From {
     Table {
         table: Spanned<String>,
@@ -131,14 +132,14 @@ pub enum From {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum WhereStatement {
     Comparison(Spanned<Comparison>),
     And(Spanned<Self>, Spanned<Self>),
     Or(Spanned<Self>, Spanned<Self>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Groupby {
     columns: Vec<Column>,
 }
@@ -153,18 +154,18 @@ impl WhereStatement {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Comparison {
-    pub left: Expression,
-    pub op: Operator,
-    pub right: Expression,
+    pub left: Spanned<Expression>,
+    pub op: Spanned<Operator>,
+    pub right: Spanned<Expression>,
 }
 
 impl Comparison {
     fn index(&self) -> Vec<(Column, Expression)> {
-        match (&self.left, &self.op) {
+        match (&*self.left, &*self.op) {
             (Expression::Column(column), Operator::Equal) => {
-                vec![(column.clone(), self.right.clone())]
+                vec![(column.clone(), *self.right.inner.clone())]
             }
             _ => vec![],
         }
@@ -188,7 +189,7 @@ pub enum Expression {
     Number(u64),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Limit {
     pub limit: usize,
 }
@@ -209,7 +210,8 @@ fn comparison_parser<'src>() -> impl SqlParser<'src, Comparison> + Clone {
             .then(just(".").ignore_then(ident).or_not())
             .to_slice()
             .padded()
-            .map(|string: &str| Expression::Column(string.trim().into())));
+            .map(|string: &str| Expression::Column(string.trim().into())))
+        .map_with(Spanned::new);
 
     let operator = choice((
         just("<>").to(Operator::NotEqual),
@@ -218,17 +220,17 @@ fn comparison_parser<'src>() -> impl SqlParser<'src, Comparison> + Clone {
         just(">=").to(Operator::GreaterEqual),
         just(">").to(Operator::Greater),
         just("=").to(Operator::Equal),
-    ));
+    ))
+    .map_with(Spanned::new);
 
     expression
         .then(operator.padded())
         .then(expression)
         .map(
-            |((left, op), right): ((Expression, Operator), Expression)| Comparison {
-                left,
-                op,
-                right,
-            },
+            |((left, op), right): (
+                (Spanned<Expression>, Spanned<Operator>),
+                Spanned<Expression>,
+            )| Comparison { left, op, right },
         )
         .map_with(Spanned::new)
 }
@@ -303,6 +305,7 @@ fn selectstmt_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
         let columns = wildcard
             .or(function)
             .or(column)
+            .map_with(Spanned::new)
             .separated_by(just(",").padded())
             .at_least(1)
             .collect::<Vec<_>>();
@@ -379,7 +382,7 @@ fn selectstmt_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
             |((((select_clause, from_clause), where_clause), groupby_clause), limit_clause): (
                 (
                     (
-                        (Spanned<Vec<Select>>, Spanned<From>),
+                        (Spanned<Vec<Spanned<Select>>>, Spanned<From>),
                         Option<Spanned<WhereStatement>>,
                     ),
                     Option<Spanned<Groupby>>,
@@ -399,7 +402,7 @@ fn selectstmt_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
     })
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct CreateTableStatement {
     pub schema: Schema,
     pub extras: Vec<Extra>,
@@ -492,6 +495,7 @@ fn createtablestmt_parser<'src>() -> impl SqlParser<'src, CreateTableStatement> 
                     schema: Schema {
                         columns,
                         names,
+                        name: Some(0),
                         primary,
                     },
                     extras,
@@ -501,7 +505,7 @@ fn createtablestmt_parser<'src>() -> impl SqlParser<'src, CreateTableStatement> 
         .map_with(Spanned::new)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct CreateIndexStatement {
     pub name: String,
     pub table: String,
@@ -536,12 +540,17 @@ fn explain_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
     just("explain").padded().ignore_then(selectstmt_parser())
 }
 
+fn info_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
+    just("info").padded().ignore_then(selectstmt_parser())
+}
+
 fn parser<'src>() -> impl SqlParser<'src, Query> {
     choice((
         selectstmt_parser().map(Query::Select),
         createtablestmt_parser().map(Query::CreateTable),
         createindexstmt_parser().map(Query::CreateIndex),
         explain_parser().map(Query::Explain),
+        info_parser().map(Query::Info),
     ))
     .then_ignore(just(";").or_not())
     .then_ignore(end())
@@ -574,11 +583,11 @@ mod tests {
         check(
             "select id from users;",
             Query::Select(Spanned::empty(SelectStatement {
-                select_clause: Spanned::empty(vec![Select::Column {
+                select_clause: Spanned::empty(vec![Spanned::empty(Select::Column {
                     name: Spanned::empty("id".into()),
                     table: None,
                     alias: None,
-                }]),
+                })]),
                 from_clause: Spanned::empty(From::Table {
                     table: Spanned::empty("users".into()),
                     alias: None,
@@ -594,20 +603,20 @@ mod tests {
     fn test_complex() {
         fn comparison(column: Column, op: Operator, right: u64) -> Spanned<WhereStatement> {
             Spanned::empty(WhereStatement::Comparison(Spanned::empty(Comparison {
-                left: Expression::Column(column),
-                op,
-                right: Expression::Number(right),
+                left: Spanned::empty(Expression::Column(column)),
+                op: Spanned::empty(op),
+                right: Spanned::empty(Expression::Number(right)),
             })))
         }
 
         check(
             "select u.id from users as u where u.id > 1 and u.id < 10 or u.id <> 3;",
             Query::Select(Spanned::empty(SelectStatement {
-                select_clause: Spanned::empty(vec![Select::Column {
+                select_clause: Spanned::empty(vec![Spanned::empty(Select::Column {
                     name: Spanned::empty("id".into()),
                     table: Some(Spanned::empty("u".into())),
                     alias: None,
-                }]),
+                })]),
                 from_clause: Spanned::empty(From::Table {
                     table: Spanned::empty("users".into()),
                     alias: Some(Spanned::empty("u".into())),
@@ -632,6 +641,7 @@ mod tests {
             Query::CreateTable(Spanned::empty(CreateTableStatement {
                 schema: Schema {
                     names: vec!["A".into()],
+                    name: Some(0),
                     columns: vec![
                         SchemaRow {
                             column: Spanned::empty("id".into()),

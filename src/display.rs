@@ -114,7 +114,7 @@ fn display_value(value: Value, index: usize, opts: &DisplayOptions) {
 
 fn display_row(row: Row, schema: &Schema, opts: &DisplayOptions) -> Result<()> {
     for (i, sr) in schema.columns.iter().enumerate() {
-        let value = row.get((*sr.column).clone()).map_err(|e| SqliteError {
+        let value = row.get(*sr.column.inner.clone()).map_err(|e| SqliteError {
             span: sr.column.span.clone(),
             ..e
         })?;
@@ -153,7 +153,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) -> Result<()> {
             let mut vec = vec![];
 
             for sr in schema.columns.iter() {
-                let value = row.get((*sr.column).clone()).map_err(|e| SqliteError {
+                let value = row.get(*sr.column.inner.clone()).map_err(|e| SqliteError {
                     span: sr.column.span.clone(),
                     ..e
                 })?;

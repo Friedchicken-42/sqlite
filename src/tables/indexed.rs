@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{
     Column, Iterator, Row, Rows, Value,
-    parser::Expression,
+    parser::{Expression, Spanned},
     tables::btreepage::{BTreePage, BTreeRows},
 };
 

@@ -10,16 +10,26 @@ pub struct View<'table> {
     inner_columns: Vec<Spanned<Column>>,
 }
 
-pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<Spanned<Column>>)> {
+pub fn create_schema(
+    select: Vec<Spanned<Select>>,
+    inner: &Table,
+) -> Result<(Schema, Vec<Spanned<Column>>)> {
     let schema = inner.schema();
 
     let srs = select
         .iter()
-        .map(|row| match row {
+        .map(|row| match row.inner.as_ref() {
             Select::Wildcard => Ok(schema
                 .columns
                 .iter()
-                .map(|sr| (sr.clone(), sr.column.clone()))
+                .map(|sr| {
+                    let span = row.span.clone();
+                    let mut sr = sr.clone();
+                    let column = sr.column.with_span(span.clone());
+                    sr.column = column.clone();
+
+                    (sr, column)
+                })
                 .collect::<Vec<_>>()),
             Select::Column { name, alias, table } => {
                 let sr = schema
@@ -28,7 +38,7 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
                     .find(|sr| sr.column.name() == **name)
                     .ok_or(SqliteError::new(
                         ErrorKind::ColumnNotFound(name.as_str().into()),
-                        name.span.clone(),
+                        row.span.clone(),
                     ))?
                     .clone();
 
@@ -42,20 +52,16 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
 
                 let sr = match alias {
                     Some(alias) => SchemaRow {
-                        column: Spanned::span(
-                            Column::Single(alias.to_string()),
-                            sr.column.span.clone(),
-                        ),
-
+                        column: Spanned::span(Column::Single(alias.to_string()), row.span.clone()),
                         ..sr
                     },
                     None => SchemaRow {
-                        column: Spanned::span(column.clone(), sr.column.span.clone()),
+                        column: Spanned::span(column.clone(), row.span.clone()),
                         ..sr
                     },
                 };
 
-                let column = Spanned::span(column, sr.column.span.clone());
+                let column = Spanned::span(column, row.span.clone());
 
                 Ok(vec![(sr, column)])
             }
@@ -94,6 +100,7 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
     Ok((
         Schema {
             names: schema.names.clone(),
+            name: None,
             columns: srs.0,
             primary: vec![],
         },
@@ -102,7 +109,7 @@ pub fn create_schema(select: Vec<Select>, inner: &Table) -> Result<(Schema, Vec<
 }
 
 impl<'table> View<'table> {
-    pub fn new(select: Spanned<Vec<Select>>, inner: Table<'table>) -> Result<Self> {
+    pub fn new(select: Spanned<Vec<Spanned<Select>>>, inner: Table<'table>) -> Result<Self> {
         let (schema, inner_columns) = create_schema(*select.inner, &inner)?;
 
         Ok(Self {
@@ -209,7 +216,13 @@ impl<'row> ViewRow<'row> {
         match &columns[..] {
             [] => Err(ErrorKind::ColumnNotFound(column).into()),
             [(i, _)] => self.row.get(*self.inner[*i].inner.clone()),
-            _ => Err(ErrorKind::WrongColumn(column).into()),
+            lst => {
+                let columns = lst
+                    .into_iter()
+                    .map(|(_, sr)| sr.column.clone())
+                    .collect::<Vec<_>>();
+                Err(ErrorKind::DuplicateColumn(columns).into())
+            }
         }
     }
 }

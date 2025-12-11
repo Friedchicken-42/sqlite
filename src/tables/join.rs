@@ -19,6 +19,7 @@ impl<'table> Join<'table> {
             right: Box::new(right),
             schema: Schema {
                 names,
+                name: None,
                 columns,
                 primary: vec![],
             },
@@ -32,19 +33,32 @@ impl<'table> Join<'table> {
 
         for table in [left, right] {
             let schema = table.schema();
-            let tbl_names = &schema.names;
-            let tbl_name = tbl_names.iter().max_by_key(|s| s.len()).unwrap();
+            let tbl_name = schema.name.map(|idx| &schema.names[idx]);
 
-            names.extend(tbl_names.iter().cloned());
+            names.extend(schema.names.iter().cloned());
 
             for sr in &schema.columns {
-                let column = match &*sr.column {
-                    Column::Single(column) => Column::Dotted {
-                        table: tbl_name.clone(),
-                        column: column.clone(),
+                let column = match tbl_name {
+                    Some(table) => Column::Dotted {
+                        table: table.clone(),
+                        column: sr.column.name().into(),
                     },
-                    dotted => (*dotted).clone(),
+                    None => {
+                        let tbl_name = schema.names.iter().max_by_key(|s| s.len()).unwrap();
+
+                        Column::Dotted {
+                            table: tbl_name.into(),
+                            column: sr.column.name().into(),
+                        }
+                    }
                 };
+                // let column = match &*sr.column {
+                //     Column::Single(column) => Column::Dotted {
+                //         table: tbl_name.clone(),
+                //         column: column.clone(),
+                //     },
+                //     dotted => (*dotted).clone(),
+                // };
 
                 let sr = SchemaRow {
                     column: Spanned::span(column, sr.column.span.clone()),
@@ -85,7 +99,7 @@ impl<'table> Join<'table> {
     ) -> std::fmt::Result {
         let spacer = "  ".repeat(indent);
 
-        write!(f, "{:<width$} |{}", "join", spacer)?;
+        write!(f, "{:<width$} │{}", "join", spacer)?;
         if let Some(left_column) = &self.left_column {
             writeln!(f, "on {}", left_column.name())?;
         } else {
@@ -176,7 +190,7 @@ impl<'row> JoinRow<'row> {
             self.right.get(column.clone()),
         ) {
             (Err(_), Err(_)) => Err(ErrorKind::ColumnNotFound(column).into()),
-            (Ok(_), Ok(_)) => Err(ErrorKind::WrongColumn(column).into()),
+            (Ok(_), Ok(_)) => Err(ErrorKind::DuplicateColumn(vec![]).into()),
             (Ok(v), Err(_)) | (Err(_), Ok(v)) => Ok(v),
         }
     }

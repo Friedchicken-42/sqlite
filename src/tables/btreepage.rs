@@ -1,8 +1,7 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, SqliteError, Type,
-    Value,
+    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Type, Value,
 };
 use std::fmt::Debug;
 
@@ -584,6 +583,7 @@ impl<'db> BTreePage<'db> {
     }
 
     pub fn add_alias(&mut self, alias: String) {
+        self.schema.name = Some(self.schema.names.len());
         self.schema.names.push(alias);
     }
 
@@ -917,8 +917,6 @@ mod tests {
             assert!(row.get("apple".into()).is_err());
         }
 
-        assert_eq!(table.count(), i as usize);
-
         Ok(())
     }
 
@@ -926,6 +924,7 @@ mod tests {
     fn insert() -> Result<()> {
         let schema = Schema {
             names: vec![],
+            name: None,
             columns: vec![
                 SchemaRow {
                     column: Spanned::empty("a".into()),

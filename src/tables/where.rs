@@ -18,6 +18,7 @@ impl Comparison {
         let Comparison { left, op, right } = self;
 
         fn to_value<'a>(expr: &'a Expression, row: &'a Row) -> Value<'a> {
+            // TODO: check this spanned
             match expr {
                 Expression::Column(column) => row.get(column.clone()).unwrap(),
                 Expression::Literal(s) => Value::Text(s),
@@ -28,7 +29,7 @@ impl Comparison {
         let left = to_value(left, row);
         let right = to_value(right, row);
 
-        match op {
+        match *op.inner {
             Operator::Less => left.lt(&right),
             Operator::LessEqual => left.le(&right),
             Operator::Equal => left.eq(&right),
@@ -58,7 +59,7 @@ pub fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std
             let Comparison { left, op, right } = &**comparison;
             write_expr(left, f)?;
 
-            let op = match op {
+            let op = match &*op.inner {
                 Operator::Less => "<",
                 Operator::LessEqual => "<=",
                 Operator::Equal => "=",
