@@ -271,6 +271,12 @@ pub struct Schema {
     pub primary: Vec<usize>,
 }
 
+impl Schema {
+    pub fn current_name(&self) -> Option<&str> {
+        self.name.map(|idx| self.names[idx].as_ref())
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct SchemaRow {
     column: Spanned<Column>,
@@ -815,7 +821,7 @@ impl Sqlite {
                     && let Some(on) = &on
                     && let Expression::Column(column) = &*on.right
                     && let Expression::Column(left_col) = &*on.left
-                    && let Some(index) = self.index(table, &[column.clone()])?
+                    && let Some(index) = self.index(table, std::slice::from_ref(column))?
                 {
                     let mut table = self.table(table)?;
                     if let Some(alias) = alias {

@@ -33,14 +33,14 @@ impl<'table> Join<'table> {
 
         for table in [left, right] {
             let schema = table.schema();
-            let tbl_name = schema.name.map(|idx| &schema.names[idx]);
+            let tbl_name = schema.current_name();
 
             names.extend(schema.names.iter().cloned());
 
             for sr in &schema.columns {
                 let column = match tbl_name {
                     Some(table) => Column::Dotted {
-                        table: table.clone(),
+                        table: table.to_string(),
                         column: sr.column.name().into(),
                     },
                     None => {
@@ -52,13 +52,6 @@ impl<'table> Join<'table> {
                         }
                     }
                 };
-                // let column = match &*sr.column {
-                //     Column::Single(column) => Column::Dotted {
-                //         table: tbl_name.clone(),
-                //         column: column.clone(),
-                //     },
-                //     dotted => (*dotted).clone(),
-                // };
 
                 let sr = SchemaRow {
                     column: Spanned::span(column, sr.column.span.clone()),

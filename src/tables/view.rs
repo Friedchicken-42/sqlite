@@ -218,7 +218,7 @@ impl<'row> ViewRow<'row> {
             [(i, _)] => self.row.get(*self.inner[*i].inner.clone()),
             lst => {
                 let columns = lst
-                    .into_iter()
+                    .iter()
                     .map(|(_, sr)| sr.column.clone())
                     .collect::<Vec<_>>();
                 Err(ErrorKind::DuplicateColumn(columns).into())

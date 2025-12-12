@@ -279,6 +279,7 @@ impl Page {
         [serials, serialized].concat()
     }
 
+    #[warn(clippy::identity_op)]
     fn insert(
         &mut self,
         pointer: u32,
@@ -386,7 +387,7 @@ impl Page {
         Ok(())
     }
 
-    fn split(&self, schema: &Schema) -> Result<[(Page, usize); 2]> {
+    fn split(&self) -> Result<[(Page, usize); 2]> {
         let mut a = Page::new(None, self.data.len(), self.r#type()?);
         let mut b = Page::new(None, self.data.len(), self.r#type()?);
 
@@ -397,7 +398,7 @@ impl Page {
 
         let pointers = self.pointers()?.collect::<Vec<_>>();
 
-        for (i, mut offset) in pointers.into_iter().enumerate() {
+        for (i, offset) in pointers.into_iter().enumerate() {
             let current = if i < count / 2 { &mut a } else { &mut b };
 
             let Varint {
@@ -595,11 +596,6 @@ impl<'db> BTreePage<'db> {
     }
 
     pub fn count(&self) -> usize {
-        // was this always broken?
-        // self.storage.clear();
-        // let first = self.storage.first();
-        // first.cells() as usize
-
         match &self.storage {
             Storage::Memory { pages, .. } => {
                 let mut count = 0;
@@ -613,7 +609,17 @@ impl<'db> BTreePage<'db> {
 
                 count
             }
-            Storage::File { .. } => todo!(),
+            Storage::File { db, root, .. } => {
+                let mut table = BTreePage::read(db, *root, self.schema.clone()).unwrap();
+                let mut rows = table.rows();
+                let mut count = 0;
+
+                while rows.next().is_some() {
+                    count += 1;
+                }
+
+                count
+            }
         }
     }
 
@@ -639,6 +645,7 @@ impl<'db> BTreePage<'db> {
     // IndexLeaf     -> values (sorted key -> others)
     // TableInterior -> pointer + rowid => append
     // IndexInterior -> pointer + values (sorted)
+    #[allow(clippy::identity_op)]
     pub fn insert(&mut self, mut values: Vec<Value>) -> Result<()> {
         match self.storage.first().r#type()? {
             PageType::IndexLeaf | PageType::IndexInterior => {
@@ -673,7 +680,7 @@ impl<'db> BTreePage<'db> {
         match page.insert(0, payload, rowid, &self.schema) {
             Ok(_) => Ok(()),
             Err(e) if e.kind == ErrorKind::PageFull => {
-                let [(a, rowid_a), (b, rowid_b)] = page.split(&self.schema)?;
+                let [(a, rowid_a), (b, rowid_b)] = page.split()?;
 
                 let size = page.data.len();
                 *page = Page::new(None, size, PageType::TableInterior);

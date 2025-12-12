@@ -2,7 +2,7 @@ use ariadne::Source;
 use sqlite::{
     Result, Sqlite,
     display::{DisplayOptions, Printable},
-    parser::{Query, Spanned},
+    parser::Query,
 };
 
 fn database(args: &[String]) -> Result<()> {
