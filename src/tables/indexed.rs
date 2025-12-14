@@ -33,15 +33,7 @@ impl<'table> Indexed<'table> {
         })
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
-        let table = self.table.schema().names.join(", ");
-        let index = self.index.schema().names.join(", ");
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         let columns = self
             .columns
             .iter()
@@ -49,11 +41,14 @@ impl<'table> Indexed<'table> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        writeln!(
-            f,
-            "{:<width$} │ {}{} with index {} ({})",
-            "from", spacer, table, index, columns
-        )
+        writeln!(f, "Index Scan {{ {columns} }}")?;
+
+        write!(f, "{prefix}├─")?;
+        self.table.write_indented(f)?;
+        write!(f, "{prefix}└─")?;
+        self.index.write_indented(f)?;
+
+        Ok(())
     }
 }
 

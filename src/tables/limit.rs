@@ -25,18 +25,9 @@ impl<'table> Limit<'table> {
         self.inner.count()
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
-
-        self.inner.write_indented(f, width, indent + 1)?;
-        writeln!(f, "{:<width$} │ {}{}", "limit", spacer, self.limit)?;
-
-        Ok(())
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        writeln!(f, "Limit {}", self.limit)?;
+        self.inner.write_indented_rec(f, prefix, true)
     }
 }
 

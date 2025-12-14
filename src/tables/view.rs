@@ -139,13 +139,7 @@ impl<'table> View<'table> {
             .collect::<Vec<_>>()
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         let rows = self
             .fmt_rows()
             .into_iter()
@@ -157,8 +151,8 @@ impl<'table> View<'table> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        writeln!(f, "{:<width$} │ {}{}", "select", spacer, rows)?;
-        self.inner.write_indented(f, width, indent + 1)
+        writeln!(f, "View {{ {rows} }}")?;
+        self.inner.write_indented_rec(f, prefix, true)
     }
 }
 

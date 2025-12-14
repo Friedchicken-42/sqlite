@@ -84,23 +84,16 @@ impl<'table> Join<'table> {
         })
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
-
-        write!(f, "{:<width$} │{}", "join", spacer)?;
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        write!(f, "Join")?;
         if let Some(left_column) = &self.left_column {
-            writeln!(f, "on {}", left_column.name())?;
+            writeln!(f, " on {}", left_column.name())?;
         } else {
-            writeln!(f, "full")?;
+            writeln!(f, " full")?;
         }
 
-        self.left.write_indented(f, width, indent + 1)?;
-        self.right.write_indented(f, width, indent + 1)?;
+        self.left.write_indented_rec(f, prefix, false)?;
+        self.right.write_indented_rec(f, prefix, true)?;
 
         Ok(())
     }

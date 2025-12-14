@@ -317,7 +317,7 @@ fn selectstmt_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
 
         let subquery = select_stmt
             .delimited_by(just("("), just(")"))
-            .then(just("as").ignore_then(ident_parser()).or_not())
+            .then(just("as").padded().ignore_then(ident_parser()).or_not())
             .map(
                 |(query, alias): (Spanned<SelectStatement>, Option<Spanned<String>>)| {
                     From::Subquery { query, alias }

@@ -105,20 +105,12 @@ impl<'table> Where<'table> {
         })
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
-
-        self.inner.write_indented(f, width, indent + 1)?;
-        write!(f, "{:<width$} │ {}", "where", spacer)?;
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        write!(f, "Filter {{ ")?;
         write_stmt(&self.r#where, f)?;
-        writeln!(f)?;
+        writeln!(f, " }}")?;
 
-        Ok(())
+        self.inner.write_indented_rec(f, prefix, true)
     }
 }
 

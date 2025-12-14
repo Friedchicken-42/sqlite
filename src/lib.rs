@@ -333,7 +333,7 @@ pub enum Table<'db> {
 impl Debug for Table<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match f.alternate() {
-            true => self.write_indented(f, 8, 0),
+            true => self.write_indented(f),
             false => self.write_normal(f),
         }
     }
@@ -379,20 +379,39 @@ impl<'db> Table<'db> {
         }
     }
 
-    fn write_indented(
+    fn write_indented_rec(
         &self,
         f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
+        prefix: &str,
+        is_last: bool,
     ) -> std::fmt::Result {
+        let connector = if is_last { "└" } else { "├" };
+        let branch_prefix = if is_last { "   " } else { "│  " };
+
+        write!(f, "{prefix}{connector}─ ")?;
+
+        let new_prefix = format!("{}{}", prefix, branch_prefix);
+
         match self {
-            Table::BTreePage(btreepage) => btreepage.write_indented(f, width, indent),
-            Table::Indexed(indexed) => indexed.write_indented(f, width, indent),
-            Table::View(view) => view.write_indented(f, width, indent),
-            Table::Join(join) => join.write_indented(f, width, indent),
-            Table::Where(r#where) => r#where.write_indented(f, width, indent),
-            Table::Groupby(groupby) => groupby.write_indented(f, width, indent),
-            Table::Limit(limit) => limit.write_indented(f, width, indent),
+            Table::BTreePage(btreepage) => btreepage.write_indented(f),
+            Table::Indexed(indexed) => indexed.write_indented(f, &new_prefix),
+            Table::View(view) => view.write_indented(f, &new_prefix),
+            Table::Join(join) => join.write_indented(f, &new_prefix),
+            Table::Where(r#where) => r#where.write_indented(f, &new_prefix),
+            Table::Groupby(groupby) => groupby.write_indented(f, &new_prefix),
+            Table::Limit(limit) => limit.write_indented(f, &new_prefix),
+        }
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Table::BTreePage(btreepage) => btreepage.write_indented(f),
+            Table::Indexed(indexed) => indexed.write_indented(f, ""),
+            Table::View(view) => view.write_indented(f, ""),
+            Table::Join(join) => join.write_indented(f, ""),
+            Table::Where(r#where) => r#where.write_indented(f, ""),
+            Table::Groupby(groupby) => groupby.write_indented(f, ""),
+            Table::Limit(limit) => limit.write_indented(f, ""),
         }
     }
 
@@ -810,10 +829,10 @@ impl Sqlite {
 
                 Ok(Table::BTreePage(btreepage))
             }
-            From::Subquery { query: _, alias: _ } => {
-                // TODO: Implement subquery support
-                panic!("Subquery support not yet implemented");
-            }
+            From::Subquery { query, alias } => match alias {
+                None => self.query_builder(query),
+                Some(_) => panic!("missing alias implementation"),
+            },
             From::Join { left, right, on } => {
                 let left = self.from_builder(left, None)?;
 

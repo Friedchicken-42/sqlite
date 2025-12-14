@@ -697,16 +697,9 @@ impl<'db> BTreePage<'db> {
         }
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let names = self.schema.names.join(", ");
-        let indent = "  ".repeat(indent);
-
-        writeln!(f, "{:<width$} │ {}{}", "from", indent, names)
+        writeln!(f, "Table Scan {{ {names} }}")
     }
 }
 

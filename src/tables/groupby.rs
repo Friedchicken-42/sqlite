@@ -32,13 +32,7 @@ impl<'db> GroupBy<'db> {
         self.table.rows()
     }
 
-    pub fn write_indented(
-        &self,
-        f: &mut std::fmt::Formatter,
-        _width: usize,
-        indent: usize,
-    ) -> std::fmt::Result {
-        let spacer = "  ".repeat(indent);
+    pub fn write_indented(&self, f: &mut std::fmt::Formatter, _prefix: &str) -> std::fmt::Result {
         writeln!(f, "todo")
     }
 }
