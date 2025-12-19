@@ -1,6 +1,6 @@
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table, Type,
-    Value,
+    Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table,
+    Tabular, Type, Value,
     parser::{Select, Spanned},
 };
 
@@ -108,18 +108,8 @@ pub fn create_schema(
     ))
 }
 
-impl<'table> View<'table> {
-    pub fn new(select: Spanned<Vec<Spanned<Select>>>, inner: Table<'table>) -> Result<Self> {
-        let (schema, inner_columns) = create_schema(*select.inner, &inner)?;
-
-        Ok(Self {
-            inner: Box::new(inner),
-            schema,
-            inner_columns,
-        })
-    }
-
-    pub fn rows(&mut self) -> Rows<'_, 'table> {
+impl<'table> Tabular<'table> for View<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
         Rows::View(ViewRows {
             rows: Box::new(self.inner.rows()),
             schema: &self.schema,
@@ -127,19 +117,11 @@ impl<'table> View<'table> {
         })
     }
 
-    pub fn schema(&self) -> &Schema {
+    fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub fn fmt_rows(&self) -> Vec<String> {
-        self.schema
-            .columns
-            .iter()
-            .map(|sr| sr.column.to_string())
-            .collect::<Vec<_>>()
-    }
-
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         let rows = self
             .fmt_rows()
             .into_iter()
@@ -153,6 +135,26 @@ impl<'table> View<'table> {
 
         writeln!(f, "View {{ {rows} }}")?;
         self.inner.write_indented_rec(f, prefix, true)
+    }
+}
+
+impl<'table> View<'table> {
+    pub fn new(select: Spanned<Vec<Spanned<Select>>>, inner: Table<'table>) -> Result<Self> {
+        let (schema, inner_columns) = create_schema(*select.inner, &inner)?;
+
+        Ok(Self {
+            inner: Box::new(inner),
+            schema,
+            inner_columns,
+        })
+    }
+
+    pub fn fmt_rows(&self) -> Vec<String> {
+        self.schema
+            .columns
+            .iter()
+            .map(|sr| sr.column.to_string())
+            .collect::<Vec<_>>()
     }
 }
 
@@ -183,8 +185,8 @@ pub struct ViewRow<'row> {
     inner: &'row [Spanned<Column>],
 }
 
-impl<'row> ViewRow<'row> {
-    pub fn get(&self, column: Column) -> Result<Value<'row>> {
+impl<'row> Access<'row> for ViewRow<'row> {
+    fn get(&self, column: Column) -> Result<Value<'row>> {
         let columns = self
             .schema
             .columns

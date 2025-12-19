@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Type, Value,
+    Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Tabular,
+    Type, Value,
 };
 use std::fmt::Debug;
 
@@ -94,28 +95,8 @@ pub struct Cell<'page> {
     page_type: PageType,
 }
 
-impl<'page> Cell<'page> {
-    fn page(&self) -> usize {
-        u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize
-    }
-
-    pub fn rowid(&self) -> Result<usize> {
-        match self.page_type {
-            PageType::TableLeaf => {
-                let Varint { length, .. } = Varint::read(self.data);
-                let Varint { value, .. } = Varint::read(&self.data[length..]);
-                Ok(value)
-            }
-            PageType::TableInterior => {
-                let Varint { value, .. } = Varint::read(&self.data[4..]);
-                Ok(value)
-            }
-            PageType::IndexLeaf => Err(ErrorKind::WrongPageType(0x0a).into()),
-            PageType::IndexInterior => Err(ErrorKind::WrongPageType(0x02).into()),
-        }
-    }
-
-    pub fn get(&self, column: Column) -> Result<Value<'page>> {
+impl<'page> Access<'page> for Cell<'page> {
+    fn get(&self, column: Column) -> Result<Value<'page>> {
         let name = match column {
             Column::Single(name) => name,
             Column::Dotted { table, column } if self.schema.names.contains(&table) => column,
@@ -165,6 +146,28 @@ impl<'page> Cell<'page> {
         match value {
             Value::Null if name == "id" => Ok(Value::Integer(rowid as u64)),
             other => Ok(other),
+        }
+    }
+}
+
+impl<'page> Cell<'page> {
+    fn page(&self) -> usize {
+        u32::from_be_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) as usize
+    }
+
+    pub fn rowid(&self) -> Result<usize> {
+        match self.page_type {
+            PageType::TableLeaf => {
+                let Varint { length, .. } = Varint::read(self.data);
+                let Varint { value, .. } = Varint::read(&self.data[length..]);
+                Ok(value)
+            }
+            PageType::TableInterior => {
+                let Varint { value, .. } = Varint::read(&self.data[4..]);
+                Ok(value)
+            }
+            PageType::IndexLeaf => Err(ErrorKind::WrongPageType(0x0a).into()),
+            PageType::IndexInterior => Err(ErrorKind::WrongPageType(0x02).into()),
         }
     }
 }
@@ -570,6 +573,24 @@ pub struct BTreePage<'db> {
     rowid: Option<usize>,
 }
 
+impl<'db> Tabular<'db> for BTreePage<'db> {
+    fn rows(&mut self) -> Rows<'_, 'db> {
+        Rows::BTreePage(BTreeRows {
+            btree: self,
+            indexes: vec![],
+        })
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, _prefix: &str) -> std::fmt::Result {
+        let names = self.schema.names.join(", ");
+        writeln!(f, "Table Scan {{ {names} }}")
+    }
+}
+
 impl<'db> BTreePage<'db> {
     pub fn read(db: &'db Sqlite, index: usize, schema: Schema) -> Result<Self> {
         Ok(Self {
@@ -586,13 +607,6 @@ impl<'db> BTreePage<'db> {
     pub fn add_alias(&mut self, alias: String) {
         self.schema.name = Some(self.schema.names.len());
         self.schema.names.push(alias);
-    }
-
-    pub fn rows(&mut self) -> Rows<'_, 'db> {
-        Rows::BTreePage(BTreeRows {
-            btree: self,
-            indexes: vec![],
-        })
     }
 
     pub fn count(&self) -> usize {
@@ -621,10 +635,6 @@ impl<'db> BTreePage<'db> {
                 count
             }
         }
-    }
-
-    pub fn schema(&self) -> &Schema {
-        &self.schema
     }
 
     fn check_schema(&self, values: &[Value]) -> Result<()> {
@@ -695,11 +705,6 @@ impl<'db> BTreePage<'db> {
             }
             e => e,
         }
-    }
-
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let names = self.schema.names.join(", ");
-        writeln!(f, "Table Scan {{ {names} }}")
     }
 }
 

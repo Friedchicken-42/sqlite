@@ -1,8 +1,27 @@
-use crate::{Iterator, Row, Rows, Table};
+use crate::{Iterator, Row, Rows, Table, Tabular};
 
 pub struct Limit<'table> {
     pub inner: Box<Table<'table>>,
     pub limit: usize,
+}
+
+impl<'table> Tabular<'table> for Limit<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
+        Rows::Limit(LimitRows {
+            rows: Box::new(self.inner.rows()),
+            count: 0,
+            limit: self.limit,
+        })
+    }
+
+    fn schema(&self) -> &crate::Schema {
+        self.inner.schema()
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        writeln!(f, "Limit {}", self.limit)?;
+        self.inner.write_indented_rec(f, prefix, true)
+    }
 }
 
 impl<'table> Limit<'table> {
@@ -13,21 +32,8 @@ impl<'table> Limit<'table> {
         }
     }
 
-    pub fn rows(&mut self) -> Rows<'_, 'table> {
-        Rows::Limit(LimitRows {
-            rows: Box::new(self.inner.rows()),
-            count: 0,
-            limit: self.limit,
-        })
-    }
-
     pub fn count(&mut self) -> usize {
         self.inner.count()
-    }
-
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
-        writeln!(f, "Limit {}", self.limit)?;
-        self.inner.write_indented_rec(f, prefix, true)
     }
 }
 
@@ -53,7 +59,7 @@ impl Iterator for LimitRows<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Result, Sqlite, Table, Value, parser::Query};
+    use crate::{Access, Result, Sqlite, Table, Value, parser::Query};
 
     use super::*;
 

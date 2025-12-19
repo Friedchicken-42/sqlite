@@ -1,6 +1,6 @@
 use ariadne::Source;
 use sqlite::{
-    Result, Sqlite,
+    Access, Result, Sqlite, Tabular,
     display::{DisplayOptions, Printable},
     parser::Query,
 };

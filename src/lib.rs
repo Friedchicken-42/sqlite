@@ -320,6 +320,12 @@ impl Column {
     }
 }
 
+pub trait Tabular<'db> {
+    fn rows(&mut self) -> Rows<'_, 'db>;
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result;
+    fn schema(&self) -> &Schema;
+}
+
 pub enum Table<'db> {
     BTreePage(BTreePage<'db>),
     Indexed(Indexed<'db>),
@@ -333,14 +339,14 @@ pub enum Table<'db> {
 impl Debug for Table<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match f.alternate() {
-            true => self.write_indented(f),
+            true => self.write_indented(f, ""),
             false => self.write_normal(f),
         }
     }
 }
 
-impl<'db> Table<'db> {
-    pub fn rows(&mut self) -> Rows<'_, 'db> {
+impl<'db> Tabular<'db> for Table<'db> {
+    fn rows(&mut self) -> Rows<'_, 'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.rows(),
             Table::Indexed(indexed) => indexed.rows(),
@@ -352,6 +358,32 @@ impl<'db> Table<'db> {
         }
     }
 
+    fn schema(&self) -> &Schema {
+        match self {
+            Table::BTreePage(btreepage) => btreepage.schema(),
+            Table::Indexed(indexed) => indexed.table.schema(),
+            Table::View(view) => view.schema(),
+            Table::Join(join) => join.schema(),
+            Table::Where(r#where) => r#where.inner.schema(),
+            Table::Groupby(groupby) => groupby.schema(),
+            Table::Limit(limit) => limit.inner.schema(),
+        }
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        match self {
+            Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
+            Table::Indexed(indexed) => indexed.write_indented(f, prefix),
+            Table::View(view) => view.write_indented(f, prefix),
+            Table::Join(join) => join.write_indented(f, prefix),
+            Table::Where(r#where) => r#where.write_indented(f, prefix),
+            Table::Groupby(groupby) => groupby.write_indented(f, prefix),
+            Table::Limit(limit) => limit.write_indented(f, prefix),
+        }
+    }
+}
+
+impl<'db> Table<'db> {
     pub fn count(&mut self) -> usize {
         match self {
             Table::BTreePage(btreepage) => btreepage.count(),
@@ -364,18 +396,6 @@ impl<'db> Table<'db> {
                 }
                 count
             }
-        }
-    }
-
-    pub fn schema(&self) -> &Schema {
-        match self {
-            Table::BTreePage(btreepage) => btreepage.schema(),
-            Table::Indexed(indexed) => indexed.table.schema(),
-            Table::View(view) => view.schema(),
-            Table::Join(join) => join.schema(),
-            Table::Where(r#where) => r#where.inner.schema(),
-            Table::Groupby(groupby) => groupby.schema(),
-            Table::Limit(limit) => limit.inner.schema(),
         }
     }
 
@@ -393,25 +413,13 @@ impl<'db> Table<'db> {
         let new_prefix = format!("{}{}", prefix, branch_prefix);
 
         match self {
-            Table::BTreePage(btreepage) => btreepage.write_indented(f),
+            Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
             Table::Indexed(indexed) => indexed.write_indented(f, &new_prefix),
             Table::View(view) => view.write_indented(f, &new_prefix),
             Table::Join(join) => join.write_indented(f, &new_prefix),
             Table::Where(r#where) => r#where.write_indented(f, &new_prefix),
             Table::Groupby(groupby) => groupby.write_indented(f, &new_prefix),
             Table::Limit(limit) => limit.write_indented(f, &new_prefix),
-        }
-    }
-
-    fn write_indented(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Table::BTreePage(btreepage) => btreepage.write_indented(f),
-            Table::Indexed(indexed) => indexed.write_indented(f, ""),
-            Table::View(view) => view.write_indented(f, ""),
-            Table::Join(join) => join.write_indented(f, ""),
-            Table::Where(r#where) => r#where.write_indented(f, ""),
-            Table::Groupby(groupby) => groupby.write_indented(f, ""),
-            Table::Limit(limit) => limit.write_indented(f, ""),
         }
     }
 
@@ -507,14 +515,18 @@ impl Iterator for Rows<'_, '_> {
     }
 }
 
+pub trait Access<'page> {
+    fn get(&self, column: Column) -> Result<Value<'page>>;
+}
+
 pub enum Row<'page> {
     Cell(Cell<'page>),
     View(ViewRow<'page>),
     Join(JoinRow<'page>),
 }
 
-impl<'page> Row<'page> {
-    pub fn get(&self, column: Column) -> Result<Value<'page>> {
+impl<'page> Access<'page> for Row<'page> {
+    fn get(&self, column: Column) -> Result<Value<'page>> {
         match self {
             Row::Cell(cell) => cell.get(column),
             Row::View(view) => view.get(column),

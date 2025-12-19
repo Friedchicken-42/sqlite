@@ -1,4 +1,6 @@
-use crate::{Iterator, Result, Row, Schema, Serialized, SqliteError, Table, Value};
+use crate::{
+    Access, Iterator, Result, Row, Schema, Serialized, SqliteError, Table, Tabular, Value,
+};
 
 enum DisplayMode {
     List,
@@ -134,6 +136,7 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) -> Result<()> {
     let mut ended = false;
 
     let schema = table.schema().clone();
+    println!("schema: {schema:?}");
 
     let mut sizes = schema
         .columns

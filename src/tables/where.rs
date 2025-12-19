@@ -1,5 +1,5 @@
 use crate::{
-    Iterator, Row, Rows, Table, Value,
+    Access, Iterator, Row, Rows, Table, Tabular, Value,
     parser::{Comparison, Expression, Operator, Spanned, WhereStatement},
 };
 
@@ -90,27 +90,33 @@ pub fn write_stmt(stmt: &WhereStatement, f: &mut std::fmt::Formatter<'_>) -> std
     }
 }
 
-impl<'table> Where<'table> {
-    pub fn new(inner: Table<'table>, r#where: Spanned<WhereStatement>) -> Self {
-        Self {
-            inner: Box::new(inner),
-            r#where,
-        }
-    }
-
-    pub fn rows(&mut self) -> Rows<'_, 'table> {
+impl<'table> Tabular<'table> for Where<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
         Rows::Where(WhereRows {
             rows: Box::new(self.inner.rows()),
             r#where: &self.r#where,
         })
     }
 
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+    fn schema(&self) -> &crate::Schema {
+        self.inner.schema()
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         write!(f, "Filter {{ ")?;
         write_stmt(&self.r#where, f)?;
         writeln!(f, " }}")?;
 
         self.inner.write_indented_rec(f, prefix, true)
+    }
+}
+
+impl<'table> Where<'table> {
+    pub fn new(inner: Table<'table>, r#where: Spanned<WhereStatement>) -> Self {
+        Self {
+            inner: Box::new(inner),
+            r#where,
+        }
     }
 }
 

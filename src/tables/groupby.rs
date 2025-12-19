@@ -1,5 +1,5 @@
 use crate::{
-    Result, Rows, Schema, Table,
+    Result, Rows, Schema, Table, Tabular,
     parser::{Groupby, Select, Spanned},
     tables::{
         btreepage::{BTreePage, BTreePageBuilder},
@@ -9,6 +9,20 @@ use crate::{
 
 pub struct GroupBy<'db> {
     table: BTreePage<'db>,
+}
+
+impl<'table> Tabular<'table> for GroupBy<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
+        todo!()
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        todo!()
+    }
+
+    fn schema(&self) -> &Schema {
+        todo!()
+    }
 }
 
 impl<'db> GroupBy<'db> {
@@ -22,17 +36,5 @@ impl<'db> GroupBy<'db> {
         let mut table = BTreePageBuilder::new(schema).build()?;
 
         Ok(Self { table })
-    }
-
-    pub fn schema(&self) -> &Schema {
-        self.table.schema()
-    }
-
-    pub fn rows(&mut self) -> Rows<'_, 'db> {
-        self.table.rows()
-    }
-
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, _prefix: &str) -> std::fmt::Result {
-        writeln!(f, "todo")
     }
 }

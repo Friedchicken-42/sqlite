@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use crate::{
-    Column, Iterator, Row, Rows, Value,
+    Access, Column, Iterator, Row, Rows, Tabular, Value,
     parser::Expression,
     tables::btreepage::{BTreePage, BTreeRows},
 };
@@ -13,8 +13,8 @@ pub struct Indexed<'table> {
     pub expressions: Vec<Expression>,
 }
 
-impl<'table> Indexed<'table> {
-    pub fn rows(&mut self) -> Rows<'_, 'table> {
+impl<'table> Tabular<'table> for Indexed<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
         let table = BTreeRows {
             btree: &mut self.table,
             indexes: vec![],
@@ -33,7 +33,11 @@ impl<'table> Indexed<'table> {
         })
     }
 
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+    fn schema(&self) -> &crate::Schema {
+        self.table.schema()
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         let columns = self
             .columns
             .iter()
@@ -44,9 +48,9 @@ impl<'table> Indexed<'table> {
         writeln!(f, "Index Scan {{ {columns} }}")?;
 
         write!(f, "{prefix}├─")?;
-        self.table.write_indented(f)?;
+        self.table.write_indented(f, "")?;
         write!(f, "{prefix}└─")?;
-        self.index.write_indented(f)?;
+        self.index.write_indented(f, "")?;
 
         Ok(())
     }

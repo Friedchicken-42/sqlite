@@ -1,5 +1,6 @@
 use crate::{
-    Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, Table, Value,
+    Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, Table, Tabular,
+    Value,
     parser::{Expression, Spanned},
 };
 
@@ -8,6 +9,34 @@ pub struct Join<'table> {
     pub right: Box<Table<'table>>,
     schema: Schema,
     left_column: Option<Column>,
+}
+
+impl<'table> Tabular<'table> for Join<'table> {
+    fn rows(&mut self) -> Rows<'_, 'table> {
+        Rows::Join(JoinRows {
+            left: Box::new(self.left.rows()),
+            right: Box::new(self.right.rows()),
+            left_column: self.left_column.as_ref(),
+        })
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
+        write!(f, "Join")?;
+        if let Some(left_column) = &self.left_column {
+            writeln!(f, " on {}", left_column.name())?;
+        } else {
+            writeln!(f, " full")?;
+        }
+
+        self.left.write_indented_rec(f, prefix, false)?;
+        self.right.write_indented_rec(f, prefix, true)?;
+
+        Ok(())
+    }
 }
 
 impl<'table> Join<'table> {
@@ -70,32 +99,6 @@ impl<'table> Join<'table> {
             left_column: Some(column),
             ..Self::new(left, right)
         }
-    }
-
-    pub fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    pub fn rows(&mut self) -> Rows<'_, 'table> {
-        Rows::Join(JoinRows {
-            left: Box::new(self.left.rows()),
-            right: Box::new(self.right.rows()),
-            left_column: self.left_column.as_ref(),
-        })
-    }
-
-    pub fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
-        write!(f, "Join")?;
-        if let Some(left_column) = &self.left_column {
-            writeln!(f, " on {}", left_column.name())?;
-        } else {
-            writeln!(f, " full")?;
-        }
-
-        self.left.write_indented_rec(f, prefix, false)?;
-        self.right.write_indented_rec(f, prefix, true)?;
-
-        Ok(())
     }
 }
 
@@ -169,8 +172,8 @@ pub struct JoinRow<'row> {
     right: Box<Row<'row>>,
 }
 
-impl<'row> JoinRow<'row> {
-    pub fn get(&self, column: Column) -> Result<Value<'row>> {
+impl<'row> Access<'row> for JoinRow<'row> {
+    fn get(&self, column: Column) -> Result<Value<'row>> {
         match (
             self.left.get(column.clone()),
             self.right.get(column.clone()),
