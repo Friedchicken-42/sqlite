@@ -6,14 +6,14 @@ use crate::{
     tables::btreepage::{BTreePage, BTreeRows},
 };
 
-pub struct Indexed<'table> {
+pub struct IndexSeek<'table> {
     pub table: BTreePage<'table>,
     pub index: BTreePage<'table>,
     pub columns: Vec<Column>,
     pub expressions: Vec<Expression>,
 }
 
-impl<'table> Tabular<'table> for Indexed<'table> {
+impl<'table> Tabular<'table> for IndexSeek<'table> {
     fn rows(&mut self) -> Rows<'_, 'table> {
         let table = BTreeRows {
             btree: &mut self.table,
@@ -25,7 +25,7 @@ impl<'table> Tabular<'table> for Indexed<'table> {
             indexes: vec![],
         };
 
-        Rows::Indexed(IndexedRows {
+        Rows::IndexSeek(IndexedRows {
             table,
             index,
             columns: &mut self.columns,
@@ -56,14 +56,14 @@ impl<'table> Tabular<'table> for Indexed<'table> {
     }
 }
 
-pub struct IndexedRows<'rows, 'table> {
+pub struct IndexSeekRows<'rows, 'table> {
     table: BTreeRows<'rows, 'table>,
     index: BTreeRows<'rows, 'table>,
     pub columns: &'rows Vec<Column>,
     pub expressions: &'rows mut Vec<Expression>,
 }
 
-impl Iterator for IndexedRows<'_, '_> {
+impl Iterator for IndexSeekRows<'_, '_> {
     fn current(&self) -> Option<Row<'_>> {
         self.table.current()
     }

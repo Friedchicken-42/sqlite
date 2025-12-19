@@ -12,7 +12,7 @@ use crate::{
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         groupby::GroupBy,
-        indexed::{Indexed, IndexedRows},
+        indexseek::{IndexSeek, IndexSeekRows},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
         view::{View, ViewRow, ViewRows},
@@ -74,9 +74,10 @@ impl SqliteError {
                 if columns.is_empty() {
                     report.with_label(label("duplicated".into()))
                 } else {
-                    let labels = columns.into_iter().map(|col| {
+                    let labels = columns.into_iter().enumerate().map(|(i, col)| {
+                        let message = if i == 0 { "here" } else { "and here" };
                         Label::new(("query", col.span))
-                            .with_message("here")
+                            .with_message(message)
                             .with_color(Color::Red)
                     });
 
@@ -328,7 +329,7 @@ pub trait Tabular<'db> {
 
 pub enum Table<'db> {
     BTreePage(BTreePage<'db>),
-    Indexed(Indexed<'db>),
+    IndexSeek(IndexSeek<'db>),
     View(View<'db>),
     Join(Join<'db>),
     Where(Where<'db>),
@@ -349,7 +350,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn rows(&mut self) -> Rows<'_, 'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.rows(),
-            Table::Indexed(indexed) => indexed.rows(),
+            Table::IndexSeek(indexseek) => indexseek.rows(),
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
             Table::Where(r#where) => r#where.rows(),
@@ -361,7 +362,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn schema(&self) -> &Schema {
         match self {
             Table::BTreePage(btreepage) => btreepage.schema(),
-            Table::Indexed(indexed) => indexed.table.schema(),
+            Table::IndexSeek(indexseek) => indexseek.table.schema(),
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
@@ -373,7 +374,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         match self {
             Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
-            Table::Indexed(indexed) => indexed.write_indented(f, prefix),
+            Table::IndexSeek(indexseek) => indexseek.write_indented(f, prefix),
             Table::View(view) => view.write_indented(f, prefix),
             Table::Join(join) => join.write_indented(f, prefix),
             Table::Where(r#where) => r#where.write_indented(f, prefix),
@@ -414,7 +415,7 @@ impl<'db> Table<'db> {
 
         match self {
             Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
-            Table::Indexed(indexed) => indexed.write_indented(f, &new_prefix),
+            Table::IndexSeek(indexseek) => indexseek.write_indented(f, &new_prefix),
             Table::View(view) => view.write_indented(f, &new_prefix),
             Table::Join(join) => join.write_indented(f, &new_prefix),
             Table::Where(r#where) => r#where.write_indented(f, &new_prefix),
@@ -429,9 +430,9 @@ impl<'db> Table<'db> {
 
         match self {
             Table::BTreePage(_) => writeln!(f, "select * from {name}"),
-            Table::Indexed(indexed) => {
-                let table = indexed.table.schema().names.join(", ");
-                let index = indexed.index.schema().names.join(", ");
+            Table::IndexSeek(indexseek) => {
+                let table = indexseek.table.schema().names.join(", ");
+                let index = indexseek.index.schema().names.join(", ");
 
                 writeln!(f, "select * from {table} using index {index}")
             }
@@ -484,7 +485,7 @@ pub trait Iterator {
 
 pub enum Rows<'rows, 'db> {
     BTreePage(BTreeRows<'rows, 'db>),
-    Indexed(IndexedRows<'rows, 'db>),
+    IndexSeek(IndexSeekRows<'rows, 'db>),
     View(ViewRows<'rows, 'db>),
     Join(JoinRows<'rows, 'db>),
     Where(WhereRows<'rows, 'db>),
@@ -495,7 +496,7 @@ impl Iterator for Rows<'_, '_> {
     fn current(&self) -> Option<Row<'_>> {
         match self {
             Rows::BTreePage(btreerows) => btreerows.current(),
-            Rows::Indexed(indexed) => indexed.current(),
+            Rows::IndexSeek(indexseek) => indexseek.current(),
             Rows::View(view) => view.current(),
             Rows::Join(join) => join.current(),
             Rows::Where(r#where) => r#where.current(),
@@ -506,7 +507,7 @@ impl Iterator for Rows<'_, '_> {
     fn advance(&mut self) {
         match self {
             Rows::BTreePage(btreerows) => btreerows.advance(),
-            Rows::Indexed(indexed) => indexed.advance(),
+            Rows::IndexSeek(indexseek) => indexseek.advance(),
             Rows::View(view) => view.advance(),
             Rows::Join(join) => join.advance(),
             Rows::Where(r#where) => r#where.advance(),
@@ -828,14 +829,14 @@ impl Sqlite {
                         r#where.index().into_iter().unzip();
 
                     if let Some(index) = self.index(&table, &columns)? {
-                        let indexed = Indexed {
+                        let indexseek = IndexSeek {
                             table: btreepage,
                             index,
                             columns,
                             expressions,
                         };
 
-                        return Ok(Table::Indexed(indexed));
+                        return Ok(Table::IndexSeek(indexseek));
                     }
                 }
 
@@ -859,14 +860,14 @@ impl Sqlite {
                         table.add_alias(alias.inner.as_str().into());
                     }
 
-                    let indexed = Indexed {
+                    let indexseek = IndexSeek {
                         table,
                         index,
                         columns: vec![column.clone()],
                         expressions: vec![],
                     };
 
-                    let right = Table::Indexed(indexed);
+                    let right = Table::IndexSeek(indexseek);
                     Table::Join(Join::indexed(left, right, left_col.clone()))
                 } else {
                     let right = self.from_builder(right, None)?;
@@ -917,7 +918,7 @@ impl Sqlite {
         // table = Table::Groupby(groupby);
         // } else if *select_clause != vec![Select::Wildcard] {
         if let Some(first) = select_clause.inner.first()
-            && *first.inner != Select::Wildcard
+            && (*first.inner != Select::Wildcard || matches!(&table, Table::Join(_)))
         {
             let view = View::new(select_clause, table)?;
             table = Table::View(view);

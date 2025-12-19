@@ -1,6 +1,7 @@
 pub mod btreepage;
 pub mod groupby;
-pub mod indexed;
+pub mod indexscan;
+pub mod indexseek;
 pub mod join;
 pub mod limit;
 pub mod view;

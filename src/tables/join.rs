@@ -197,8 +197,6 @@ mod tests {
         let query = Query::parse("select * from apples join oranges")?;
         let mut table = db.execute(query)?;
 
-        assert!(matches!(&table, Table::Join(_)));
-
         let mut i = 0;
         let mut rows = table.rows();
         while let Some(row) = rows.next() {
@@ -231,6 +229,27 @@ mod tests {
         }
 
         assert_eq!(i, 7);
+
+        Ok(())
+    }
+
+    #[test]
+    fn join_select_star_spans() -> Result<()> {
+        let db = Sqlite::read("sample.db")?;
+        let query = Query::parse("select * from apples as a join oranges as o")?;
+        let table = db.execute(query)?;
+        let schema = table.schema();
+
+        println!("Schema columns count: {}", schema.columns.len());
+
+        for (i, col) in schema.columns.iter().enumerate() {
+            println!(
+                "Column {}: {} with span {:?}",
+                i, col.column.inner, col.column.span
+            );
+        }
+
+        assert!(schema.columns.len() > 0);
 
         Ok(())
     }

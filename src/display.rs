@@ -136,7 +136,6 @@ fn display_table(table: &mut Table<'_>, opts: DisplayOptions) -> Result<()> {
     let mut ended = false;
 
     let schema = table.schema().clone();
-    println!("schema: {schema:?}");
 
     let mut sizes = schema
         .columns
