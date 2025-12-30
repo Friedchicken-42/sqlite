@@ -147,11 +147,11 @@ impl Iterator for JoinRows<'_, '_> {
 
 impl JoinRows<'_, '_> {
     fn setup_right(&mut self) {
-        let Rows::Indexed(indexed) = &mut *self.right else {
+        let Rows::IndexSeek(indexseek) = &mut *self.right else {
             return;
         };
 
-        indexed.expressions.clear();
+        indexseek.expressions.clear();
 
         let left = self.left.current().unwrap();
         let column = self.left_column.unwrap();
@@ -163,7 +163,7 @@ impl JoinRows<'_, '_> {
             _ => panic!("not supported as an expression"),
         };
 
-        indexed.expressions.push(expr);
+        indexseek.expressions.push(expr);
     }
 }
 

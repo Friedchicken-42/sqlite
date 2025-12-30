@@ -3,15 +3,25 @@ use crate::{Iterator, Row, Rows, Table, Tabular};
 pub struct Limit<'table> {
     pub inner: Box<Table<'table>>,
     pub limit: usize,
+    pub offset: usize,
 }
 
 impl<'table> Tabular<'table> for Limit<'table> {
     fn rows(&mut self) -> Rows<'_, 'table> {
-        Rows::Limit(LimitRows {
+        let mut rows = Rows::Limit(LimitRows {
             rows: Box::new(self.inner.rows()),
             count: 0,
             limit: self.limit,
-        })
+        });
+
+        for _ in 0..self.offset {
+            rows.advance();
+            if rows.current().is_none() {
+                break;
+            }
+        }
+
+        rows
     }
 
     fn schema(&self) -> &crate::Schema {
@@ -19,21 +29,25 @@ impl<'table> Tabular<'table> for Limit<'table> {
     }
 
     fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
-        writeln!(f, "Limit {}", self.limit)?;
+        if self.limit != 0 {
+            write!(f, "Limit {} ", self.limit)?;
+        }
+        if self.offset != 0 {
+            write!(f, "Skip {}", self.offset)?;
+        }
+        writeln!(f)?;
+
         self.inner.write_indented_rec(f, prefix, true)
     }
 }
 
 impl<'table> Limit<'table> {
-    pub fn new(inner: Table<'table>, limit: usize) -> Self {
+    pub fn new(inner: Table<'table>, limit: usize, offset: usize) -> Self {
         Self {
             inner: Box::new(inner),
             limit,
+            offset,
         }
-    }
-
-    pub fn count(&mut self) -> usize {
-        self.inner.count()
     }
 }
 

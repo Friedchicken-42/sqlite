@@ -25,7 +25,7 @@ impl<'table> Tabular<'table> for IndexSeek<'table> {
             indexes: vec![],
         };
 
-        Rows::IndexSeek(IndexedRows {
+        Rows::IndexSeek(IndexSeekRows {
             table,
             index,
             columns: &mut self.columns,

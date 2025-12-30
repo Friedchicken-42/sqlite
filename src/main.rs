@@ -33,7 +33,7 @@ fn database(args: &[String]) -> Result<()> {
         }
         ".parse" => {
             let q = Query::parse(&args[3])?;
-            println!("{q:#?}");
+            println!("{q:?}");
         }
         input => {
             let query = Query::parse(input)?;

@@ -2,6 +2,7 @@
 
 pub mod display;
 pub mod parser;
+pub mod physical;
 pub mod tables;
 
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
         CreateIndexStatement, Expression, From, Query, Select, SelectStatement, Spanned,
         WhereStatement,
     },
+    physical::Physical,
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         groupby::GroupBy,
@@ -53,6 +55,10 @@ pub struct SqliteError {
 impl SqliteError {
     pub fn new(kind: ErrorKind, span: Range<usize>) -> Self {
         Self { kind, span }
+    }
+
+    pub fn span(self, span: Range<usize>) -> Self {
+        Self { span, ..self }
     }
 
     pub fn write<'src, C: ariadne::Cache<&'src str>>(self, cache: C, writer: impl Write) {
@@ -339,10 +345,7 @@ pub enum Table<'db> {
 
 impl Debug for Table<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match f.alternate() {
-            true => self.write_indented(f, ""),
-            false => self.write_normal(f),
-        }
+        self.write_indented(f, "")
     }
 }
 
@@ -413,63 +416,7 @@ impl<'db> Table<'db> {
 
         let new_prefix = format!("{}{}", prefix, branch_prefix);
 
-        match self {
-            Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
-            Table::IndexSeek(indexseek) => indexseek.write_indented(f, &new_prefix),
-            Table::View(view) => view.write_indented(f, &new_prefix),
-            Table::Join(join) => join.write_indented(f, &new_prefix),
-            Table::Where(r#where) => r#where.write_indented(f, &new_prefix),
-            Table::Groupby(groupby) => groupby.write_indented(f, &new_prefix),
-            Table::Limit(limit) => limit.write_indented(f, &new_prefix),
-        }
-    }
-
-    fn write_normal(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let schema = self.schema();
-        let name = schema.names.iter().max_by_key(|s| s.len()).unwrap();
-
-        match self {
-            Table::BTreePage(_) => writeln!(f, "select * from {name}"),
-            Table::IndexSeek(indexseek) => {
-                let table = indexseek.table.schema().names.join(", ");
-                let index = indexseek.index.schema().names.join(", ");
-
-                writeln!(f, "select * from {table} using index {index}")
-            }
-            Table::View(view) => {
-                let rows = view.fmt_rows().join(", ");
-
-                write!(f, "(select {rows} from ")?;
-                view.inner.write_normal(f)?;
-                write!(f, ")")?;
-                Ok(())
-            }
-            Table::Join(join) => {
-                write!(f, "(")?;
-                join.left.write_normal(f)?;
-                write!(f, ") join (")?;
-                join.right.write_normal(f)?;
-                write!(f, ")")?;
-                Ok(())
-            }
-            Table::Where(r#where) => {
-                r#where.inner.write_normal(f)?;
-                write!(f, " where ")?;
-                write_stmt(&r#where.r#where, f)?;
-                Ok(())
-            }
-            Table::Groupby(groupby) => {
-                // ...
-                write!(f, " group by ...")?;
-                Ok(())
-            }
-            Table::Limit(limit) => {
-                write!(f, "(")?;
-                limit.inner.write_normal(f)?;
-                write!(f, ") limit {}", limit.limit)?;
-                Ok(())
-            }
-        }
+        self.write_indented(f, &new_prefix)
     }
 }
 
@@ -807,6 +754,7 @@ impl Sqlite {
         Ok(Some(btreepage))
     }
 
+    /*
     #[allow(clippy::wrong_self_convention)]
     fn from_builder(
         &self,
@@ -890,44 +838,12 @@ impl Sqlite {
             }
         }
     }
+    */
 
     fn query_builder(&self, select: Spanned<SelectStatement>) -> Result<Table<'_>> {
-        let SelectStatement {
-            select_clause,
-            from_clause,
-            where_clause,
-            groupby_clause,
-            limit_clause,
-        } = *select.inner;
-
-        let mut table = self.from_builder(from_clause, where_clause.as_ref())?;
-
-        if let Some(r#where) = where_clause {
-            let r#where = Where::new(table, r#where);
-            table = Table::Where(r#where);
-        }
-
-        // if select_clause
-        //     .iter()
-        //     .any(|s| matches!(s, Select::Function { .. }))
-        //     || groupby_clause.is_some()
-        // {
-        // panic!("groupby work in progress");
-
-        // let groupby = GroupBy::new(select_clause, groupby_clause, table)?;
-        // table = Table::Groupby(groupby);
-        // } else if *select_clause != vec![Select::Wildcard] {
-        if let Some(first) = select_clause.inner.first()
-            && (*first.inner != Select::Wildcard || matches!(&table, Table::Join(_)))
-        {
-            let view = View::new(select_clause, table)?;
-            table = Table::View(view);
-        }
-
-        if let Some(limit_stmt) = limit_clause {
-            let limit = Limit::new(table, limit_stmt.limit);
-            table = Table::Limit(limit);
-        }
+        let physical = self.physical_builder(select)?;
+        // let physical = self.optimize(physical);
+        let table = self.table_builder(physical)?;
 
         Ok(table)
     }
@@ -944,7 +860,7 @@ impl Sqlite {
             }
             Query::Explain(select_statement) => {
                 let table = self.query_builder(select_statement)?;
-                println!("{table:#?}");
+                println!("{table:?}");
 
                 // Returns empty table
                 let schema = Schema {
