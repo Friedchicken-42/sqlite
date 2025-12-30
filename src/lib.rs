@@ -6,11 +6,7 @@ pub mod physical;
 pub mod tables;
 
 use crate::{
-    parser::{
-        CreateIndexStatement, Expression, From, Query, Select, SelectStatement, Spanned,
-        WhereStatement,
-    },
-    physical::Physical,
+    parser::{Query, SelectStatement, Spanned},
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         groupby::GroupBy,
@@ -18,7 +14,7 @@ use crate::{
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
         view::{View, ViewRow, ViewRows},
-        r#where::{Where, WhereRows, write_stmt},
+        r#where::{Where, WhereRows},
     },
 };
 use ariadne::{Color, Label, Report, ReportKind};
@@ -662,68 +658,13 @@ impl Sqlite {
         Ok(None)
     }
 
-    pub fn table(&self, name: &str) -> Result<BTreePage<'_>> {
-        let Some((rootpage, query)) = self.find(|tbl_name, _| tbl_name == name)? else {
-            return Err(ErrorKind::TableNotFound(name.to_string()).into());
-        };
-
-        if let Query::CreateTable(cts) = &*query {
-            BTreePage::read(self, rootpage, cts.schema.clone())
-        } else {
-            Err(ErrorKind::WrongCommand(query).into())
-        }
-    }
-
-    fn index(&self, table_name: &str, columns: &[Column]) -> Result<Option<BTreePage<'_>>> {
-        let mut root = self.root()?;
-        let mut rows = root.rows();
-
-        let mut best: Option<(usize, u64, Spanned<CreateIndexStatement>)> = None;
-
-        while let Some(row) = rows.next() {
-            let tbl_name = self.extract_text_value(&row, "name".into())?;
-            if tbl_name == "sqlite_sequence" {
-                continue;
-            }
-
-            let sql = self.extract_text_value(&row, "sql".into())?;
-            let rootpage = self.extract_integer_value(&row, "rootpage".into())?;
-
-            let query = Query::parse(&sql.to_lowercase())?;
-            let Query::CreateIndex(index) = *query.inner else {
-                continue;
-            };
-
-            if index.table != table_name {
-                continue;
-            }
-
-            let mut count = 0;
-            for col in index.columns.iter() {
-                for c in columns {
-                    if col == c.name() {
-                        count += 1;
-                    }
-                }
-            }
-
-            best = match best {
-                None if count == 0 => None,
-                Some((c, ..)) if c >= count => best,
-                _ => Some((count, rootpage, index)),
-            };
-        }
-
-        let Some((_, rootpage, index)) = best else {
-            return Ok(None);
-        };
-
-        let table = self.table(table_name)?;
+    fn create_schema_index(&self, index: &str, table: &str, columns: &[String]) -> Result<Schema> {
+        let table = self.table(table)?;
 
         let mut schema = vec![];
         let mut primary = vec![];
 
-        for (idx, name) in index.columns.iter().enumerate() {
+        for (idx, name) in columns.iter().enumerate() {
             let out = table
                 .schema()
                 .columns
@@ -743,106 +684,63 @@ impl Sqlite {
             r#type: Type::Integer, // TODO: Check if this should be Type::Blob based on SQLite spec
         });
 
-        let schema = Schema {
-            names: vec![index.name.clone()],
+        Ok(Schema {
+            names: vec![index.to_string()],
             name: Some(0),
             columns: schema,
             primary,
+        })
+    }
+
+    pub fn table(&self, name: &str) -> Result<BTreePage<'_>> {
+        let Some((rootpage, query)) = self.find(|tbl_name, _| tbl_name == name)? else {
+            return Err(ErrorKind::TableNotFound(name.to_string()).into());
         };
 
-        let btreepage = BTreePage::read(self, rootpage as usize, schema)?;
-        Ok(Some(btreepage))
-    }
-
-    /*
-    #[allow(clippy::wrong_self_convention)]
-    fn from_builder(
-        &self,
-        from_clause: Spanned<From>,
-        where_clause: Option<&Spanned<WhereStatement>>,
-    ) -> Result<Table<'_>> {
-        match *from_clause.inner {
-            From::Table { table, alias } => {
-                let mut btreepage = self.table(&table).map_err(|e| SqliteError {
-                    span: table.span.clone(),
-                    ..e
-                })?;
-
-                if let Some(alias) = alias {
-                    btreepage.add_alias(*alias.inner);
-                }
-
-                if let Some(r#where) = where_clause {
-                    let (columns, expressions): (Vec<Column>, Vec<Expression>) =
-                        r#where.index().into_iter().unzip();
-
-                    if let Some(index) = self.index(&table, &columns)? {
-                        let indexseek = IndexSeek {
-                            table: btreepage,
-                            index,
-                            columns,
-                            expressions,
-                        };
-
-                        return Ok(Table::IndexSeek(indexseek));
-                    }
-                }
-
-                Ok(Table::BTreePage(btreepage))
+        match &*query {
+            Query::CreateTable(cts) => BTreePage::read(self, rootpage, cts.schema.clone()),
+            Query::CreateIndex(cis) => {
+                let schema = self.create_schema_index(&cis.name, &cis.table, &cis.columns)?;
+                BTreePage::read(self, rootpage, schema)
             }
-            From::Subquery { query, alias } => match alias {
-                None => self.query_builder(query),
-                Some(_) => panic!("missing alias implementation"),
-            },
-            From::Join { left, right, on } => {
-                let left = self.from_builder(left, None)?;
-
-                let join = if let From::Table { table, alias } = &*right
-                    && let Some(on) = &on
-                    && let Expression::Column(column) = &*on.right
-                    && let Expression::Column(left_col) = &*on.left
-                    && let Some(index) = self.index(table, std::slice::from_ref(column))?
-                {
-                    let mut table = self.table(table)?;
-                    if let Some(alias) = alias {
-                        table.add_alias(alias.inner.as_str().into());
-                    }
-
-                    let indexseek = IndexSeek {
-                        table,
-                        index,
-                        columns: vec![column.clone()],
-                        expressions: vec![],
-                    };
-
-                    let right = Table::IndexSeek(indexseek);
-                    Table::Join(Join::indexed(left, right, left_col.clone()))
-                } else {
-                    let right = self.from_builder(right, None)?;
-                    Table::Join(Join::new(left, right))
-                };
-
-                match on {
-                    Some(comparison) => {
-                        let span = comparison.span.clone();
-                        let r#where = Spanned {
-                            inner: Box::new(WhereStatement::Comparison(comparison)),
-                            span,
-                        };
-                        let r#where = Where::new(join, r#where);
-
-                        Ok(Table::Where(r#where))
-                    }
-                    None => Ok(join),
-                }
-            }
+            _ => Err(ErrorKind::WrongCommand(query).into()),
         }
     }
-    */
+
+    fn indexes(&self, table_name: &str, columns: &[String]) -> Result<Vec<BTreePage<'_>>> {
+        let mut indexes = vec![];
+        let mut root = self.root()?;
+        let mut rows = root.rows();
+
+        while let Some(row) = rows.next() {
+            let tbl_name = self.extract_text_value(&row, "name".into())?;
+            if tbl_name == "sqlite_sequence" {
+                continue;
+            }
+
+            let sql = self.extract_text_value(&row, "sql".into())?;
+            let rootpage = self.extract_integer_value(&row, "rootpage".into())?;
+
+            let query = Query::parse(&sql.to_lowercase())?;
+            let Query::CreateIndex(index) = *query.inner else {
+                continue;
+            };
+
+            if index.table != table_name {
+                continue;
+            }
+
+            let schema = self.create_schema_index(&index.name, table_name, columns)?;
+            let btreepage = BTreePage::read(self, rootpage as usize, schema)?;
+            indexes.push(btreepage);
+        }
+
+        Ok(indexes)
+    }
 
     fn query_builder(&self, select: Spanned<SelectStatement>) -> Result<Table<'_>> {
         let physical = self.physical_builder(select)?;
-        // let physical = self.optimize(physical);
+        let physical = self.optimize(physical);
         let table = self.table_builder(physical)?;
 
         Ok(table)

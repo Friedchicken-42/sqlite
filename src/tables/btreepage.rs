@@ -202,7 +202,7 @@ impl Page {
         }
     }
 
-    fn r#type(&self) -> Result<PageType> {
+    pub fn r#type(&self) -> Result<PageType> {
         match self.data[self.offset()] {
             0x0d => Ok(PageType::TableLeaf),
             0x0a => Ok(PageType::IndexLeaf),
@@ -240,7 +240,7 @@ impl Page {
         }
     }
 
-    fn pointers(&self) -> Result<impl std::iter::Iterator<Item = usize>> {
+    pub fn pointers(&self) -> Result<impl std::iter::Iterator<Item = usize>> {
         let offset = self.pointers_offset()?;
 
         let pointers = (0..self.cells()).map(move |i| {
@@ -282,7 +282,7 @@ impl Page {
         [serials, serialized].concat()
     }
 
-    #[warn(clippy::identity_op)]
+    #[allow(clippy::identity_op)]
     fn insert(
         &mut self,
         pointer: u32,
@@ -370,6 +370,7 @@ impl Page {
         Ok(())
     }
 
+    #[allow(clippy::identity_op)]
     fn append(&mut self, payload: Vec<u8>) -> Result<()> {
         let page_size = self.data.len();
 
@@ -430,14 +431,14 @@ impl Page {
 }
 
 #[derive(PartialEq, Debug)]
-enum PageType {
+pub enum PageType {
     TableLeaf,
     IndexLeaf,
     TableInterior,
     IndexInterior,
 }
 
-enum Storage<'db> {
+pub enum Storage<'db> {
     Memory {
         pages: Vec<Page>,
         stack: Vec<usize>,
@@ -562,15 +563,13 @@ impl BTreePageBuilder {
                 stack: vec![0],
             },
             schema: self.schema,
-            rowid: Some(0),
         })
     }
 }
 
 pub struct BTreePage<'db> {
-    storage: Storage<'db>,
-    schema: Schema,
-    rowid: Option<usize>,
+    pub storage: Storage<'db>,
+    pub schema: Schema,
 }
 
 impl<'db> Tabular<'db> for BTreePage<'db> {
@@ -600,7 +599,6 @@ impl<'db> BTreePage<'db> {
                 stack: vec![],
             },
             schema,
-            rowid: Some(0),
         })
     }
 
@@ -950,7 +948,6 @@ mod tests {
                     stack: vec![0],
                 },
                 schema: schema.clone(),
-                rowid: Some(0),
             };
 
             for j in 0..i {

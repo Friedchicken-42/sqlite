@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{fmt::Display, ops::Range};
 
 use chumsky::{
     Parser,
@@ -114,6 +114,21 @@ pub enum Select {
     },
 }
 
+impl Display for Select {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Select::Wildcard => write!(f, "*"),
+            Select::Column { name, table, .. } => {
+                if let Some(table) = table {
+                    write!(f, "{}.", *table.inner)?;
+                }
+                write!(f, "{}", *name.inner)
+            }
+            Select::Function { name, .. } => write!(f, "{}(...)", *name.inner),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum From {
     Table {
@@ -144,6 +159,16 @@ pub struct Groupby {
     columns: Vec<Column>,
 }
 
+impl Display for WhereStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WhereStatement::Comparison(comp) => write!(f, "{}", *comp.inner),
+            WhereStatement::And(a, b) => write!(f, "({} and {})", *a.inner, *b.inner),
+            WhereStatement::Or(a, b) => write!(f, "({} or {})", *a.inner, *b.inner),
+        }
+    }
+}
+
 impl WhereStatement {
     pub fn index(&self) -> Vec<(Column, Expression)> {
         match self {
@@ -159,6 +184,12 @@ pub struct Comparison {
     pub left: Spanned<Expression>,
     pub op: Spanned<Operator>,
     pub right: Spanned<Expression>,
+}
+
+impl Display for Comparison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} {}", *self.left, *self.op, *self.right)
+    }
 }
 
 impl Comparison {
@@ -181,12 +212,34 @@ pub enum Operator {
     Greater,
     GreaterEqual,
 }
+impl Display for Operator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operator::Less => write!(f, "<"),
+            Operator::LessEqual => write!(f, "<="),
+            Operator::Equal => write!(f, "="),
+            Operator::NotEqual => write!(f, "<>"),
+            Operator::Greater => write!(f, ">"),
+            Operator::GreaterEqual => write!(f, ">="),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Expression {
     Column(Column),
     Literal(String),
     Number(u64),
+}
+
+impl Display for Expression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expression::Column(column) => write!(f, "{column}"),
+            Expression::Literal(s) => write!(f, "{s:?}"),
+            Expression::Number(n) => write!(f, "{n}"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]

@@ -14,7 +14,7 @@ impl WhereStatement {
 }
 
 impl Comparison {
-    fn matches(&self, row: &Row) -> bool {
+    pub fn matches(&self, row: &Row) -> bool {
         let Comparison { left, op, right } = self;
 
         fn to_value<'a>(expr: &'a Expression, row: &'a Row) -> Value<'a> {

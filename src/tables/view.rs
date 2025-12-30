@@ -1,111 +1,12 @@
 use crate::{
-    Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, SchemaRow, SqliteError, Table,
-    Tabular, Type, Value,
-    parser::{Select, Spanned},
+    Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Table, Tabular, Value,
+    parser::Spanned,
 };
 
 pub struct View<'table> {
     pub inner: Box<Table<'table>>,
-    schema: Schema,
-    inner_columns: Vec<Spanned<Column>>,
-}
-
-pub fn create_schema(
-    select: Vec<Spanned<Select>>,
-    inner: &Table,
-) -> Result<(Schema, Vec<Spanned<Column>>)> {
-    let schema = inner.schema();
-
-    let srs = select
-        .iter()
-        .map(|row| match row.inner.as_ref() {
-            Select::Wildcard => Ok(schema
-                .columns
-                .iter()
-                .map(|sr| {
-                    let span = row.span.clone();
-                    let mut sr = sr.clone();
-                    let column = sr.column.with_span(span.clone());
-                    sr.column = column.clone();
-
-                    (sr, column)
-                })
-                .collect::<Vec<_>>()),
-            Select::Column { name, alias, table } => {
-                let sr = schema
-                    .columns
-                    .iter()
-                    .find(|sr| sr.column.name() == **name)
-                    .ok_or(SqliteError::new(
-                        ErrorKind::ColumnNotFound(name.as_str().into()),
-                        row.span.clone(),
-                    ))?
-                    .clone();
-
-                let column = match table {
-                    Some(table) => Column::Dotted {
-                        table: table.to_string(),
-                        column: name.to_string(),
-                    },
-                    None => Column::Single(name.to_string()),
-                };
-
-                let sr = match alias {
-                    Some(alias) => SchemaRow {
-                        column: Spanned::span(Column::Single(alias.to_string()), row.span.clone()),
-                        ..sr
-                    },
-                    None => SchemaRow {
-                        column: Spanned::span(column.clone(), row.span.clone()),
-                        ..sr
-                    },
-                };
-
-                let column = Spanned::span(column, row.span.clone());
-
-                Ok(vec![(sr, column)])
-            }
-            Select::Function { name, .. } => {
-                let r#type = match name.as_str() {
-                    "count" => Type::Integer,
-                    func => {
-                        return Err(SqliteError::new(
-                            ErrorKind::ColumnNotFound(func.into()),
-                            name.span.clone(),
-                        ));
-                    }
-                };
-
-                let column = Column::Single(name.as_str().into());
-                let span = name.span.clone();
-
-                Ok(vec![(
-                    SchemaRow {
-                        column: Spanned::span(column, span.clone()),
-                        r#type,
-                    },
-                    Spanned::span(Column::Single(name.as_str().into()), span.clone()),
-                )])
-            }
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .fold((vec![], vec![]), |(mut s, mut n), (a, b)| {
-            s.push(a);
-            n.push(b);
-            (s, n)
-        });
-
-    Ok((
-        Schema {
-            names: schema.names.clone(),
-            name: None,
-            columns: srs.0,
-            primary: vec![],
-        },
-        srs.1,
-    ))
+    pub schema: Schema,
+    pub inner_columns: Vec<Spanned<Column>>,
 }
 
 impl<'table> Tabular<'table> for View<'table> {
@@ -139,16 +40,6 @@ impl<'table> Tabular<'table> for View<'table> {
 }
 
 impl<'table> View<'table> {
-    pub fn new(select: Spanned<Vec<Spanned<Select>>>, inner: Table<'table>) -> Result<Self> {
-        let (schema, inner_columns) = create_schema(*select.inner, &inner)?;
-
-        Ok(Self {
-            inner: Box::new(inner),
-            schema,
-            inner_columns,
-        })
-    }
-
     pub fn fmt_rows(&self) -> Vec<String> {
         self.schema
             .columns
