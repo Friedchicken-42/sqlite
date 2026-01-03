@@ -1,12 +1,13 @@
 use std::{collections::HashSet, fmt::Display, hash::Hash};
 
 use crate::{
-    Column, ErrorKind, Result, Schema, SchemaRow, Sqlite, SqliteError, Table, Type,
+    Column, ErrorKind, Result, Schema, SchemaRow, Sqlite, SqliteError, Table, Tabular, Type,
     parser::{
         Comparison, Expression, From, Operator, Select, SelectStatement, Spanned, WhereStatement,
     },
     tables::{
-        btreepage::{Page, PageType, Storage},
+        btreepage::{BTreePage, Page, PageType, Storage},
+        indexscan::IndexScan,
         indexseek::IndexSeek,
         join::Join,
         limit::Limit,
@@ -78,6 +79,19 @@ impl Metadata {
             pages,
         })
     }
+
+    fn read(db: &Sqlite, btreepage: &BTreePage) -> Result<Self> {
+        match &btreepage.storage {
+            Storage::Memory { pages, .. } => {
+                let page = pages.first().expect("should have at least one page");
+                Metadata::heuristic(page, &btreepage.schema)
+            }
+            Storage::File { root, .. } => {
+                let page = db.page(*root)?;
+                Metadata::heuristic(&page, &btreepage.schema)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -97,8 +111,15 @@ pub enum Physical {
         schema: Schema,
         metadata: Metadata,
     },
+    IndexOnly {
+        table: Spanned<String>,
+        alias: Option<Spanned<String>>,
+        schema: Schema,
+        metadata: Metadata,
+    },
     IndexFilter {
         table: Spanned<String>,
+        alias: Option<Spanned<String>>,
         index: String,
         columns: Vec<Column>,
         expressions: Vec<Expression>,
@@ -167,6 +188,9 @@ impl PartialEq for Physical {
                     ..
                 },
             ) => *l_table == *r_table && *l_alias == *r_alias,
+            (Self::IndexOnly { table: l_table, .. }, Self::IndexOnly { table: r_table, .. }) => {
+                *l_table == *r_table
+            }
             (
                 Self::IndexFilter {
                     table: l_table,
@@ -244,10 +268,10 @@ impl Display for Physical {
 impl Physical {
     fn metadata(&self) -> Metadata {
         match self {
-            Physical::Project { table, .. } => table.metadata(),
-            Physical::Filter { table, .. } => table.metadata(),
-            Physical::TableScan { metadata, .. } => metadata.clone(),
-            Physical::IndexFilter { metadata, .. } => metadata.clone(),
+            Physical::Project { table, .. } | Physical::Filter { table, .. } => table.metadata(),
+            Physical::TableScan { metadata, .. }
+            | Physical::IndexOnly { metadata, .. }
+            | Physical::IndexFilter { metadata, .. } => metadata.clone(),
             Physical::NestedLoop { left, right, .. }
             | Physical::IndexNestedLoop { left, right, .. } => {
                 let left = left.metadata();
@@ -277,13 +301,13 @@ impl Physical {
 
     fn schema(&self) -> Schema {
         match self {
-            Physical::Project { schema, .. } => schema.clone(),
-            Physical::Filter { table, .. } => table.schema(),
-            Physical::TableScan { schema, .. } => schema.clone(),
-            Physical::IndexFilter { schema, .. } => schema.clone(),
-            Physical::NestedLoop { schema, .. } => schema.clone(),
-            Physical::IndexNestedLoop { schema, .. } => schema.clone(),
-            Physical::Limit { table, .. } => table.schema(),
+            Physical::Filter { table, .. } | Physical::Limit { table, .. } => table.schema(),
+            Physical::Project { schema, .. }
+            | Physical::TableScan { schema, .. }
+            | Physical::IndexOnly { schema, .. }
+            | Physical::IndexFilter { schema, .. }
+            | Physical::NestedLoop { schema, .. }
+            | Physical::IndexNestedLoop { schema, .. } => schema.clone(),
         }
     }
 
@@ -320,15 +344,24 @@ impl Physical {
                 writeln!(f, "Filter {{ {} }}", *condition.inner)?;
                 table.write_indented_rec(f, prefix, true)
             }
+            // TODO: move this alias to `Schema`
             Physical::TableScan { table, alias, .. } => {
-                write!(f, "TableScan {{ ")?;
+                write!(f, "TableScan {{ {} ", *table.inner)?;
                 if let Some(alias) = alias {
-                    write!(f, "{}, ", *alias.inner)?;
+                    write!(f, "({}) ", *alias.inner)?;
                 }
-                writeln!(f, "{} }}", *table.inner)
+                writeln!(f, "}}")
+            }
+            Physical::IndexOnly { table, alias, .. } => {
+                write!(f, "IndexOnly {{ {} ", *table.inner)?;
+                if let Some(alias) = alias {
+                    write!(f, "({}) ", *alias.inner)?;
+                }
+                writeln!(f, "}}")
             }
             Physical::IndexFilter {
                 table,
+                alias,
                 index,
                 columns,
                 ..
@@ -339,11 +372,11 @@ impl Physical {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                writeln!(
-                    f,
-                    "IndexFilter {{ {}, {}, ({}) }}",
-                    *table.inner, index, cols
-                )
+                write!(f, "IndexFilter {{ {}", *table.inner)?;
+                if let Some(alias) = alias {
+                    write!(f, " ({})", *alias.inner)?;
+                }
+                writeln!(f, ", ({} on {}) }}", index, cols)
             }
             Physical::NestedLoop {
                 left, right, on, ..
@@ -491,16 +524,7 @@ impl Sqlite {
         match *from.inner {
             From::Table { table, alias } => {
                 let btree = self.table(&table)?;
-                let metadata = match btree.storage {
-                    Storage::Memory { pages, .. } => {
-                        let page = pages.first().expect("should have at least one page");
-                        Metadata::heuristic(page, &btree.schema)?
-                    }
-                    Storage::File { root, .. } => {
-                        let page = self.page(root)?;
-                        Metadata::heuristic(&page, &btree.schema)?
-                    }
-                };
+                let metadata = Metadata::read(self, &btree)?;
 
                 let mut schema = btree.schema.clone();
                 if let Some(alias) = &alias {
@@ -590,6 +614,8 @@ impl Sqlite {
             tablescan_to_indexfilter,
             join_indexfilter,
             // project_after_join,
+            indexonly,
+            lower_project_filter,
         ];
 
         loop {
@@ -621,8 +647,10 @@ impl Sqlite {
 
         let best = all
             .into_iter()
-            .max_by_key(|p| p.metadata().pages)
+            .min_by_key(|p| p.metadata().pages)
             .expect("a rule deleted the first node");
+
+        println!("{best}\n");
 
         println!("query cost: {:?}", best.metadata());
         Spanned::span(best, span)
@@ -657,24 +685,43 @@ impl Sqlite {
 
                 Ok(Table::BTreePage(btreepage))
             }
+            Physical::IndexOnly { table, alias, .. } => {
+                let mut table = self.table(&table).map_err(|e| e.span(table.span.clone()))?;
+                if let Some(alias) = alias {
+                    table.add_alias(*alias.inner);
+                }
+
+                let indexscan = IndexScan {
+                    table,
+                    columns: vec![],
+                    expressions: vec![],
+                };
+                Ok(Table::IndexScan(indexscan))
+            }
             Physical::IndexFilter {
                 table,
+                alias,
                 index,
                 columns,
                 expressions,
                 ..
             } => {
                 let span = table.span.clone();
-                let table = self.table(&table).map_err(|e| e.span(span.clone()))?;
-                let index = self.table(&index).map_err(|e| e.span(span.clone()))?;
 
-                let indexseek = IndexSeek {
-                    table,
-                    index,
+                let index = self.table(&index).map_err(|e| e.span(span.clone()))?;
+                let index = IndexScan {
+                    table: index,
                     columns,
                     expressions,
                 };
+                let index = Box::new(Table::IndexScan(index));
 
+                let mut table = self.table(&table).map_err(|e| e.span(span.clone()))?;
+                if let Some(alias) = alias {
+                    table.add_alias(*alias.inner);
+                }
+
+                let indexseek = IndexSeek { table, index };
                 Ok(Table::IndexSeek(indexseek))
             }
             Physical::NestedLoop {
@@ -738,6 +785,7 @@ fn apply(db: &Sqlite, physical: &Physical, rule: Rule) -> Vec<Physical> {
             })
             .collect(),
         p @ Physical::TableScan { .. } => vec![p.clone()],
+        p @ Physical::IndexOnly { .. } => vec![p.clone()],
         p @ Physical::IndexFilter { .. } => vec![p.clone()],
         Physical::NestedLoop {
             left,
@@ -836,12 +884,7 @@ fn tablescan_to_indexfilter(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
         && let Comparison { left, op, right } = &**comp
         && let Expression::Column(col) = &**left
         && **op == Operator::Equal
-        && let Physical::TableScan {
-            table,
-            alias, // TODO: check this alias
-            metadata,
-            ..
-        } = &**tf
+        && let Physical::TableScan { table, alias, .. } = &**tf
     {
         db.indexes(table, &[col.name().to_string()])
             .unwrap_or_default()
@@ -853,17 +896,20 @@ fn tablescan_to_indexfilter(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
                     .expect("index should have a name")
                     .to_string();
 
+                let mut metadata =
+                    Metadata::read(db, &idx).expect("should be able to read the first page");
+                metadata.pages *= 2;
+                metadata.records *= 2;
+                metadata.sort = vec![SortCol::Rowid]; // TODO: ???
+
                 Physical::IndexFilter {
                     table: table.clone(),
+                    alias: alias.clone(),
                     index,
                     columns: vec![col.clone()],
                     expressions: vec![(**right).clone()],
                     schema: idx.schema.clone(),
-                    metadata: Metadata {
-                        sort: vec![SortCol::Column(col.clone())],
-                        records: metadata.records,
-                        pages: metadata.pages.div_ceil(10).max(1),
-                    },
+                    metadata,
                 }
             })
             .collect()
@@ -915,30 +961,74 @@ fn project_after_loop(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
 }
 */
 
-/*
 fn indexonly(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
-    let all_in_project = |select: &[Spanned<Select>], columns: &[Column]| -> bool {
-        select.iter().all(|s| match &**s {
-            Select::Column { name, .. } => {
-                columns.iter().find(|c| c.name() == name.as_str()).is_some()
-            }
-            _ => false,
-        })
-    };
-
-    if let Physical::Project { table, select } = physical
-        && let Physical::IndexFilter {
-            table,
-            index,
-            columns,
-            expressions,
-            metadata,
-        } = &**table
-        && all_in_project(select, columns)
+    if let Physical::Project {
+        table,
+        inner_columns,
+        schema: schema_project,
+    } = physical
+        && let Physical::TableScan { table, alias, .. } = &**table
     {
-        Physical::IndexOnlyScan {}
+        let columns = inner_columns
+            .iter()
+            .map(|col| col.name().to_string())
+            .collect::<Vec<_>>();
+
+        db.indexes(&**table, &columns)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|idx| {
+                let index = idx
+                    .schema
+                    .current_name()
+                    .expect("index should have a name")
+                    .to_string();
+
+                let idx_data =
+                    Metadata::read(db, &idx).expect("should be able to read the first page");
+
+                let indexonly = Physical::IndexOnly {
+                    table: Spanned::span(index, table.span.clone()),
+                    alias: alias.clone(),
+                    schema: idx.schema().clone(),
+                    metadata: idx_data,
+                };
+
+                Physical::Project {
+                    table: Spanned::span(indexonly, table.span.clone()),
+                    schema: schema_project.clone(),
+                    inner_columns: inner_columns.clone(),
+                }
+            })
+            .collect()
     } else {
         vec![]
     }
 }
-*/
+
+fn lower_project_filter(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
+    if let Physical::Project {
+        table,
+        schema,
+        inner_columns,
+    } = physical
+        && let Physical::Filter { table, condition } = &**table
+        && let WhereStatement::Comparison(comp) = &**condition
+        && let Expression::Column(col) = &*comp.left
+        && schema.columns.len() == 1
+        && let Some(first) = schema.columns.first()
+        && first.column.name() == col.name()
+    {
+        let inner = Physical::Project {
+            table: table.clone(),
+            schema: schema.clone(),
+            inner_columns: inner_columns.clone(),
+        };
+        vec![Physical::Filter {
+            table: Spanned::span(inner, table.span.clone()),
+            condition: condition.clone(),
+        }]
+    } else {
+        vec![]
+    }
+}

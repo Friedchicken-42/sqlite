@@ -10,6 +10,7 @@ use crate::{
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         groupby::GroupBy,
+        indexscan::{IndexScan, IndexScanRows},
         indexseek::{IndexSeek, IndexSeekRows},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
@@ -331,6 +332,7 @@ pub trait Tabular<'db> {
 
 pub enum Table<'db> {
     BTreePage(BTreePage<'db>),
+    IndexScan(IndexScan<'db>),
     IndexSeek(IndexSeek<'db>),
     View(View<'db>),
     Join(Join<'db>),
@@ -349,6 +351,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn rows(&mut self) -> Rows<'_, 'db> {
         match self {
             Table::BTreePage(btreepage) => btreepage.rows(),
+            Table::IndexScan(indexscan) => indexscan.rows(),
             Table::IndexSeek(indexseek) => indexseek.rows(),
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
@@ -361,6 +364,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn schema(&self) -> &Schema {
         match self {
             Table::BTreePage(btreepage) => btreepage.schema(),
+            Table::IndexScan(indexscan) => indexscan.schema(),
             Table::IndexSeek(indexseek) => indexseek.table.schema(),
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
@@ -373,6 +377,7 @@ impl<'db> Tabular<'db> for Table<'db> {
     fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
         match self {
             Table::BTreePage(btreepage) => btreepage.write_indented(f, prefix),
+            Table::IndexScan(indexscan) => indexscan.write_indented(f, prefix),
             Table::IndexSeek(indexseek) => indexseek.write_indented(f, prefix),
             Table::View(view) => view.write_indented(f, prefix),
             Table::Join(join) => join.write_indented(f, prefix),
@@ -428,6 +433,7 @@ pub trait Iterator {
 
 pub enum Rows<'rows, 'db> {
     BTreePage(BTreeRows<'rows, 'db>),
+    IndexScan(IndexScanRows<'rows, 'db>),
     IndexSeek(IndexSeekRows<'rows, 'db>),
     View(ViewRows<'rows, 'db>),
     Join(JoinRows<'rows, 'db>),
@@ -439,6 +445,7 @@ impl Iterator for Rows<'_, '_> {
     fn current(&self) -> Option<Row<'_>> {
         match self {
             Rows::BTreePage(btreerows) => btreerows.current(),
+            Rows::IndexScan(indexscan) => indexscan.current(),
             Rows::IndexSeek(indexseek) => indexseek.current(),
             Rows::View(view) => view.current(),
             Rows::Join(join) => join.current(),
@@ -450,6 +457,7 @@ impl Iterator for Rows<'_, '_> {
     fn advance(&mut self) {
         match self {
             Rows::BTreePage(btreerows) => btreerows.advance(),
+            Rows::IndexScan(indexscan) => indexscan.advance(),
             Rows::IndexSeek(indexseek) => indexseek.advance(),
             Rows::View(view) => view.advance(),
             Rows::Join(join) => join.advance(),

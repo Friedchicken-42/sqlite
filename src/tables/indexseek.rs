@@ -1,16 +1,11 @@
-use std::cmp::Ordering;
-
 use crate::{
-    Access, Column, Iterator, Row, Rows, Tabular, Value,
-    parser::Expression,
+    Access, Iterator, Row, Rows, Table, Tabular, Value,
     tables::btreepage::{BTreePage, BTreeRows},
 };
 
 pub struct IndexSeek<'table> {
     pub table: BTreePage<'table>,
-    pub index: BTreePage<'table>,
-    pub columns: Vec<Column>,
-    pub expressions: Vec<Expression>,
+    pub index: Box<Table<'table>>,
 }
 
 impl<'table> Tabular<'table> for IndexSeek<'table> {
@@ -19,18 +14,9 @@ impl<'table> Tabular<'table> for IndexSeek<'table> {
             btree: &mut self.table,
             indexes: vec![],
         };
+        let index = Box::new(self.index.rows());
 
-        let index = BTreeRows {
-            btree: &mut self.index,
-            indexes: vec![],
-        };
-
-        Rows::IndexSeek(IndexSeekRows {
-            table,
-            index,
-            columns: &mut self.columns,
-            expressions: &mut self.expressions,
-        })
+        Rows::IndexSeek(IndexSeekRows { table, index })
     }
 
     fn schema(&self) -> &crate::Schema {
@@ -38,19 +24,11 @@ impl<'table> Tabular<'table> for IndexSeek<'table> {
     }
 
     fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
-        let columns = self
-            .columns
-            .iter()
-            .map(|c| c.name())
-            .collect::<Vec<_>>()
-            .join(", ");
+        writeln!(f, "Index Seek")?;
 
-        writeln!(f, "Index Scan {{ {columns} }}")?;
-
-        write!(f, "{prefix}├─")?;
-        self.table.write_indented(f, "")?;
-        write!(f, "{prefix}└─")?;
-        self.index.write_indented(f, "")?;
+        write!(f, "{prefix}├─ ")?;
+        self.table.write_indented(f, prefix)?;
+        self.index.write_indented_rec(f, prefix, true)?;
 
         Ok(())
     }
@@ -58,9 +36,7 @@ impl<'table> Tabular<'table> for IndexSeek<'table> {
 
 pub struct IndexSeekRows<'rows, 'table> {
     table: BTreeRows<'rows, 'table>,
-    index: BTreeRows<'rows, 'table>,
-    pub columns: &'rows Vec<Column>,
-    pub expressions: &'rows mut Vec<Expression>,
+    index: Box<Rows<'rows, 'table>>,
 }
 
 impl Iterator for IndexSeekRows<'_, '_> {
@@ -69,36 +45,7 @@ impl Iterator for IndexSeekRows<'_, '_> {
     }
 
     fn advance(&mut self) {
-        self.index.loop_until(|cell| {
-            for (i, column) in self.columns.iter().enumerate() {
-                let column = match column {
-                    Column::Dotted { table, column }
-                        if self.table.btree.schema().names.contains(table) =>
-                    {
-                        &Column::Single(column.to_string())
-                    }
-                    Column::Dotted { .. } => continue,
-                    single => single,
-                };
-
-                let value = match self.expressions.get(i) {
-                    Some(Expression::Literal(s)) => Value::Text(s.as_str()),
-                    Some(Expression::Number(n)) => Value::Integer(*n),
-                    _ => continue,
-                };
-
-                let Ok(v) = cell.get(column.clone()) else {
-                    continue;
-                };
-
-                let cmp = v.cmp(&value);
-
-                if cmp.is_ne() {
-                    return cmp;
-                }
-            }
-            Ordering::Equal
-        });
+        self.index.advance();
 
         let Some(row) = self.index.current() else {
             self.table.indexes.clear();

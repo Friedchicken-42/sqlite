@@ -1,18 +1,82 @@
-use crate::{Tabular, tables::btreepage::BTreePage};
+use std::cmp::Ordering;
 
-pub struct IndexScan<'table>(BTreePage<'table>);
+use crate::{
+    Access, Column, Iterator, Row, Rows, Schema, Tabular, Value,
+    parser::Expression,
+    tables::btreepage::{BTreePage, BTreeRows},
+};
+
+pub struct IndexScan<'table> {
+    pub table: BTreePage<'table>,
+    pub columns: Vec<Column>,
+    pub expressions: Vec<Expression>,
+}
 
 impl<'table> Tabular<'table> for IndexScan<'table> {
-    fn rows(&mut self) -> crate::Rows<'_, 'table> {
-        self.0.rows()
+    fn rows(&mut self) -> Rows<'_, 'table> {
+        Rows::IndexScan(IndexScanRows {
+            table: BTreeRows {
+                btree: &mut self.table,
+                indexes: vec![],
+            },
+            columns: &self.columns,
+            expressions: &self.expressions,
+        })
     }
 
     fn write_indented(&self, f: &mut std::fmt::Formatter, prefix: &str) -> std::fmt::Result {
-        write!(f, "{prefix}└─")?;
-        self.0.write_indented(f, "")
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| c.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        writeln!(f, "Index Scan {{ {columns} }}")?;
+        write!(f, "{prefix}└─ ")?;
+        self.table.write_indented(f, "")
     }
 
-    fn schema(&self) -> &crate::Schema {
-        self.0.schema()
+    fn schema(&self) -> &Schema {
+        self.table.schema()
+    }
+}
+
+pub struct IndexScanRows<'rows, 'table> {
+    table: BTreeRows<'rows, 'table>,
+    columns: &'rows [Column],
+    expressions: &'rows [Expression],
+}
+
+impl Iterator for IndexScanRows<'_, '_> {
+    fn current(&self) -> Option<Row<'_>> {
+        self.table.current()
+    }
+
+    fn advance(&mut self) {
+        self.table.loop_until(|cell| {
+            for (i, column) in self.columns.iter().enumerate() {
+                let Ok(v) = cell.get(column.clone()) else {
+                    continue;
+                };
+
+                let value = match self.expressions.get(i) {
+                    Some(Expression::Literal(s)) => Value::Text(s.as_str()),
+                    Some(Expression::Number(n)) => Value::Integer(*n),
+                    _ => continue,
+                };
+
+                let cmp = v.cmp(&value);
+                if cmp.is_ne() {
+                    return cmp;
+                }
+            }
+
+            Ordering::Equal
+        });
+
+        if self.table.current().is_none() {
+            self.table.indexes.clear();
+        }
     }
 }
