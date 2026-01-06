@@ -20,7 +20,7 @@ impl<'table> Tabular<'table> for IndexScan<'table> {
                 indexes: vec![],
             },
             columns: &self.columns,
-            expressions: &self.expressions,
+            expressions: &mut self.expressions,
         })
     }
 
@@ -43,9 +43,9 @@ impl<'table> Tabular<'table> for IndexScan<'table> {
 }
 
 pub struct IndexScanRows<'rows, 'table> {
-    table: BTreeRows<'rows, 'table>,
-    columns: &'rows [Column],
-    expressions: &'rows [Expression],
+    pub table: BTreeRows<'rows, 'table>,
+    pub columns: &'rows [Column],
+    pub expressions: &'rows mut [Expression],
 }
 
 impl Iterator for IndexScanRows<'_, '_> {

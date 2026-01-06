@@ -114,6 +114,8 @@ pub enum Physical {
     IndexOnly {
         table: Spanned<String>,
         alias: Option<Spanned<String>>,
+        columns: Vec<Column>,
+        expressions: Vec<Expression>,
         schema: Schema,
         metadata: Metadata,
     },
@@ -614,8 +616,10 @@ impl Sqlite {
             tablescan_to_indexfilter,
             join_indexfilter,
             // project_after_join,
-            indexonly,
+            tablescan_to_indexonly,
+            indexfilter_to_indexonly,
             lower_project_filter,
+            lower_project_join,
         ];
 
         loop {
@@ -647,7 +651,7 @@ impl Sqlite {
 
         let best = all
             .into_iter()
-            .min_by_key(|p| p.metadata().pages)
+            .max_by_key(|p| p.metadata().pages)
             .expect("a rule deleted the first node");
 
         println!("{best}\n");
@@ -685,7 +689,13 @@ impl Sqlite {
 
                 Ok(Table::BTreePage(btreepage))
             }
-            Physical::IndexOnly { table, alias, .. } => {
+            Physical::IndexOnly {
+                table,
+                alias,
+                columns,
+                expressions,
+                ..
+            } => {
                 let mut table = self.table(&table).map_err(|e| e.span(table.span.clone()))?;
                 if let Some(alias) = alias {
                     table.add_alias(*alias.inner);
@@ -693,8 +703,8 @@ impl Sqlite {
 
                 let indexscan = IndexScan {
                     table,
-                    columns: vec![],
-                    expressions: vec![],
+                    columns,
+                    expressions,
                 };
                 Ok(Table::IndexScan(indexscan))
             }
@@ -746,7 +756,19 @@ impl Sqlite {
                 right,
                 on,
                 schema,
-            } => todo!(),
+            } => {
+                let left = self.table_builder(left)?;
+                let right = self.table_builder(right)?;
+
+                let join = Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    on: Some(on),
+                    schema,
+                };
+
+                Ok(Table::Join(join))
+            }
             Physical::Limit {
                 table,
                 limit,
@@ -864,10 +886,22 @@ fn switch_loop(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
         schema,
     } = physical
     {
+        let on = match on {
+            None => on.clone(),
+            Some(on) => Some(Spanned::span(
+                Comparison {
+                    left: on.right.clone(),
+                    op: on.op.clone(),
+                    right: on.left.clone(),
+                },
+                on.span.clone(),
+            )),
+        };
+
         vec![Physical::NestedLoop {
             left: right.clone(),
             right: left.clone(),
-            on: on.clone(),
+            on,
             schema: schema.clone(),
         }]
     } else {
@@ -906,7 +940,7 @@ fn tablescan_to_indexfilter(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
                     table: table.clone(),
                     alias: alias.clone(),
                     index,
-                    columns: vec![col.clone()],
+                    columns: vec![col.name().into()], // TODO: this should not be name, indexseek should handle table names
                     expressions: vec![(**right).clone()],
                     schema: idx.schema.clone(),
                     metadata,
@@ -949,19 +983,7 @@ fn join_indexfilter(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
     }
 }
 
-/*
-fn project_after_loop(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
-    if let Physical::Project { table, select } = physical
-        && let Physical::NestedLoop { left, right, on } = &**table
-    {
-        todo!()
-    } else {
-        vec![]
-    }
-}
-*/
-
-fn indexonly(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
+fn tablescan_to_indexonly(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
     if let Physical::Project {
         table,
         inner_columns,
@@ -990,6 +1012,8 @@ fn indexonly(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
                 let indexonly = Physical::IndexOnly {
                     table: Spanned::span(index, table.span.clone()),
                     alias: alias.clone(),
+                    columns: vec![],
+                    expressions: vec![],
                     schema: idx.schema().clone(),
                     metadata: idx_data,
                 };
@@ -1001,6 +1025,46 @@ fn indexonly(db: &Sqlite, physical: &Physical) -> Vec<Physical> {
                 }
             })
             .collect()
+    } else {
+        vec![]
+    }
+}
+
+fn indexfilter_to_indexonly(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
+    if let Physical::Project {
+        table: project_table,
+        schema: project_schema,
+        inner_columns,
+    } = physical
+        && let Physical::IndexFilter {
+            table,
+            alias,
+            index,
+            columns,
+            expressions,
+            schema,
+            metadata,
+        } = &**project_table
+    {
+        // TODO: check name
+        let inner = Physical::IndexOnly {
+            table: Spanned::span(index.to_string(), table.span.clone()),
+            alias: alias.clone(),
+            columns: columns.clone(),
+            expressions: expressions.clone(),
+            schema: schema.clone(),
+            metadata: Metadata {
+                sort: metadata.sort.clone(),
+                records: metadata.records / 2,
+                pages: metadata.pages / 2,
+            },
+        };
+
+        vec![Physical::Project {
+            table: Spanned::span(inner, project_table.span.clone()),
+            schema: project_schema.clone(),
+            inner_columns: inner_columns.clone(),
+        }]
     } else {
         vec![]
     }
@@ -1027,6 +1091,61 @@ fn lower_project_filter(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
         vec![Physical::Filter {
             table: Spanned::span(inner, table.span.clone()),
             condition: condition.clone(),
+        }]
+    } else {
+        vec![]
+    }
+}
+
+fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
+    if let Physical::Project {
+        table,
+        schema: project_schema,
+        inner_columns,
+    } = physical
+        && let Physical::NestedLoop {
+            left,
+            right,
+            schema,
+            on: Some(comp),
+        } = &**table
+        // TODO: should work only on left + switch_loop
+        && let Expression::Column(cl) = &*comp.left
+        && *comp.op == Operator::Equal
+        && let Expression::Column(cr) = &*comp.right
+        && let Some(il) = inner_columns.iter().position(|c| c.name() == cl.name())
+        && let Some(ir) = inner_columns.iter().position(|c| c.name() == cr.name())
+        && !matches!(&**left, Physical::Project { .. })
+    {
+        let inner_left = Physical::Project {
+            table: left.clone(),
+            schema: Schema {
+                columns: vec![project_schema.columns[il].clone()],
+                ..left.schema()
+            },
+            inner_columns: vec![Spanned::span(cl.clone(), comp.left.span.clone())],
+        };
+
+        let inner_right = Physical::Project {
+            table: right.clone(),
+            schema: Schema {
+                columns: vec![project_schema.columns[ir].clone()],
+                ..right.schema()
+            },
+            inner_columns: vec![Spanned::span(cr.clone(), comp.right.span.clone())],
+        };
+
+        let join = Physical::NestedLoop {
+            left: Spanned::span(inner_left, left.span.clone()),
+            right: Spanned::span(inner_right, right.span.clone()),
+            schema: schema.clone(),
+            on: Some(comp.clone()),
+        };
+
+        vec![Physical::Project {
+            table: Spanned::span(join, table.span.clone()),
+            schema: project_schema.clone(),
+            inner_columns: inner_columns.clone(),
         }]
     } else {
         vec![]

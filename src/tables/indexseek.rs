@@ -1,5 +1,6 @@
 use crate::{
     Access, Iterator, Row, Rows, Table, Tabular, Value,
+    parser::Expression,
     tables::btreepage::{BTreePage, BTreeRows},
 };
 
@@ -35,8 +36,8 @@ impl<'table> Tabular<'table> for IndexSeek<'table> {
 }
 
 pub struct IndexSeekRows<'rows, 'table> {
-    table: BTreeRows<'rows, 'table>,
-    index: Box<Rows<'rows, 'table>>,
+    pub table: BTreeRows<'rows, 'table>,
+    pub index: Box<Rows<'rows, 'table>>,
 }
 
 impl Iterator for IndexSeekRows<'_, '_> {

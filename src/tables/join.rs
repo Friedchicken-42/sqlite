@@ -1,6 +1,6 @@
 use crate::{
     Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Table, Tabular, Value,
-    parser::{Comparison, Spanned},
+    parser::{Comparison, Expression, Spanned},
 };
 
 pub struct Join<'table> {
@@ -62,6 +62,7 @@ impl Iterator for JoinRows<'_, '_> {
         loop {
             if self.left.current().is_none() && self.right.current().is_none() {
                 self.left.advance();
+                self.setup_right();
                 self.right.advance();
             } else {
                 self.right.advance();
@@ -73,6 +74,7 @@ impl Iterator for JoinRows<'_, '_> {
                         return;
                     }
 
+                    self.setup_right();
                     self.right.advance();
                 }
             }
@@ -90,9 +92,30 @@ impl Iterator for JoinRows<'_, '_> {
     }
 }
 
+impl JoinRows<'_, '_> {
+    fn setup_right(&mut self) {
+        if let Rows::IndexSeek(iseek) = &mut *self.right
+            && let Rows::IndexScan(iscan) = &mut *iseek.index
+            && let Some(comp) = self.on
+            && let Expression::Column(cl) = &*comp.left
+        {
+            let left_row = self.left.current().unwrap();
+            let value = left_row.get(cl.clone()).unwrap();
+
+            let expr = match value {
+                Value::Integer(n) => Expression::Number(n),
+                Value::Text(t) => Expression::Literal(t.to_string()),
+                _ => panic!("not supported as an expression"),
+            };
+
+            iscan.expressions[0] = expr;
+        }
+    }
+}
+
 pub struct JoinRow<'row> {
-    left: Box<Row<'row>>,
-    right: Box<Row<'row>>,
+    pub left: Box<Row<'row>>,
+    pub right: Box<Row<'row>>,
 }
 
 impl<'row> Access<'row> for JoinRow<'row> {

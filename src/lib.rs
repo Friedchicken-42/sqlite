@@ -750,6 +750,7 @@ impl Sqlite {
         let physical = self.physical_builder(select)?;
         let physical = self.optimize(physical);
         let table = self.table_builder(physical)?;
+        println!("{table:?}");
 
         Ok(table)
     }
