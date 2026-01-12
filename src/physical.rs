@@ -11,6 +11,7 @@ use crate::{
         indexseek::IndexSeek,
         join::Join,
         limit::Limit,
+        mergejoin::MergeJoin,
         view::View,
         r#where::Where,
     },
@@ -140,6 +141,13 @@ pub enum Physical {
         schema: Schema,
         on: Spanned<Comparison>,
     },
+    MergeLoop {
+        left: Spanned<Physical>,
+        right: Spanned<Physical>,
+        left_col: Column,
+        right_col: Column,
+        schema: Schema,
+    },
     Limit {
         table: Spanned<Physical>,
         limit: usize,
@@ -243,6 +251,28 @@ impl PartialEq for Physical {
                 },
             ) => *l_left == *r_left && *l_right == *r_right && l_on == r_on && l_schema == r_schema,
             (
+                Self::MergeLoop {
+                    left: l_left,
+                    right: l_right,
+                    left_col: l_left_col,
+                    right_col: l_right_col,
+                    schema: l_schema,
+                },
+                Self::MergeLoop {
+                    left: r_left,
+                    right: r_right,
+                    left_col: r_left_col,
+                    right_col: r_right_col,
+                    schema: r_schema,
+                },
+            ) => {
+                *l_left == *r_left
+                    && *l_right == *r_right
+                    && l_left_col == r_left_col
+                    && l_right_col == r_right_col
+                    && l_schema == r_schema
+            }
+            (
                 Self::Limit {
                     table: l_table,
                     limit: l_limit,
@@ -285,6 +315,16 @@ impl Physical {
                     pages: left.pages + left.records * right.pages,
                 }
             }
+            Physical::MergeLoop { left, right, .. } => {
+                let left = left.metadata();
+                let right = right.metadata();
+
+                Metadata {
+                    sort: vec![], // TODO: could be sort on the left
+                    records: left.records + right.records,
+                    pages: left.pages + right.pages,
+                }
+            }
             Physical::Limit {
                 table,
                 limit,
@@ -309,7 +349,8 @@ impl Physical {
             | Physical::IndexOnly { schema, .. }
             | Physical::IndexFilter { schema, .. }
             | Physical::NestedLoop { schema, .. }
-            | Physical::IndexNestedLoop { schema, .. } => schema.clone(),
+            | Physical::IndexNestedLoop { schema, .. }
+            | Physical::MergeLoop { schema, .. } => schema.clone(),
         }
     }
 
@@ -399,6 +440,18 @@ impl Physical {
                 left.write_indented_rec(f, prefix, false)?;
                 right.write_indented_rec(f, prefix, true)
             }
+            Physical::MergeLoop {
+                left,
+                right,
+                left_col,
+                right_col,
+                ..
+            } => {
+                writeln!(f, "MergeLoop {{ {} {} }}", left_col, right_col)?;
+                left.write_indented_rec(f, prefix, false)?;
+                right.write_indented_rec(f, prefix, true)
+            }
+
             Physical::Limit {
                 table,
                 limit,
@@ -607,7 +660,7 @@ impl Sqlite {
         Ok(table)
     }
 
-    pub fn optimize(&self, physical: Spanned<Physical>) -> Spanned<Physical> {
+    pub fn generate(&self, physical: Spanned<Physical>) -> Vec<Spanned<Physical>> {
         let span = physical.span.clone();
         let mut all = HashSet::from([*physical.inner]);
 
@@ -615,11 +668,11 @@ impl Sqlite {
             switch_loop,
             tablescan_to_indexfilter,
             join_indexfilter,
-            // project_after_join,
             tablescan_to_indexonly,
             indexfilter_to_indexonly,
             lower_project_filter,
             lower_project_join,
+            // loop_merge_join,
         ];
 
         loop {
@@ -643,21 +696,15 @@ impl Sqlite {
             }
         }
 
-        println!("---\n");
-        for p in &all {
-            println!("{p}{:?}\n", p.metadata());
-        }
-        println!("---");
+        all.into_iter()
+            .map(|p| Spanned::span(p, span.clone()))
+            .collect()
+    }
 
-        let best = all
-            .into_iter()
-            .max_by_key(|p| p.metadata().pages)
-            .expect("a rule deleted the first node");
-
-        println!("{best}\n");
-
-        println!("query cost: {:?}", best.metadata());
-        Spanned::span(best, span)
+    pub fn best(&self, all: Vec<Spanned<Physical>>) -> Spanned<Physical> {
+        all.into_iter()
+            .min_by_key(|p| p.metadata().pages)
+            .expect("a rule deleted the first node")
     }
 
     pub fn table_builder(&self, physical: Spanned<Physical>) -> Result<Table<'_>> {
@@ -769,6 +816,26 @@ impl Sqlite {
 
                 Ok(Table::Join(join))
             }
+            Physical::MergeLoop {
+                left,
+                right,
+                left_col,
+                right_col,
+                schema,
+            } => {
+                let left = self.table_builder(left)?;
+                let right = self.table_builder(right)?;
+
+                let join = MergeJoin {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    left_col,
+                    right_col,
+                    schema,
+                };
+
+                Ok(Table::MergeJoin(join))
+            }
             Physical::Limit {
                 table,
                 limit,
@@ -856,6 +923,35 @@ fn apply(db: &Sqlite, physical: &Physical, rule: Rule) -> Vec<Physical> {
                     left: left.clone(),
                     right: Spanned::span(inner, right.span.clone()),
                     on: on.clone(),
+                    schema: schema.clone(),
+                });
+
+            l.chain(r).collect()
+        }
+        Physical::MergeLoop {
+            left,
+            right,
+            left_col,
+            right_col,
+            schema,
+        } => {
+            let l = apply(db, left, rule)
+                .into_iter()
+                .map(|inner| Physical::MergeLoop {
+                    left: Spanned::span(inner, left.span.clone()),
+                    right: right.clone(),
+                    left_col: left_col.clone(),
+                    right_col: right_col.clone(),
+                    schema: schema.clone(),
+                });
+
+            let r = apply(db, right, rule)
+                .into_iter()
+                .map(|inner| Physical::MergeLoop {
+                    left: left.clone(),
+                    right: Spanned::span(inner, right.span.clone()),
+                    left_col: left_col.clone(),
+                    right_col: right_col.clone(),
                     schema: schema.clone(),
                 });
 
@@ -1098,6 +1194,28 @@ fn lower_project_filter(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
 }
 
 fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
+    fn filter_columns(inner: &[Spanned<Column>], schema: Schema) -> Vec<SchemaRow> {
+        inner
+            .iter()
+            .filter_map(|c| {
+                schema
+                    .columns
+                    .iter()
+                    .find(|sr| match (&*c.inner, &*sr.column.inner) {
+                        (Column::Single(a), b) => a == b.name(),
+                        (Column::Dotted { table, column }, Column::Single(a)) => {
+                            a == column && schema.names.contains(table)
+                        }
+                        (a, b) => a == b,
+                    })
+                    .map(|sr| SchemaRow {
+                        column: c.clone(),
+                        r#type: sr.r#type,
+                    })
+            })
+            .collect::<Vec<_>>()
+    }
+
     if let Physical::Project {
         table,
         schema: project_schema,
@@ -1113,26 +1231,38 @@ fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
         && let Expression::Column(cl) = &*comp.left
         && *comp.op == Operator::Equal
         && let Expression::Column(cr) = &*comp.right
-        && let Some(il) = inner_columns.iter().position(|c| c.name() == cl.name())
-        && let Some(ir) = inner_columns.iter().position(|c| c.name() == cr.name())
+        && inner_columns.iter().find(|c| *c.inner == *cl).is_some()
+        && inner_columns.iter().find(|c| *c.inner == *cr).is_some()
         && !matches!(&**left, Physical::Project { .. })
     {
+        let columns = filter_columns(inner_columns, left.schema());
+        let inner = columns
+            .iter()
+            .map(|sr| sr.column.clone())
+            .collect::<Vec<_>>();
+
         let inner_left = Physical::Project {
             table: left.clone(),
             schema: Schema {
-                columns: vec![project_schema.columns[il].clone()],
+                columns,
                 ..left.schema()
             },
-            inner_columns: vec![Spanned::span(cl.clone(), comp.left.span.clone())],
+            inner_columns: inner,
         };
+
+        let columns = filter_columns(inner_columns, right.schema());
+        let inner = columns
+            .iter()
+            .map(|sr| sr.column.clone())
+            .collect::<Vec<_>>();
 
         let inner_right = Physical::Project {
             table: right.clone(),
             schema: Schema {
-                columns: vec![project_schema.columns[ir].clone()],
+                columns,
                 ..right.schema()
             },
-            inner_columns: vec![Spanned::span(cr.clone(), comp.right.span.clone())],
+            inner_columns: inner,
         };
 
         let join = Physical::NestedLoop {
@@ -1146,6 +1276,39 @@ fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
             table: Spanned::span(join, table.span.clone()),
             schema: project_schema.clone(),
             inner_columns: inner_columns.clone(),
+        }]
+    } else {
+        vec![]
+    }
+}
+
+fn loop_merge_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
+    fn check(col: &Column, p: &Physical) -> bool {
+        let sort = p.metadata().sort;
+        match sort.first() {
+            Some(SortCol::Column(c)) => c.name() == col.name(),
+            _ => false,
+        }
+    }
+
+    if let Physical::NestedLoop {
+        left,
+        right,
+        schema,
+        on: Some(comp),
+    } = physical
+        && let Expression::Column(cl) = &*comp.left
+        && *comp.op == Operator::Equal
+        && let Expression::Column(cr) = &*comp.right
+        && check(cl, left)
+        && check(cr, right)
+    {
+        vec![Physical::MergeLoop {
+            left: left.clone(),
+            right: right.clone(),
+            schema: schema.clone(),
+            left_col: cl.clone(),
+            right_col: cr.clone(),
         }]
     } else {
         vec![]

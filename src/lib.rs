@@ -6,7 +6,7 @@ pub mod physical;
 pub mod tables;
 
 use crate::{
-    parser::{Query, SelectStatement, Spanned},
+    parser::{CreateIndexStatement, Query, SelectStatement, Spanned},
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
         groupby::GroupBy,
@@ -14,6 +14,7 @@ use crate::{
         indexseek::{IndexSeek, IndexSeekRows},
         join::{Join, JoinRow, JoinRows},
         limit::{Limit, LimitRows},
+        mergejoin::{MergeJoin, MergeJoinRows},
         view::{View, ViewRow, ViewRows},
         r#where::{Where, WhereRows},
     },
@@ -336,6 +337,7 @@ pub enum Table<'db> {
     IndexSeek(IndexSeek<'db>),
     View(View<'db>),
     Join(Join<'db>),
+    MergeJoin(MergeJoin<'db>),
     Where(Where<'db>),
     Groupby(GroupBy<'db>),
     Limit(Limit<'db>),
@@ -355,6 +357,7 @@ impl<'db> Tabular<'db> for Table<'db> {
             Table::IndexSeek(indexseek) => indexseek.rows(),
             Table::View(view) => view.rows(),
             Table::Join(join) => join.rows(),
+            Table::MergeJoin(join) => join.rows(),
             Table::Where(r#where) => r#where.rows(),
             Table::Groupby(groupby) => groupby.rows(),
             Table::Limit(limit) => limit.rows(),
@@ -368,6 +371,7 @@ impl<'db> Tabular<'db> for Table<'db> {
             Table::IndexSeek(indexseek) => indexseek.table.schema(),
             Table::View(view) => view.schema(),
             Table::Join(join) => join.schema(),
+            Table::MergeJoin(join) => join.schema(),
             Table::Where(r#where) => r#where.inner.schema(),
             Table::Groupby(groupby) => groupby.schema(),
             Table::Limit(limit) => limit.inner.schema(),
@@ -381,6 +385,7 @@ impl<'db> Tabular<'db> for Table<'db> {
             Table::IndexSeek(indexseek) => indexseek.write_indented(f, prefix),
             Table::View(view) => view.write_indented(f, prefix),
             Table::Join(join) => join.write_indented(f, prefix),
+            Table::MergeJoin(join) => join.write_indented(f, prefix),
             Table::Where(r#where) => r#where.write_indented(f, prefix),
             Table::Groupby(groupby) => groupby.write_indented(f, prefix),
             Table::Limit(limit) => limit.write_indented(f, prefix),
@@ -437,6 +442,7 @@ pub enum Rows<'rows, 'db> {
     IndexSeek(IndexSeekRows<'rows, 'db>),
     View(ViewRows<'rows, 'db>),
     Join(JoinRows<'rows, 'db>),
+    MergeJoin(MergeJoinRows<'rows, 'db>),
     Where(WhereRows<'rows, 'db>),
     Limit(LimitRows<'rows, 'db>),
 }
@@ -449,6 +455,7 @@ impl Iterator for Rows<'_, '_> {
             Rows::IndexSeek(indexseek) => indexseek.current(),
             Rows::View(view) => view.current(),
             Rows::Join(join) => join.current(),
+            Rows::MergeJoin(join) => join.current(),
             Rows::Where(r#where) => r#where.current(),
             Rows::Limit(limit) => limit.current(),
         }
@@ -461,6 +468,7 @@ impl Iterator for Rows<'_, '_> {
             Rows::IndexSeek(indexseek) => indexseek.advance(),
             Rows::View(view) => view.advance(),
             Rows::Join(join) => join.advance(),
+            Rows::MergeJoin(join) => join.advance(),
             Rows::Where(r#where) => r#where.advance(),
             Rows::Limit(limit) => limit.advance(),
         }
@@ -666,13 +674,13 @@ impl Sqlite {
         Ok(None)
     }
 
-    fn create_schema_index(&self, index: &str, table: &str, columns: &[String]) -> Result<Schema> {
-        let table = self.table(table)?;
+    fn create_schema_index(&self, query: &CreateIndexStatement) -> Result<Schema> {
+        let table = self.table(&query.table)?;
 
         let mut schema = vec![];
         let mut primary = vec![];
 
-        for (idx, name) in columns.iter().enumerate() {
+        for (idx, name) in query.columns.iter().enumerate() {
             let out = table
                 .schema()
                 .columns
@@ -693,7 +701,7 @@ impl Sqlite {
         });
 
         Ok(Schema {
-            names: vec![index.to_string()],
+            names: vec![query.name.to_string()],
             name: Some(0),
             columns: schema,
             primary,
@@ -708,7 +716,7 @@ impl Sqlite {
         match &*query {
             Query::CreateTable(cts) => BTreePage::read(self, rootpage, cts.schema.clone()),
             Query::CreateIndex(cis) => {
-                let schema = self.create_schema_index(&cis.name, &cis.table, &cis.columns)?;
+                let schema = self.create_schema_index(&cis)?;
                 BTreePage::read(self, rootpage, schema)
             }
             _ => Err(ErrorKind::WrongCommand(query).into()),
@@ -738,7 +746,11 @@ impl Sqlite {
                 continue;
             }
 
-            let schema = self.create_schema_index(&index.name, table_name, columns)?;
+            if !columns.iter().all(|col| index.columns.contains(col)) {
+                continue;
+            }
+
+            let schema = self.create_schema_index(&index)?;
             let btreepage = BTreePage::read(self, rootpage as usize, schema)?;
             indexes.push(btreepage);
         }
@@ -748,9 +760,9 @@ impl Sqlite {
 
     fn query_builder(&self, select: Spanned<SelectStatement>) -> Result<Table<'_>> {
         let physical = self.physical_builder(select)?;
-        let physical = self.optimize(physical);
-        let table = self.table_builder(physical)?;
-        println!("{table:?}");
+        let all = self.generate(physical);
+        let best = self.best(all);
+        let table = self.table_builder(best)?;
 
         Ok(table)
     }
@@ -766,7 +778,20 @@ impl Sqlite {
                 panic!("CreateIndex statement execution not yet implemented");
             }
             Query::Explain(select_statement) => {
-                let table = self.query_builder(select_statement)?;
+                let physical = self.physical_builder(select_statement)?;
+                let all = self.generate(physical);
+
+                println!("{:─^40}", " Query Plans ");
+                for p in &all {
+                    println!("{}", p.inner);
+                }
+
+                let best = self.best(all);
+                println!("{:─^40}", " Best Plan ");
+                println!("{}", best.inner);
+
+                let table = self.table_builder(best)?;
+                println!("{:─^40}", " Table Representation ");
                 println!("{table:?}");
 
                 // Returns empty table

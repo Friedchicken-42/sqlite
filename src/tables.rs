@@ -4,5 +4,6 @@ pub mod indexscan;
 pub mod indexseek;
 pub mod join;
 pub mod limit;
+pub mod mergejoin;
 pub mod view;
 pub mod r#where;
