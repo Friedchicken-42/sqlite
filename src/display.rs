@@ -2,11 +2,13 @@ use crate::{
     Access, Iterator, Result, Row, Schema, Serialized, SqliteError, Table, Tabular, Value,
 };
 
+#[derive(Clone)]
 enum DisplayMode {
     List,
     Table,
 }
 
+#[derive(Clone)]
 pub struct DisplayOptions {
     mode: DisplayMode,
     column_sizes: Option<Vec<usize>>,

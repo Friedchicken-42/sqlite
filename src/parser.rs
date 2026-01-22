@@ -70,6 +70,7 @@ pub enum Query {
     CreateIndex(Spanned<CreateIndexStatement>),
     Explain(Spanned<SelectStatement>),
     Info(Spanned<SelectStatement>), // Could use Query
+    Test(Spanned<SelectStatement>),
 }
 
 impl Query {
@@ -597,6 +598,10 @@ fn info_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
     just("info").padded().ignore_then(selectstmt_parser())
 }
 
+fn test_parser<'src>() -> impl SqlParser<'src, SelectStatement> {
+    just("test").padded().ignore_then(selectstmt_parser())
+}
+
 fn parser<'src>() -> impl SqlParser<'src, Query> {
     choice((
         selectstmt_parser().map(Query::Select),
@@ -604,6 +609,7 @@ fn parser<'src>() -> impl SqlParser<'src, Query> {
         createindexstmt_parser().map(Query::CreateIndex),
         explain_parser().map(Query::Explain),
         info_parser().map(Query::Info),
+        test_parser().map(Query::Test),
     ))
     .then_ignore(just(";").or_not())
     .then_ignore(end())

@@ -578,7 +578,11 @@ impl Sqlite {
     pub fn physical_from_builder(&self, from: Spanned<From>) -> Result<Spanned<Physical>> {
         match *from.inner {
             From::Table { table, alias } => {
-                let btree = self.table(&table)?;
+                let btree = self.table(&table).map_err(|err| SqliteError {
+                    span: table.span.clone(),
+                    ..err
+                })?;
+
                 let metadata = Metadata::read(self, &btree)?;
 
                 let mut schema = btree.schema.clone();
@@ -1141,6 +1145,13 @@ fn indexfilter_to_indexonly(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
             schema,
             metadata,
         } = &**project_table
+        && inner_columns.iter().all(|col| {
+            schema
+                .columns
+                .iter()
+                .find(|sr| *sr.column.inner == *col.inner)
+                .is_some()
+        })
     {
         // TODO: check name
         let inner = Physical::IndexOnly {
@@ -1225,16 +1236,25 @@ fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
             left,
             right,
             schema,
-            on: Some(comp),
+            on,
         } = &**table
         // TODO: should work only on left + switch_loop
-        && let Expression::Column(cl) = &*comp.left
-        && *comp.op == Operator::Equal
-        && let Expression::Column(cr) = &*comp.right
-        && inner_columns.iter().find(|c| *c.inner == *cl).is_some()
-        && inner_columns.iter().find(|c| *c.inner == *cr).is_some()
         && !matches!(&**left, Physical::Project { .. })
     {
+        if let Some(comp) = on {
+            if let Expression::Column(cl) = &*comp.left
+                && inner_columns.iter().find(|c| *c.inner == *cl).is_none()
+            {
+                return vec![];
+            }
+
+            if let Expression::Column(cr) = &*comp.right
+                && inner_columns.iter().find(|c| *c.inner == *cr).is_none()
+            {
+                return vec![];
+            }
+        }
+
         let columns = filter_columns(inner_columns, left.schema());
         let inner = columns
             .iter()
@@ -1269,7 +1289,7 @@ fn lower_project_join(_: &Sqlite, physical: &Physical) -> Vec<Physical> {
             left: Spanned::span(inner_left, left.span.clone()),
             right: Spanned::span(inner_right, right.span.clone()),
             schema: schema.clone(),
-            on: Some(comp.clone()),
+            on: on.clone(),
         };
 
         vec![Physical::Project {

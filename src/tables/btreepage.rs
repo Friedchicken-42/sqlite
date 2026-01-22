@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, num::NonZeroUsize};
 
+use memmap2::Mmap;
+
 use crate::{
     Access, Column, ErrorKind, Iterator, Result, Row, Rows, Schema, Serialized, Sqlite, Tabular,
     Type, Value,
@@ -446,6 +448,7 @@ pub enum Storage<'db> {
     File {
         db: &'db Sqlite,
         root: usize,
+        // TODO: this should use &Page as the pages are stored on Sqlite::mmap
         stack: Vec<Page>,
     },
 }

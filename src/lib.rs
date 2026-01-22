@@ -6,6 +6,7 @@ pub mod physical;
 pub mod tables;
 
 use crate::{
+    display::{DisplayOptions, Printable},
     parser::{CreateIndexStatement, Query, SelectStatement, Spanned},
     tables::{
         btreepage::{BTreePage, BTreePageBuilder, BTreeRows, Cell, Page, Varint},
@@ -19,12 +20,13 @@ use crate::{
         r#where::{Where, WhereRows},
     },
 };
-use ariadne::{Color, Label, Report, ReportKind};
+use ariadne::{Color, Label, Report, ReportKind, Source};
+use memmap2::Mmap;
 use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     num::NonZeroUsize,
     ops::Range,
 };
@@ -511,22 +513,21 @@ impl Header {
 
 #[derive(Debug)]
 pub struct Sqlite {
-    file: File,
+    mmap: Mmap,
     header: Header,
 }
 
 impl Sqlite {
     pub fn read(path: &str) -> Result<Self> {
-        let file = File::open(path).map_err(|_| ErrorKind::FileNotFound(path.into()).into())?;
+        let err = || ErrorKind::FileNotFound(path.into()).into();
 
-        let mut buf = vec![0; 100];
-        (&file)
-            .read_exact(&mut buf)
-            .map_err(|_| ErrorKind::FileNotFound(path.into()).into())?;
+        let file = File::open(path).map_err(|_| err())?;
+        let mmap = unsafe { Mmap::map(&file).map_err(|_| err())? };
+        let buf = mmap.get(0..100).ok_or(err())?;
 
         let header = Header::read(&buf);
 
-        Ok(Self { file, header })
+        Ok(Self { mmap, header })
     }
 
     pub fn page_size(&self) -> usize {
@@ -592,7 +593,7 @@ impl Sqlite {
                 continue;
             }
 
-            println!("schema {name:?}");
+            println!("\nschema {name:?}");
 
             let sql = self.extract_text_value(&table, "sql".into())?;
             println!("{sql}");
@@ -604,13 +605,12 @@ impl Sqlite {
     fn page(&self, index: usize) -> Result<Page> {
         let offset = (index - 1) * self.header.page_size;
 
-        (&self.file)
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| ErrorKind::PageRead { index, offset }.into())?;
-        let mut data = vec![0; self.header.page_size];
-        (&self.file)
-            .read_exact(&mut data)
-            .map_err(|_| ErrorKind::PageRead { index, offset }.into())?;
+        let range = offset..offset + self.header.page_size;
+        let data = self
+            .mmap
+            .get(range)
+            .ok_or(ErrorKind::PageRead { index, offset }.into())?
+            .to_vec();
 
         let header_file_size = match index - 1 {
             0 => NonZeroUsize::new(100),
@@ -792,7 +792,7 @@ impl Sqlite {
 
                 let table = self.table_builder(best)?;
                 println!("{:─^40}", " Table Representation ");
-                println!("{table:?}");
+                print!("{table:?}");
 
                 // Returns empty table
                 let schema = Schema {
@@ -825,6 +825,35 @@ impl Sqlite {
                 println!("# rows: {count}");
 
                 Ok(table)
+            }
+            Query::Test(select_statement) => {
+                let options = DisplayOptions::r#box();
+
+                let physical = self.physical_builder(select_statement)?;
+                for (i, physical) in self.generate(physical).into_iter().enumerate() {
+                    println!("{:─^40}", format!(" Plan {} ", i + 1));
+                    println!("{}", physical.inner);
+
+                    let Ok(mut table) = self.table_builder(physical) else {
+                        println!("Error while parsing this query"); // TODO: better error here
+                        continue;
+                    };
+
+                    print!("{table:?}");
+                    table.display(options.clone())?;
+                    println!();
+                }
+
+                // Returns empty table
+                let schema = Schema {
+                    names: vec![],
+                    name: None,
+                    columns: vec![],
+                    primary: vec![],
+                };
+                let btree = BTreePageBuilder::new(schema).build()?;
+
+                Ok(Table::BTreePage(btree))
             }
         }
     }
